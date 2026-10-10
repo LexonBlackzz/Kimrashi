@@ -31,6 +31,30 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+/// How a load is going, and a way to stop it: the bytes read so far (for a progress
+/// bar), and a flag that makes the next read fail.
+#[derive(Default)]
+pub struct Progress {
+    pub bytes: std::sync::atomic::AtomicU64,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl Progress {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Count `n` more bytes read; fails if the load was cancelled.
+    pub fn add(&self, n: u64) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.cancelled.load(Relaxed) {
+            return Err(IoError::new(std::io::ErrorKind::Other, "Load cancelled"));
+        }
+        self.bytes.fetch_add(n, Relaxed);
+        Ok(())
+    }
+}
+
 // ------------------------------------------------------------------
 // Packed track format
 // ------------------------------------------------------------------
@@ -285,7 +309,7 @@ impl MidiFile {
     pub fn open_and_parse<P: AsRef<Path>>(
         path: P,
         vel_levels: u8,
-        progress: &std::sync::atomic::AtomicU64,
+        progress: &Progress,
     ) -> Result<Self, ParseError> {
         let path = path.as_ref();
         let file = File::open(path)?;
@@ -335,7 +359,7 @@ impl MidiFile {
                     let file = file.as_ref().map_err(|e| ParseError(e.to_string()))?;
                     let src = FileAt { file, offset, progress };
                     let split = can_split && len >= SPLIT_MIN && {
-                        let unseen = std::sync::atomic::AtomicU64::new(0);
+                        let unseen = Progress::default();
                         let head = FileAt { file, offset, progress: &unseen };
                         spread_over_channels(&mut Input::streaming(window, head, len.min(SNIFF)))
                     };
@@ -346,7 +370,7 @@ impl MidiFile {
                         pack_track(&mut input, vel_levels, scratch, &dedup).map(|t| vec![t])
                     };
                     scratch.trim();
-                    progress.fetch_add(8, std::sync::atomic::Ordering::Relaxed);
+                    let _ = progress.add(8);
                     packed
                 },
             )
@@ -798,7 +822,7 @@ impl<'a, R: Read> Input<'a, R> {
 struct FileAt<'a> {
     file: &'a File,
     offset: u64,
-    progress: &'a std::sync::atomic::AtomicU64,
+    progress: &'a Progress,
 }
 
 impl Read for FileAt<'_> {
@@ -812,7 +836,7 @@ impl Read for FileAt<'_> {
         #[cfg(unix)]
         let n = self.file.read_at(buf, self.offset)?;
         self.offset += n as u64;
-        self.progress.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        self.progress.add(n as u64)?;
         Ok(n)
     }
 }
@@ -1628,9 +1652,9 @@ mod tests {
         }
         let path = std::env::temp_dir().join(format!("fmp_parser_test_{}.mid", std::process::id()));
         std::fs::write(&path, &file).unwrap();
-        let progress = std::sync::atomic::AtomicU64::new(0);
+        let progress = Progress::default();
         let from_file = MidiFile::open_and_parse(&path, 127, &progress).unwrap();
-        assert!(progress.load(std::sync::atomic::Ordering::Relaxed) >= file.len() as u64 - 14 - 3 * 8);
+        assert!(progress.bytes.load(std::sync::atomic::Ordering::Relaxed) >= file.len() as u64 - 14 - 3 * 8);
         let _ = std::fs::remove_file(&path);
         // all tracks pooled; only the biggest packed on the reading thread; all of them
         for pooled_max in [usize::MAX, 1000, 0] {

@@ -187,7 +187,7 @@ impl SongData {
     pub fn load<P: AsRef<Path>>(
         path: P,
         vel_levels: u8,
-        progress: &std::sync::atomic::AtomicU64,
+        progress: &crate::parser::Progress,
     ) -> Result<Arc<Self>, ParseError> {
         let start = std::time::Instant::now();
         let path_ref = path.as_ref();

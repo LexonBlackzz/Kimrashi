@@ -11,9 +11,9 @@
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::parser::{MidiFile, ParseError};
+use crate::parser::{MidiFile, ParseError, Progress};
 
 /// Deepest nesting followed (guards against archive bombs).
 const MAX_DEPTH: usize = 4;
@@ -63,13 +63,13 @@ impl Kind {
 /// Counts bytes read from the file on disk, for the load progress bar.
 struct Counting<'a, R> {
     inner: R,
-    progress: &'a AtomicU64,
+    progress: &'a Progress,
 }
 
 impl<R: Read> Read for Counting<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.progress.fetch_add(n as u64, Ordering::Relaxed);
+        self.progress.add(n as u64)?;
         Ok(n)
     }
 }
@@ -176,7 +176,7 @@ fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 /// Load the MIDI inside the archive or compressed file at `path`.
-pub fn open(path: &Path, vel_levels: u8, progress: &AtomicU64) -> Result<MidiFile, ParseError> {
+pub fn open(path: &Path, vel_levels: u8, progress: &Progress) -> Result<MidiFile, ParseError> {
     let size = std::fs::metadata(path)?.len();
     let mut ctx = Ctx { vel_levels, progress, layers: Vec::new() };
     let mut midi = ctx.file(path, 0)?;
@@ -186,7 +186,7 @@ pub fn open(path: &Path, vel_levels: u8, progress: &AtomicU64) -> Result<MidiFil
 
 struct Ctx<'a> {
     vel_levels: u8,
-    progress: &'a AtomicU64,
+    progress: &'a Progress,
     /// The formats unwrapped so far, outermost first.
     layers: Vec<&'static str>,
 }
@@ -384,7 +384,7 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("fmp_archive_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let load = |name: &str| MidiFile::open_and_parse(dir.join(name), 127, &AtomicU64::new(0));
+        let load = |name: &str| MidiFile::open_and_parse(dir.join(name), 127, &Progress::default());
 
         std::fs::write(dir.join("plain.mid"), &midi).unwrap();
         std::fs::write(dir.join("song.gz"), gz(&midi)).unwrap();
@@ -443,6 +443,14 @@ mod tests {
             assert_eq!(m.source.map(|s| s.0).as_deref(), Some(layers));
         }
         assert!(load("text.txt").is_err());
+
+        // A cancelled load fails at its next read, from a plain file or an archive.
+        for name in ["plain.mid", "song.gz", "song.zip", "solid.7z"] {
+            let progress = Progress::default();
+            progress.cancel();
+            let e = MidiFile::open_and_parse(dir.join(name), 127, &progress).err().expect(name);
+            assert!(e.to_string().contains("cancelled"), "{name}: {e}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

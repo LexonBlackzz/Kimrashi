@@ -30,3 +30,11 @@ winapi = { version = "0.3", features = ["timeapi", "dwmapi", "dxgi", "winerror",
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# Quick builds for trying things out: `cargo build --profile fast` (target/fast/).
+# Same optimization level, but no whole-program LTO, which is most of a release build.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

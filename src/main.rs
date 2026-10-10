@@ -399,7 +399,7 @@ struct Loading {
     name: String,
     rx: Receiver<Result<Arc<SongData>, String>>,
     /// Bytes parsed so far, out of `total`.
-    progress: Arc<std::sync::atomic::AtomicU64>,
+    progress: Arc<parser::Progress>,
     total: u64,
     started: Instant,
 }
@@ -531,8 +531,9 @@ impl eframe::App for AppState {
                 ui.separator();
                 ui.toggle_value(&mut self.show_settings, "Settings");
             });
+            let mut cancel = false;
             if let Some(l) = &self.loading {
-                let done = l.progress.load(std::sync::atomic::Ordering::Relaxed) as f32;
+                let done = l.progress.bytes.load(std::sync::atomic::Ordering::Relaxed) as f32;
                 let frac = (done / l.total.max(1) as f32).min(1.0);
                 ui.horizontal(|ui| {
                     ui.label(format!("Loading {}…", l.name));
@@ -541,7 +542,11 @@ impl eframe::App for AppState {
                             .desired_width(220.0)
                             .text(format!("{:.0}% · {}", frac * 100.0, secs(l.started.elapsed().as_secs_f64()))),
                     );
+                    cancel = ui.button("Cancel").clicked();
                 });
+            }
+            if cancel {
+                self.cancel_loading();
             }
             match (&self.status_message, &self.current_song) {
                 (Some(msg), _) => {
@@ -927,20 +932,27 @@ impl AppState {
         self.start_loading(path);
     }
 
+    /// Stop the load in progress, if any: its worker fails at its next read.
+    fn cancel_loading(&mut self) {
+        if let Some(l) = self.loading.take() {
+            l.progress.cancel();
+        }
+    }
+
     /// Load `path` on a worker thread; `poll_loading` picks up the result.
     fn start_loading(&mut self, path: std::path::PathBuf) {
         let name = path
             .file_name()
             .map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
         let total = std::fs::metadata(&path).map_or(1, |m| m.len());
-        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        self.cancel_loading();
+        let progress = Arc::new(parser::Progress::default());
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (vel_levels, p) = (self.vel_levels, progress.clone());
         std::thread::spawn(move || {
             let _ = tx.send(SongData::load(&path, vel_levels, &p).map_err(|e| e.to_string()));
         });
         self.status_message = None;
-        // A newer load replaces an unfinished one (its result is dropped).
         self.loading = Some(Loading {
             name,
             rx,

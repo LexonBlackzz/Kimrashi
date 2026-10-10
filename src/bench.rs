@@ -5,7 +5,7 @@
 //! `kimrashi --play <file> [--from m:ss] [--to m:ss] [--dll <KDMAPI dll>]
 //!  [--batch] [--no-skip] [--limit <notes/s>] [--speed <x>]`
 
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,7 +75,7 @@ pub fn run_from_args() -> bool {
 /// and the non-note events by kind.
 fn analyze(a: &Args) -> Result<(), String> {
     use crate::parser::{Record, TrackReader};
-    let song = SongData::load(&a.file, 127, &AtomicU64::new(0)).map_err(|e| e.to_string())?;
+    let song = SongData::load(&a.file, 127, &crate::parser::Progress::default()).map_err(|e| e.to_string())?;
     let tempo = &song.tempo;
     let end_us = a.to_us.unwrap_or(tempo.duration_us());
     let (t0, t1) = (tempo.time_to_tick(a.from_us), tempo.time_to_tick(end_us));
@@ -141,7 +141,7 @@ fn run(a: Args) -> Result<(), String> {
         return Err("KDMAPI not available".into());
     }
     let omni = Arc::new(omni);
-    let progress = AtomicU64::new(0);
+    let progress = crate::parser::Progress::default();
     let song = SongData::load(&a.file, 127, &progress).map_err(|e| e.to_string())?;
     let end_us = a.to_us.unwrap_or(song.tempo.duration_us()).min(song.tempo.duration_us());
     eprintln!("loaded {} in {:.2} s; playing {:.1}..{:.1} s", a.file, song.load_time.as_secs_f64(), a.from_us as f64 / 1e6, end_us as f64 / 1e6);
