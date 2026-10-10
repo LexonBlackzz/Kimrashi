@@ -253,6 +253,11 @@ impl<'a> Ctx<'a> {
                     sevenz_rust2::Password::empty(),
                 )
                 .map_err(err)?;
+                // The multi-threaded LZMA2 decoder holds each independent unit's whole
+                // output in memory, and a stream with few resets is one unit: a 7z of
+                // tightly compressed MIDI then needs gigabytes (tens of GB for the 10
+                // billion note one). One thread decodes through a dictionary-sized window.
+                archive.set_thread_count(1);
                 let target = pick(
                     archive
                         .archive()
@@ -261,6 +266,7 @@ impl<'a> Ctx<'a> {
                         .filter(|f| !f.is_directory())
                         .map(|f| (f.name().to_owned(), f.name().to_owned(), f.size)),
                 )?;
+                let solid = archive.archive().is_solid;
                 let mut result = None;
                 archive
                     .for_each_entries(|entry, reader| {
@@ -268,7 +274,12 @@ impl<'a> Ctx<'a> {
                             result = Some(self.stream(Box::new(reader), depth + 1));
                             return Ok(false); // done
                         }
-                        Ok(true) // keep going (solid archives must decode what comes before)
+                        // Solid archives must decode what comes before: the next entry
+                        // starts where this one's data ends, read or not.
+                        if solid {
+                            std::io::copy(reader, &mut std::io::sink())?;
+                        }
+                        Ok(true)
                     })
                     .map_err(err)?;
                 result.unwrap_or_else(|| Err("MIDI file not found while extracting".into()))
@@ -390,6 +401,20 @@ mod tests {
         zip.write_all(&gz(&midi)).unwrap(); // largest candidate, and another layer
         zip.finish().unwrap();
 
+        // 7z, solid (the smaller MIDI first must be skipped over) and not
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+        let mut sz = ArchiveWriter::create(dir.join("solid.7z")).unwrap();
+        sz.push_archive_entries(
+            vec![ArchiveEntry::new_file("a_small.mid"), ArchiveEntry::new_file("b_song.mid")],
+            vec![SourceReader::from(&midi[..14]), SourceReader::from(&midi[..])],
+        )
+        .unwrap();
+        sz.finish().unwrap();
+        let mut sz = ArchiveWriter::create(dir.join("separate.7z")).unwrap();
+        sz.push_archive_entry(ArchiveEntry::new_file("a_small.mid"), Some(&midi[..14])).unwrap();
+        sz.push_archive_entry(ArchiveEntry::new_file("b_song.mid"), Some(&midi[..])).unwrap();
+        sz.finish().unwrap();
+
         // tar.gz: a tar holding the song, gzipped
         let mut tar = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
@@ -405,6 +430,8 @@ mod tests {
             ("song.gz", "gz"),
             ("song.zst", "zst"),
             ("song.zip", "zip › gz"),
+            ("solid.7z", "7z"),
+            ("separate.7z", "7z"),
             ("song.tar.gz", "gz › tar"),
         ] {
             let m = load(name).unwrap();
