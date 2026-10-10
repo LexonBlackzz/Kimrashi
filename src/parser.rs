@@ -423,7 +423,7 @@ impl MidiFile {
                 },
             )
             .collect::<Result<_, _>>()?;
-        Ok(Self::assemble(division, packed, dedup, file_bytes, parse_start.elapsed()))
+        Ok(Self::assemble(division, packed, dedup, file_bytes, parse_start.elapsed()).with_smpte_tempo(&hdr))
     }
 
     /// Parse a MIDI file from a sequential stream (e.g. a decompressor). One thread
@@ -519,7 +519,15 @@ impl MidiFile {
                 (i as u32, 1 + extra, t)
             })
             .collect();
-        Ok(Self::assemble_with(division, num_tracks as usize, packed, dedup, file_bytes, parse_start.elapsed()))
+        Ok(Self::assemble_with(division, num_tracks as usize, packed, dedup, file_bytes, parse_start.elapsed()).with_smpte_tempo(&hdr))
+    }
+
+    /// With an SMPTE division the speed is fixed: the tempo events are ignored.
+    fn with_smpte_tempo(mut self, hdr: &[u8; 14]) -> Self {
+        if let Some(tempo) = smpte_tempo(hdr) {
+            self.tempos = vec![(0, tempo)];
+        }
+        self
     }
 
     fn assemble(
@@ -593,6 +601,17 @@ impl MidiFile {
     }
 }
 
+/// An SMPTE division counts ticks per frame at a frame rate, not per quarter note. It is
+/// read as `fps * ticks per frame` ticks per quarter (`parse_header`) and the tempo that
+/// makes a quarter a second (29.97 fps is `-29`, in drop-frame time).
+fn smpte_tempo(hdr: &[u8; 14]) -> Option<u32> {
+    if hdr[12] & 0x80 == 0 {
+        return None;
+    }
+    let fps = (hdr[12] as i8).unsigned_abs() as u64;
+    Some(if fps == 29 { (1_000_000u64 * 29 * 100 / 2997) as u32 } else { 1_000_000 })
+}
+
 /// Validate an MThd header; returns (track count, ticks per quarter).
 fn parse_header(hdr: &[u8; 14]) -> Result<(u16, u16), ParseError> {
     if hdr[4..8] != [0, 0, 0, 6] {
@@ -600,8 +619,12 @@ fn parse_header(hdr: &[u8; 14]) -> Result<(u16, u16), ParseError> {
     }
     let num_tracks = u16::from_be_bytes([hdr[10], hdr[11]]);
     let division = u16::from_be_bytes([hdr[12], hdr[13]]);
-    if (division & 0x8000) != 0 {
-        return Err("SMTPE time division not supported".into());
+    if smpte_tempo(hdr).is_some() {
+        let ticks = (hdr[12] as i8).unsigned_abs() as u16 * hdr[13] as u16;
+        if ticks == 0 {
+            return Err("Invalid SMPTE time division (0 ticks per second)".into());
+        }
+        return Ok((num_tracks, ticks));
     }
     if division == 0 {
         return Err("Invalid time division (0 ticks per quarter)".into());
@@ -821,6 +844,10 @@ struct Pending {
 }
 
 const NEVER: u32 = u32::MAX;
+
+/// Most events held back behind open notes (16 bytes each). A longer wait than this ends
+/// the oldest open note early, so a note that never ends can't use all the memory.
+const MAX_PENDING: usize = 1 << 24;
 
 /// Window size for reading a track (at least `Input::MIN_WINDOW`).
 const WINDOW: usize = 1 << 20;
@@ -1248,6 +1275,33 @@ impl<'a> Sequencer<'a> {
             emit(front);
             self.queue.pop_front();
             self.base = self.base.wrapping_add(1);
+        }
+        if self.queue.len() > MAX_PENDING {
+            self.release_oldest(tick, emit);
+        }
+    }
+
+    /// Too many events are waiting behind open notes (a stuck note under billions of
+    /// others would need gigabytes): the oldest open notes end now, as if released.
+    #[cold]
+    fn release_oldest(&mut self, tick: u32, emit: &mut impl FnMut(&Pending)) {
+        while self.queue.len() > MAX_PENDING {
+            // (every queue entry before the first open note has been emitted)
+            let Some(front) = self.queue.front_mut() else { return };
+            front.end = tick;
+            let slot = (front.status as usize & 0x0F) * 128 + (front.d1 as usize & 0x7F);
+            self.head[slot] = front.next;
+            if front.next == Self::NONE {
+                self.tail[slot] = Self::NONE;
+            }
+            while let Some(front) = self.queue.front() {
+                if front.end == NEVER {
+                    break;
+                }
+                emit(front);
+                self.queue.pop_front();
+                self.base = self.base.wrapping_add(1);
+            }
         }
     }
 
@@ -1804,4 +1858,37 @@ mod tests {
         assert!(!judge(&mut track(&[0])));
         assert!(!judge(&mut track(&[0, 0, 0, 0, 1])));
     }
+    #[test]
+    fn smpte_division_is_a_fixed_speed() {
+        let hdr = |d: [u8; 2]| *b"MThd     ".iter().chain(&d).copied().collect::<Vec<u8>>().first_chunk::<14>().unwrap();
+        // -1 fps, 255 ticks per frame: 255 ticks a second.
+        assert_eq!(parse_header(&hdr([0xFF, 0xFF])).unwrap(), (2, 255));
+        assert_eq!(smpte_tempo(&hdr([0xFF, 0xFF])), Some(1_000_000));
+        assert_eq!(parse_header(&hdr([0xE7, 40])).unwrap(), (2, 25 * 40));
+        assert!(parse_header(&hdr([0xE7, 0])).is_err());
+        assert_eq!(smpte_tempo(&hdr([1, 0xE0])), None);
+    }
+
+    #[test]
+    fn stuck_notes_cannot_grow_the_queue_without_bound() {
+        let mut queue = Default::default();
+        let mut seq = Sequencer::new(&mut queue);
+        let (mut emitted, mut open, mut last) = (0u64, 0usize, 0u32);
+        let n = MAX_PENDING as u32 * 2;
+        let mut emit = |p: &Pending| {
+            assert!(p.end >= p.tick && p.tick >= last);
+            open += usize::from(p.end == NEVER);
+            last = p.tick;
+            emitted += 1;
+        };
+        // Note-ons on one key and no note-off, as in a noise file.
+        for tick in 0..n {
+            seq.event(tick, 0x90, 0x60, 0x7F, &mut emit);
+            assert!(seq.queue.len() <= MAX_PENDING);
+        }
+        seq.finish(&mut emit);
+        assert_eq!(emitted, n as u64);
+        assert!(open <= MAX_PENDING); // (only those still waiting when the track ended)
+    }
+
 }
