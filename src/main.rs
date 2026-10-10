@@ -213,6 +213,7 @@ fn main() {
                 timer_guard,
                 color_by_channel: setting(&saved, "color_by_channel").unwrap_or(true),
                 color_auto: setting(&saved, "color_auto").unwrap_or(true),
+                piano_layout: setting(&saved, "piano_layout").unwrap_or(false),
                 frame_times: FrameTimes::default(),
                 frame_log: FrameLog::from_env(),
                 open_at_us,
@@ -628,6 +629,8 @@ struct AppState {
     color_by_channel: bool,
     /// Pick by channel or by track from the song (see `colors_by_channel`).
     color_auto: bool,
+    /// Notes laid out like the keys (see `key_columns`) rather than an even grid.
+    piano_layout: bool,
     frame_times: FrameTimes,
     frame_log: Option<FrameLog>,
     /// Where to seek once the file given on the command line has loaded.
@@ -807,6 +810,7 @@ impl eframe::App for AppState {
                     self.notes_upwards,
                     self.flat_notes,
                     self.colors_by_channel(),
+                    self.piano_layout,
                     (self.detailed_stats, self.synth_stats),
                     &mut self.visible,
                     &mut self.instances,
@@ -921,6 +925,17 @@ impl AppState {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.notes_upwards, false, "Fall");
                         ui.selectable_value(&mut self.notes_upwards, true, "Rise");
+                    });
+                    ui.end_row();
+
+                    ui.label("Layout");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.piano_layout, false, "Even").on_hover_text(
+                            "Every key the same width",
+                        );
+                        ui.selectable_value(&mut self.piano_layout, true, "Piano").on_hover_text(
+                            "Like the keys: sharps narrower, drawn over the naturals",
+                        );
                     });
                     ui.end_row();
 
@@ -1087,13 +1102,14 @@ impl AppState {
     fn save_settings(&self) {
         let output = self.outputs.get(self.output_idx).map_or("", |o| o.1.as_str());
         let text = format!(
-            "note_speed={}\nnotes_rise={}\nflat_notes={}\ncolor_by_channel={}\ncolor_auto={}\nvsync={}\n\
+            "note_speed={}\nnotes_rise={}\nflat_notes={}\ncolor_by_channel={}\ncolor_auto={}\npiano_layout={}\nvsync={}\n\
              output={output}\nskip_notes={}\nsynth_limit={}\nvelocity_levels={}\nsvms_batch={}\ndetailed_stats={}\nsynth_stats={}\n",
             self.note_speed_seconds,
             self.notes_upwards,
             self.flat_notes,
             self.color_by_channel,
             self.color_auto,
+            self.piano_layout,
             self.vsync_enabled,
             self.skipping,
             self.synth_limit,
@@ -1200,6 +1216,7 @@ fn draw_piano_roll(
     notes_upwards: bool,
     flat_notes: bool,
     color_by_channel: bool,
+    piano_layout: bool,
     (detailed_stats, synth_stats): (bool, bool),
     visible: &mut VisibleNotes,
     instances: &mut Arc<Vec<gpu::NoteInstance>>,
@@ -1239,8 +1256,6 @@ fn draw_piano_roll(
     };
 
     let pitch_span_i = (pitch_max as i32 - pitch_min as i32 + 1).max(1);
-    let pitch_span = pitch_span_i as f32;
-    let key_width = note_area.width() / pitch_span.max(1.0);
 
     let mut active_keys = [false; 128];
     let mut active_colors = [Color32::TRANSPARENT; 128];
@@ -1251,10 +1266,10 @@ fn draw_piano_roll(
         _pad1: 0.0,
     }; 256];
 
+    let columns = key_columns(piano_layout, pitch_min, pitch_max);
     if pitch_span_i > 0 {
-        for (idx, pitch) in (pitch_min..=pitch_max).enumerate() {
-            let left = idx as f32 / pitch_span;
-            let right = (idx as f32 + 1.0) / pitch_span;
+        for pitch in pitch_min..=pitch_max {
+            let (left, right) = columns[pitch as usize];
             gpu_key_positions[pitch as usize] = gpu::KeyPosition {
                 left,
                 right,
@@ -1282,12 +1297,18 @@ fn draw_piano_roll(
         // Reuses last frame's allocation once the GPU callback has dropped its clone.
         let buf = Arc::make_mut(instances);
         buf.clear();
-        // Newest first: the GPU draws front to back (see the depth test in gpu.rs).
-        for note in visible
-            .window
-            .iter()
-            .rev()
-            .filter(|n| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us)
+        // Newest first: the GPU draws front to back (see the depth test in gpu.rs). With
+        // the piano layout the sharps' columns overlap the naturals', and sharps go in
+        // front (first), as in Piano From Above.
+        let passes = if piano_layout { 2 } else { 1 };
+        for note in (0..passes).flat_map(|pass| {
+            visible
+                .window
+                .iter()
+                .rev()
+                .filter(move |n| !piano_layout || is_black_key(n.pitch) == (pass == 0))
+        })
+        .filter(|n| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us)
         {
             let color = song.color_for(note, color_by_channel);
             // The newest sounding note on a key is the one shown on top.
@@ -1340,7 +1361,7 @@ fn draw_piano_roll(
         keyboard_rect,
         pitch_min,
         pitch_max,
-        key_width,
+        piano_layout.then_some(&columns),
         &active_keys,
         &active_colors,
     );
@@ -1411,12 +1432,57 @@ Lag:    {:.1} ms",
     );
 }
 
+/// Each key's column across the notes area, as (left, right) fractions of its width.
+/// Even: one equal column per semitone. Piano: as in Piano From Above, white keys all
+/// the same width, sharps narrower and centred on the line between their neighbours
+/// (C#, F# nudged left and D#, A# right, as on a real keyboard), so a sharp's column
+/// overlaps the naturals beside it.
+fn key_columns(piano: bool, pitch_min: u8, pitch_max: u8) -> [(f32, f32); 128] {
+    const SHARP: f32 = 0.65; // a sharp's width as a fraction of a white key's
+    let mut out = [(0.0, 0.0); 128];
+    if pitch_min > pitch_max {
+        return out;
+    }
+    if !piano {
+        let span = (pitch_max - pitch_min + 1) as f32;
+        for p in pitch_min..=pitch_max {
+            let i = (p - pitch_min) as f32;
+            out[p as usize] = (i / span, (i + 1.0) / span);
+        }
+        return out;
+    }
+    let whites_below = |p: u8| (0..p).filter(|&q| !is_black_key(q)).count() as f32;
+    let first_sharp = is_black_key(pitch_min);
+    // Room for half a sharp past each end if that end is a sharp.
+    let buffer = (first_sharp as u8 + is_black_key(pitch_max) as u8) as f32 * SHARP / 2.0;
+    let whites = whites_below(pitch_max + 1) - whites_below(pitch_min);
+    let white_cx = 1.0 / (whites + buffer);
+    for p in pitch_min..=pitch_max {
+        let index = whites_below(p) - whites_below(pitch_min);
+        let (offset, width) = if is_black_key(p) {
+            let nudge = match p % 12 {
+                1 | 6 => -SHARP / 5.0,
+                3 | 10 => SHARP / 5.0,
+                _ => 0.0,
+            };
+            ((first_sharp as u8 as f32 - 1.0) * SHARP / 2.0 + nudge, SHARP)
+        } else {
+            (first_sharp as u8 as f32 * SHARP / 2.0, 1.0)
+        };
+        let left = white_cx * (index + offset);
+        out[p as usize] = (left, left + white_cx * width);
+    }
+    out
+}
+
 fn draw_keyboard(
     painter: &egui::Painter,
     rect: Rect,
     pitch_min: u8,
     pitch_max: u8,
-    _key_width: f32, // This width is for the semitone grid of the piano roll, not the keyboard.
+    // Where the notes' columns are, when they follow the keys (see `key_columns`);
+    // otherwise the notes are on an even grid and the keys are laid out on their own.
+    columns: Option<&[(f32, f32); 128]>,
     active_keys: &[bool; 128],
     active_colors: &[Color32; 128],
 ) {
@@ -1459,8 +1525,13 @@ fn draw_keyboard(
         .enumerate()
         .filter_map(|(p, i)| Some((p, (*i)?)))
     {
-        let left = rect.left() + (index as f32 * white_key_width);
-        let right = left + white_key_width;
+        let (left, right) = match columns {
+            Some(c) => (rect.left() + c[idx].0 * rect.width(), rect.left() + c[idx].1 * rect.width()),
+            None => {
+                let left = rect.left() + (index as f32 * white_key_width);
+                (left, left + white_key_width)
+            }
+        };
         let key_rect =
             Rect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom()));
 
@@ -1488,14 +1559,21 @@ fn draw_keyboard(
     for pitch in pitch_min..=pitch_max {
         if is_black_key(pitch) {
             // Find the white key *before* this black key.
-            let prev_white_key_pitch = pitch - 1;
+            let prev_white_key_pitch = pitch.saturating_sub(1);
 
-            // Check if the previous white key is in our visible range
-            if let Some(prev_white_key_index) = white_key_positions[prev_white_key_pitch as usize] {
-                // Center the black key on the dividing line between the two white keys
-                let center_x = rect.left() + (prev_white_key_index as f32 + 1.0) * white_key_width;
-                let left = center_x - (black_key_width / 2.0);
-                let right = left + black_key_width;
+            // Check if the previous white key is in our visible range (when the notes
+            // follow the keys, a black key at the edge is drawn too).
+            if columns.is_some() || white_key_positions[prev_white_key_pitch as usize].is_some() {
+                let (left, right) = match columns {
+                    Some(c) => (rect.left() + c[pitch as usize].0 * rect.width(), rect.left() + c[pitch as usize].1 * rect.width()),
+                    None => {
+                        // Center the black key on the dividing line between the two white keys
+                        let prev_index = white_key_positions[prev_white_key_pitch as usize].unwrap_or(0);
+                        let center_x = rect.left() + (prev_index as f32 + 1.0) * white_key_width;
+                        let left = center_x - (black_key_width / 2.0);
+                        (left, left + black_key_width)
+                    }
+                };
 
                 let key_rect = Rect::from_min_max(
                     Pos2::new(left, rect.top()),
@@ -1752,6 +1830,36 @@ fn color_from_hsv(h: f32, s: f32, v: f32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn piano_columns_follow_the_keys() {
+        let c = key_columns(true, 21, 108); // a full 88-key piano: 52 white keys
+        let white = 1.0 / 52.0;
+        assert_eq!(c[21], (0.0, white)); // A0
+        assert!((c[108].1 - 1.0).abs() < 1e-5); // C8 ends at the right edge
+        // white keys tile
+        let whites: Vec<_> = (21..=108u8).filter(|&p| !is_black_key(p)).collect();
+        for w in whites.windows(2) {
+            assert!((c[w[0] as usize].1 - c[w[1] as usize].0).abs() < 1e-5);
+        }
+        // C#4 sits over the line between C4 and D4, nudged left; D#4 nudged right; G#4 centred
+        let line = |lower: u8| c[lower as usize].1;
+        let centre = |p: u8| (c[p as usize].0 + c[p as usize].1) / 2.0;
+        assert!(centre(61) < line(60) && line(60) - centre(61) < white / 2.0);
+        assert!(centre(63) > line(62));
+        assert!((centre(68) - line(67)).abs() < 1e-5);
+        // a sharp is 0.65 of a white key wide and overlaps both neighbours
+        assert!(((c[61].1 - c[61].0) / white - 0.65).abs() < 1e-4);
+        assert!(c[61].0 < c[60].1 && c[61].1 > c[62].0);
+        // a range that starts and ends on sharps gets room for them (A#, nudged right,
+        // pokes out a little at the far end, as it does in Piano From Above)
+        let c = key_columns(true, 22, 106);
+        assert!(c[22].0 >= 0.0 && c[106].1 <= 1.01);
+        // even: a column per semitone
+        let c = key_columns(false, 60, 71);
+        assert_eq!(c[60], (0.0, 1.0 / 12.0));
+        assert!((c[71].1 - 1.0).abs() < 1e-6);
+    }
 
     #[test]
     fn exact_culling_only_drops_what_is_hidden() {
