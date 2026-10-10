@@ -571,9 +571,38 @@ struct Dedup {
     shards: Vec<std::sync::Mutex<Shard>>,
 }
 
+/// The index is keyed by hashes that are already well mixed.
+#[derive(Default)]
+struct Passthrough(u64);
+
+impl std::hash::Hasher for Passthrough {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only u64 keys")
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+/// A fast hash of a chunk, 8 bytes at a time (a collision only costs a duplicate chunk).
+fn hash_chunk(chunk: &[u8]) -> u64 {
+    let mut h = 0x9E37_79B9_7F4A_7C15 ^ chunk.len() as u64;
+    let mut words = chunk.chunks_exact(8);
+    for w in &mut words {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 32;
+    }
+    let tail = words.remainder().iter().rev().fold(0u64, |t, &b| t << 8 | b as u64);
+    h = (h ^ tail).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^ h >> 29
+}
+
 #[derive(Default)]
 struct Shard {
-    index: std::collections::HashMap<u64, u32>,
+    index: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<Passthrough>>,
     chunks: Vec<Chunk>,
     bytes: Vec<u8>,
 }
@@ -589,10 +618,7 @@ impl Dedup {
 
     /// Id of `chunk` (stored if new): its index in its shard, and the shard.
     fn insert(&self, chunk: &[u8]) -> u32 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        chunk.hash(&mut h);
-        let hash = h.finish();
+        let hash = hash_chunk(chunk);
         let s = (hash & ((1 << Self::SHARD_BITS) - 1)) as usize;
         let id = |local: u32| local << Self::SHARD_BITS | s as u32;
         let mut shard = self.shards[s].lock().unwrap();
@@ -1141,6 +1167,33 @@ fn walk_raw_track<R: Read>(
         }
         let len = w.len();
 
+        // Fast path for the common case: channel events with a one-byte delta, all inside
+        // the window. Anything else (meta, sysex, a long delta, the window running out)
+        // is left for the general code below.
+        let mut c = 0;
+        while len - c >= 8 {
+            let delta = w[c];
+            if delta >= 0x80 {
+                break;
+            }
+            let s = w[c + 1];
+            let (status, at) = if s >= 0x80 { (s, c + 2) } else { (running_status, c + 1) };
+            let d1 = w[at] & 0x7F;
+            let (d2, used) = match status & 0xF0 {
+                0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => (w[at + 1] & 0x7F, 2),
+                0xC0 | 0xD0 => (0, 1),
+                _ => break,
+            };
+            running_status = status;
+            abs_tick = abs_tick.wrapping_add(delta as u32);
+            f(abs_tick, RawEvent::Channel { status, d1, d2 });
+            c = at + used;
+        }
+        if c > 0 {
+            input.pos += c;
+            continue;
+        }
+
         // 1) delta (VLV)
         let (delta, mut cursor) = read_vlv_from_buf(w)?;
         abs_tick = abs_tick.wrapping_add(delta);
@@ -1265,6 +1318,9 @@ fn quantize_velocity(vel: u8, levels: u8) -> u8 {
 
 /// Write a MIDI-style VLV (big-endian 7-bit groups, up to 10 bytes for a u64).
 fn put_vlv(out: &mut Vec<u8>, v: u64) {
+    if v < 0x80 {
+        return out.push(v as u8);
+    }
     let mut shift = 63;
     while shift > 0 && v >> shift == 0 {
         shift -= 7;
