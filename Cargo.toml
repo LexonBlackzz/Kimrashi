@@ -1,6 +1,6 @@
 [package]
 name = "kimrashi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A MIDI player that keeps the whole song packed in memory, with a GPU-rendered piano roll"
 license = "GPL-3.0-or-later"
