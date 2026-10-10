@@ -239,6 +239,8 @@ pub struct MidiFile {
     pub source_tracks: usize,
     /// How many of those have notes.
     pub note_tracks: usize,
+    /// The channels with notes, a bit each.
+    pub channels_used: u16,
     /// Distinct chunks: where each lives in `store`.
     pub chunks: Vec<Chunk>,
     /// Every distinct chunk's bytes, stored once.
@@ -495,6 +497,7 @@ impl MidiFile {
             track_origin: Vec::new(),
             source_tracks,
             note_tracks: 0,
+            channels_used: 0,
             chunks,
             store,
             logical_bytes: 0,
@@ -521,6 +524,7 @@ impl MidiFile {
                 (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
                 (a, b) => a.or(b),
             };
+            file.channels_used |= t.channels;
             file.pack_stats.add(&t.stats);
             file.tempos.extend(t.tempos);
             file.logical_bytes += t.logical_bytes;
@@ -560,6 +564,7 @@ struct PackedTrack {
     end_tick: u32,
     note_count: u64,
     pitch_range: Option<(u8, u8)>,
+    channels: u16,
 }
 
 enum RawEvent {
@@ -902,6 +907,7 @@ impl<'a> Packer<'a> {
             end_tick,
             note_count: seq.note_count,
             pitch_range: seq.pitch_range,
+            channels: seq.channels,
         }
     }
 
@@ -1120,6 +1126,8 @@ struct Sequencer<'a> {
     base: u32,
     note_count: u64,
     pitch_range: Option<(u8, u8)>,
+    /// Channels with note-ons, a bit each.
+    channels: u16,
 }
 
 impl<'a> Sequencer<'a> {
@@ -1134,6 +1142,7 @@ impl<'a> Sequencer<'a> {
             base: 0,
             note_count: 0,
             pitch_range: None,
+            channels: 0,
         }
     }
 
@@ -1153,6 +1162,7 @@ impl<'a> Sequencer<'a> {
                 self.tail[slot] = seq;
                 self.queue.push_back(p);
                 self.note_count += 1;
+                self.channels |= 1 << (status & 0x0F);
                 self.pitch_range = Some(match self.pitch_range {
                     Some((lo, hi)) => (lo.min(d1), hi.max(d1)),
                     None => (d1, d1),
@@ -1504,6 +1514,7 @@ mod tests {
             .collect();
         let m = MidiFile::assemble(96, tracks, dedup, 0, Default::default());
         assert_eq!(m.note_tracks, 3);
+        assert_eq!(m.channels_used, 0b1); // all on channel 0
         assert!((m.store.len() as u64) < m.logical_bytes / 2, "{} of {}", m.store.len(), m.logical_bytes);
         // every track still decodes to the same notes
         for i in 0..3 {

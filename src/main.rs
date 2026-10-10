@@ -364,12 +364,14 @@ struct NoteSegment {
 }
 
 impl NoteSegment {
-    /// If this note, drawn after `prev` on the same key, covers all of it but less than a
-    /// pixel (`px_us` = time per pixel) at either end, fold `prev` into it and return true.
+    /// If this note, drawn after `prev` on the same key, covers all of it but at most
+    /// `slack_us` at either end, fold `prev` into it and return true. With no slack that
+    /// is exact (the picture doesn't change): same start, and at least as long. With a
+    /// pixel of slack, a sliver of `prev` may take the colour of this note instead.
     /// The merged note keeps `prev`'s start: dropping that sliver instead leaves gaps,
     /// since pixel rows don't line up with any fixed time grid while notes scroll.
-    fn absorb(&self, prev: &mut NoteSegment, px_us: u64) -> bool {
-        let covers = self.start_us.saturating_sub(prev.start_us) < px_us && self.end_us + px_us > prev.end_us;
+    fn absorb(&self, prev: &mut NoteSegment, slack_us: u64) -> bool {
+        let covers = self.start_us.saturating_sub(prev.start_us) <= slack_us && self.end_us + slack_us >= prev.end_us;
         if covers {
             *prev = NoteSegment { start_us: prev.start_us.min(self.start_us), end_us: prev.end_us.max(self.end_us), ..*self };
         }
@@ -381,10 +383,10 @@ impl NoteSegment {
 /// `last` holds, per key, the index in `out` of the last note pushed there; only
 /// those from `base` on count (earlier ones belong to other tracks).
 /// This is what keeps polyphony bombs bounded: at most ~one note per key per pixel row.
-fn push_culled(out: &mut Vec<NoteSegment>, last: &mut [usize; 128], base: usize, note: NoteSegment, px_us: u64) {
+fn push_culled(out: &mut Vec<NoteSegment>, last: &mut [usize; 128], base: usize, note: NoteSegment, slack_us: u64) {
     let k = note.pitch as usize & 127;
     let prev = if last[k] >= base { out.get_mut(last[k]) } else { None };
-    if !prev.is_some_and(|prev| note.absorb(prev, px_us)) {
+    if !prev.is_some_and(|prev| note.absorb(prev, slack_us)) {
         last[k] = out.len();
         out.push(note);
     }
@@ -404,6 +406,10 @@ impl Decoded {
     }
 }
 
+/// Notes kept on screen while culling is exact. Past this it also merges notes that are
+/// nearly hidden, back to exact once there are a third as many.
+const EXACT_MAX: usize = 3_000_000;
+
 /// Notes on screen. Each note is decoded from the packed tracks once, when it enters
 /// the window, and dropped once it has finished.
 #[derive(Default)]
@@ -421,6 +427,8 @@ struct VisibleNotes {
     /// Notes in `window` after the last sweep of finished ones, and frames since.
     alive: usize,
     frames_since_sweep: u32,
+    /// Whether culling merges nearly-hidden notes (see `EXACT_MAX`).
+    lossy: bool,
     /// Where the last `advance` spent its time (for `FrameLog`).
     timing: AdvanceTimes,
 }
@@ -459,6 +467,15 @@ impl VisibleNotes {
         }
         self.timing.retain = t0.elapsed();
         let t0 = Instant::now();
+        // Merging notes that are nearly hidden changes the picture a little (a note
+        // 1-2 pixels long can lose half its pixels to the colour of a neighbour), so
+        // it only happens when there are too many notes to keep them all.
+        if self.window.len() > EXACT_MAX {
+            self.lossy = true;
+        } else if self.window.len() < EXACT_MAX / 3 {
+            self.lossy = false;
+        }
+        let slack_us = if self.lossy { px_us } else { 0 };
 
         let tempo = &song.tempo;
         let now_tick = tempo.time_to_tick(now_us);
@@ -489,7 +506,7 @@ impl VisibleNotes {
                         channel: ch,
                         pitch: key,
                     };
-                    push_culled(&mut acc.notes, &mut acc.last, base, note, px_us);
+                    push_culled(&mut acc.notes, &mut acc.last, base, note, slack_us);
                 }
             }
         };
@@ -542,7 +559,7 @@ impl VisibleNotes {
         for r in first_new..self.window.len() {
             let note = self.window[r];
             let k = note.pitch as usize & 127;
-            if last[k] == usize::MAX || !note.absorb(&mut self.window[last[k]], px_us) {
+            if last[k] == usize::MAX || !note.absorb(&mut self.window[last[k]], slack_us) {
                 self.window[w] = note;
                 last[k] = w;
                 w += 1;
@@ -819,11 +836,15 @@ impl AppState {
         self.visible = VisibleNotes::default();
     }
 
-    /// What to color notes by: the setting, or for Auto, tracks when several have notes
-    /// (a file whose tracks are its parts), else channels.
+    /// What to color notes by: the setting, or for Auto, channels when the file has few
+    /// tracks that use several channels between them (or one track), else tracks
+    /// (a file of many tracks, or tracks that are its parts on one channel).
     fn colors_by_channel(&self) -> bool {
         match (&self.current_song, self.color_auto) {
-            (Some(song), true) => song.data.midi.note_tracks < 2,
+            (Some(song), true) => {
+                let m = &song.data.midi;
+                m.note_tracks < 2 || (m.note_tracks <= 16 && m.channels_used.count_ones() >= 2)
+            }
             _ => self.color_by_channel,
         }
     }
@@ -913,7 +934,7 @@ impl AppState {
                     ui.label("Colors");
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.color_auto, true, "Auto").on_hover_text(
-                            "By track if several tracks have notes, else by channel",
+                            "By channel if a few tracks use several channels, else by track",
                         );
                         if ui.selectable_label(!self.color_auto && self.color_by_channel, "By channel").clicked() {
                             (self.color_auto, self.color_by_channel) = (false, true);
@@ -1731,6 +1752,17 @@ fn color_from_hsv(h: f32, s: f32, v: f32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_culling_only_drops_what_is_hidden() {
+        let n = |start_us, end_us| NoteSegment { start_us, end_us, track: 0, channel: 0, pitch: 60 };
+        let mut prev = n(100, 500);
+        assert!(!n(101, 500).absorb(&mut prev, 0)); // starts a µs later: prev shows above it
+        assert!(!n(100, 499).absorb(&mut prev, 0)); // ends sooner: prev shows below it
+        assert!(n(100, 500).absorb(&mut prev, 0)); // same span: hidden
+        assert!(n(100, 800).absorb(&mut prev, 0)); // same start, longer: hidden
+        assert_eq!((prev.start_us, prev.end_us), (100, 800));
+    }
 
     #[test]
     fn culls_only_fully_hidden_notes() {
