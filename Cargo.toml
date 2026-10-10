@@ -27,14 +27,9 @@ tar = { version = "0.4", default-features = false }
 winapi = { version = "0.3", features = ["timeapi", "dwmapi", "dxgi", "winerror", "mmeapi", "mmsystem"] }
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-
-# Quick builds for trying things out: `cargo build --profile fast` (target/fast/).
-# Same optimization level, but no whole-program LTO, which is most of a release build.
-[profile.fast]
-inherits = "release"
+# No whole-program LTO or single codegen unit: neither measurably changed load or
+# playback speed here, and they made every build take ~100 s instead of seconds.
 lto = false
 codegen-units = 16
 incremental = true
+panic = "abort"
