@@ -221,7 +221,7 @@ impl VisualSong {
 
         // Generate 16 colors, one for each MIDI channel
         let colors = generate_palette(16);
-        let track_colors = generate_palette(data.midi.tracks.len().max(1));
+        let track_colors = generate_palette(data.midi.source_tracks.max(1));
         Self {
             data,
             channel_colors: colors,
@@ -341,7 +341,7 @@ impl VisibleNotes {
                     let note = NoteSegment {
                         start_us: tempo.tick_to_time_with_cache(tick, &mut tempo_cache),
                         end_us,
-                        track: track as u16,
+                        track: song.midi.track_origin[track] as u16,
                         channel: ch,
                         pitch: key,
                     };
@@ -1351,14 +1351,19 @@ fn load_info(song: &SongData) -> (String, String) {
     let st = &m.pack_stats;
     let pct = |n: u64| 100.0 * n as f64 / st.notes.max(1) as f64;
     let details = format!(
-        "Tracks: {}\nFile: {file}\n\nTotal load: {}\n  {parse_label}: {} ({} notes/s, {}/s)\n  \
+        "Tracks: {}{}\nFile: {file}\n\nTotal load: {}\n  {parse_label}: {} ({} notes/s, {}/s)\n  \
          Open, index & tempo map: {}\n\nPacked: {} ({:.2} B/note, {:.2}:1 vs file)\n  \
          repeats stored once: {} before, {:.1}x smaller ({} distinct chunks)\n\n\
          Note encoding (a note is 2 bytes unless it needs extras):\n  \
          2-byte notes: {:.1}%\n  new velocity: {:.1}% (+1 byte)\n  \
          new duration: {:.1}% (+{:.2} bytes avg)\n  long delta: {:.1}% (+1 byte or more)\n  \
          status byte: {:.1}% (+1 byte)\n  other events: {}",
-        m.tracks.len(),
+        m.source_tracks,
+        if m.tracks.len() == m.source_tracks {
+            String::new()
+        } else {
+            format!(" (packed as {}: big ones are split by channel)", m.tracks.len())
+        },
         secs(total),
         secs(parse),
         si(notes / parse),
