@@ -254,8 +254,9 @@ impl MidiFile {
 // ------------------------------------------------------------------
 impl MidiFile {
     /// Open and parse a MIDI file, packing tracks in parallel. Each worker thread reads
-    /// one track at a time into a reused buffer with its own file handle, so raw bytes
-    /// never pile up in memory and threads don't contend on page faults.
+    /// one track at a time through a small reused window with its own file handle, so
+    /// raw bytes never pile up in memory (even for one huge track) and threads don't
+    /// contend on page faults.
     /// `vel_levels` (1..=127) quantizes velocities: 127 keeps them exact, fewer levels
     /// make running velocity hit more often (1 = every note the same velocity).
     /// `progress` is increased by each track's byte size as it's packed (for a progress bar).
@@ -298,24 +299,16 @@ impl MidiFile {
         // Step 2: read and pack each track in parallel.
         let parse_start = std::time::Instant::now();
         let dedup = Dedup::new();
-        let budget = ByteBudget::new();
         let packed: Vec<PackedTrack> = chunks
             .into_par_iter()
             .map_init(
-                || (File::open(path), Vec::new(), Scratch::default()),
-                |(file, raw, scratch), (offset, len)| {
+                || (File::open(path), vec![0u8; WINDOW], Scratch::default()),
+                |(file, window, scratch), (offset, len)| {
                     let file = file.as_ref().map_err(|e| ParseError(e.to_string()))?;
-                    budget.acquire(len as u64); // never closed here: always succeeds
-                    raw.resize(len, 0);
-                    let read = read_at(file, offset, raw);
-                    let packed = read.map_err(ParseError::from).and_then(|_| pack_track(raw, vel_levels, scratch, &dedup));
+                    let src = FileAt { file, offset, progress };
+                    let packed = pack_track(&mut Input::streaming(window, src, len), vel_levels, scratch, &dedup);
                     scratch.trim();
-                    // Big tracks would otherwise keep this thread's buffer at their size.
-                    if raw.len() > 16 << 20 {
-                        *raw = Vec::new();
-                    }
-                    budget.release(len as u64);
-                    progress.fetch_add(len as u64 + 8, std::sync::atomic::Ordering::Relaxed);
+                    progress.fetch_add(8, std::sync::atomic::Ordering::Relaxed);
                     packed
                 },
             )
@@ -325,8 +318,13 @@ impl MidiFile {
 
     /// Parse a MIDI file from a sequential stream (e.g. a decompressor). One thread
     /// reads track chunks while the thread pool packs them; a bounded queue keeps only
-    /// a few raw chunks in memory at a time.
-    pub(crate) fn parse_stream(mut r: impl Read, vel_levels: u8) -> Result<Self, ParseError> {
+    /// a few raw chunks in memory at a time. A track over `POOLED_MAX` is packed by the
+    /// reading thread itself, straight off the stream, so it never sits in memory whole.
+    pub(crate) fn parse_stream(r: impl Read, vel_levels: u8) -> Result<Self, ParseError> {
+        Self::parse_stream_with(r, vel_levels, POOLED_MAX)
+    }
+
+    fn parse_stream_with(mut r: impl Read, vel_levels: u8, pooled_max: usize) -> Result<Self, ParseError> {
         let mut hdr = [0u8; 14];
         if r.read_exact(&mut hdr).is_err() || &hdr[..4] != b"MThd" {
             return Err("Not a MIDI file (invalid MThd header)".into());
@@ -344,8 +342,8 @@ impl MidiFile {
                 let packed = rx
                     .into_iter()
                     .par_bridge()
-                    .map_init(Scratch::default, |scratch, (i, raw)| {
-                        let packed = pack_track(&raw, vel_levels, scratch, dedup).map(|t| (i, t));
+                    .map_init(Scratch::default, |scratch, (i, mut raw)| {
+                        let packed = pack_track(&mut Input::whole(&mut raw), vel_levels, scratch, dedup).map(|t| (i, t));
                         scratch.trim();
                         budget.release(raw.len() as u64);
                         packed
@@ -354,7 +352,10 @@ impl MidiFile {
                 budget.close();
                 packed
             });
-            let read_result = (|| -> Result<(), ParseError> {
+            // Returns the tracks it packed itself (the big ones).
+            let read_result = (|| -> Result<Vec<(usize, PackedTrack)>, ParseError> {
+                let mut own = Vec::new();
+                let (mut window, mut scratch) = (Vec::new(), Scratch::default());
                 for i in 0..num_tracks as usize {
                     let mut h = [0u8; 8];
                     r.read_exact(&mut h).map_err(|_| "Truncated MIDI file")?;
@@ -362,23 +363,30 @@ impl MidiFile {
                         return Err("Invalid MTrk header".into());
                     }
                     let len = u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as usize;
+                    file_bytes += 8 + len as u64;
+                    if len > pooled_max {
+                        window.resize(WINDOW, 0);
+                        let mut input = Input::streaming(&mut window, r.by_ref().take(len as u64), len);
+                        own.push((i, pack_track(&mut input, vel_levels, &mut scratch, dedup)?));
+                        scratch.trim();
+                        continue;
+                    }
                     if !budget.acquire(len as u64) {
                         break; // the packer stopped on an error; it reports it
                     }
                     let mut raw = vec![0u8; len];
                     r.read_exact(&mut raw).map_err(|_| "Truncated MIDI file")?;
-                    file_bytes += 8 + len as u64;
                     if tx.send((i, raw)).is_err() {
                         break; // the packer stopped on an error; it reports it
                     }
                 }
-                Ok(())
+                Ok(own)
             })();
             drop(tx);
             (read_result, packer.join().unwrap_or_else(|_| Err("Packing thread panicked".into())))
         });
         let mut packed = packed?;
-        read_result?;
+        packed.extend(read_result?);
         packed.sort_unstable_by_key(|(i, _)| *i);
         Ok(Self::assemble(
             division,
@@ -549,25 +557,30 @@ impl Dedup {
         id(local)
     }
 
-    /// Build the final store and chunk table, laying chunks out in order of first use
-    /// so each track's chunks sit together (a track is read front to back, and memory
-    /// that is read in order is fast). Rewrites `tracks`' ids into table indices.
+    /// Build the final store and chunk table by appending the shards one after another,
+    /// freeing each as it's copied: peak memory is the packed size plus one shard, not
+    /// twice the packed size. Rewrites `tracks`' ids into table indices.
     fn finish<'a>(self, tracks: impl Iterator<Item = &'a mut Vec<u32>>) -> (Vec<u8>, Vec<Chunk>) {
-        let shards: Vec<Shard> = self.shards.into_iter().map(|m| m.into_inner().unwrap()).collect();
+        let mut shards: Vec<Shard> = self.shards.into_iter().map(|m| m.into_inner().unwrap()).collect();
+        // Only needed while inserting.
+        for s in &mut shards {
+            s.index = Default::default();
+        }
         let mut store = Vec::with_capacity(shards.iter().map(|s| s.bytes.len()).sum());
         let mut chunks = Vec::with_capacity(shards.iter().map(|s| s.chunks.len()).sum());
-        let mut placed: Vec<Vec<u32>> = shards.iter().map(|s| vec![u32::MAX; s.chunks.len()]).collect();
+        // Table index of each shard's first chunk.
+        let mut first = Vec::with_capacity(shards.len());
+        for s in &mut shards {
+            first.push(chunks.len() as u32);
+            let base = store.len() as u64;
+            store.extend_from_slice(&s.bytes);
+            chunks.extend(s.chunks.iter().map(|c| Chunk { start: c.start + base, len: c.len }));
+            *s = Shard::default();
+        }
         for refs in tracks {
             for id in refs.iter_mut() {
-                let (s, local) = ((*id & ((1 << Self::SHARD_BITS) - 1)) as usize, (*id >> Self::SHARD_BITS) as usize);
-                let slot = &mut placed[s][local];
-                if *slot == u32::MAX {
-                    let c = shards[s].chunks[local];
-                    *slot = chunks.len() as u32;
-                    chunks.push(Chunk { start: store.len() as u64, len: c.len });
-                    store.extend_from_slice(&shards[s].bytes[c.start as usize..][..c.len as usize]);
-                }
-                *id = *slot;
+                let (s, local) = ((*id & ((1 << Self::SHARD_BITS) - 1)) as usize, *id >> Self::SHARD_BITS);
+                *id = first[s] + local;
             }
         }
         (store, chunks)
@@ -593,198 +606,371 @@ const GEAR: [u64; 256] = {
 /// allocator (which scales badly across threads).
 #[derive(Default)]
 struct Scratch {
-    /// End tick per note-on ordinal (NONE = never released).
-    note_ends: Vec<u32>,
-    /// Next note-on ordinal in the same channel+key FIFO.
-    next: Vec<u32>,
+    /// Events whose record can't be written yet (see `pack_track`).
+    queue: std::collections::VecDeque<Pending>,
+    /// The chunk being written.
     data: Vec<u8>,
-    /// End offset of each chunk in `data`.
-    cuts: Vec<usize>,
 }
 
 impl Scratch {
-    /// Drop buffers a huge track blew up (~10 bytes per note), instead of keeping that
+    /// Drop a queue that a track with a stuck note blew up, instead of keeping that
     /// capacity on every thread for the rest of the load.
     fn trim(&mut self) {
-        if self.note_ends.capacity() > 1 << 22 {
-            *self = Scratch::default();
+        if self.queue.capacity() > 1 << 22 {
+            self.queue = Default::default();
         }
     }
 }
 
-/// Pack one raw MTrk payload. Two passes over the raw bytes: the first pairs each
-/// note-on with its note-off (FIFO per channel+key) to learn durations, the second
-/// writes the records.
-fn pack_track(
-    buf: &[u8],
+/// An event waiting for its record to be written. A note's record needs its duration,
+/// so it waits for the matching note-off; everything behind it waits too, to keep order.
+#[derive(Clone, Copy)]
+struct Pending {
+    tick: u32,
+    /// Note-on: the tick of its note-off, `NEVER` until (unless) one arrives.
+    end: u32,
+    /// Note-on: sequence number of the next open note on the same channel+key.
+    next: u32,
+    status: u8,
+    d1: u8,
+    d2: u8,
+}
+
+const NEVER: u32 = u32::MAX;
+
+/// Window size for reading a track (at least `Input::MIN_WINDOW`).
+const WINDOW: usize = 1 << 20;
+
+/// Streams with a track bigger than this pack it on the reading thread, straight off the
+/// stream, instead of reading it into memory whole and handing it to the pool.
+const POOLED_MAX: usize = 64 << 20;
+
+/// One track's bytes, read through a window that refills from `src`, so the track never
+/// has to be in memory whole.
+struct Input<'a, R> {
+    buf: &'a mut [u8],
+    pos: usize,
+    end: usize,
+    /// Track bytes not yet read from `src`.
+    left: usize,
+    src: R,
+}
+
+impl<'a> Input<'a, std::io::Empty> {
+    /// A track that is all in `buf` already.
+    fn whole(buf: &'a mut [u8]) -> Self {
+        let end = buf.len();
+        Input { buf, pos: 0, end, left: 0, src: std::io::empty() }
+    }
+}
+
+impl<'a, R: Read> Input<'a, R> {
+    /// The biggest `window(n)` asked for.
+    const MIN_WINDOW: usize = 16;
+
+    /// A track of `len` bytes to come from `src`, read through `buf`.
+    fn streaming(buf: &'a mut [u8], src: R, len: usize) -> Self {
+        assert!(buf.len() >= Self::MIN_WINDOW);
+        Input { buf, pos: 0, end: 0, left: len, src }
+    }
+
+    /// The unread bytes: at least `n` of them unless the track ends first.
+    #[inline]
+    fn window(&mut self, n: usize) -> Result<&[u8], ParseError> {
+        if self.end - self.pos < n && self.left > 0 {
+            self.buf.copy_within(self.pos..self.end, 0);
+            self.end -= self.pos;
+            self.pos = 0;
+            let want = self.left.min(self.buf.len() - self.end);
+            self.src.read_exact(&mut self.buf[self.end..self.end + want])?;
+            self.end += want;
+            self.left -= want;
+        }
+        Ok(&self.buf[self.pos..self.end])
+    }
+
+    /// Skip `n` bytes; false if the track ends first.
+    fn skip(&mut self, n: usize) -> Result<bool, ParseError> {
+        let have = self.end - self.pos;
+        if n <= have {
+            self.pos += n;
+            return Ok(true);
+        }
+        let more = n - have;
+        if more > self.left {
+            return Ok(false);
+        }
+        self.pos = self.end;
+        let skipped = std::io::copy(&mut (&mut self.src).take(more as u64), &mut std::io::sink())?;
+        self.left -= more;
+        Ok(skipped == more as u64)
+    }
+}
+
+/// Reads a range of a file by position, counting bytes into `progress`.
+struct FileAt<'a> {
+    file: &'a File,
+    offset: u64,
+    progress: &'a std::sync::atomic::AtomicU64,
+}
+
+impl Read for FileAt<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        use std::os::windows::fs::FileExt;
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
+        #[cfg(windows)]
+        let n = self.file.seek_read(buf, self.offset)?;
+        #[cfg(unix)]
+        let n = self.file.read_at(buf, self.offset)?;
+        self.offset += n as u64;
+        self.progress.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Writes records and cuts them into chunks as it goes, so only the current chunk is held.
+struct Packer<'a> {
+    dedup: &'a Dedup,
     vel_levels: u8,
-    scratch: &mut Scratch,
-    dedup: &Dedup,
-) -> Result<PackedTrack, ParseError> {
-    const NONE: u32 = u32::MAX;
-    const NEVER: u32 = NONE;
-    let Scratch { note_ends, next, data, cuts } = scratch;
-    note_ends.clear();
-    next.clear();
-    data.clear();
-    cuts.clear();
+    /// The chunk being written.
+    data: &'a mut Vec<u8>,
+    /// Finished chunks (ids from `Dedup::insert`).
+    refs: Vec<u32>,
+    logical_bytes: u64,
+    stats: PackStats,
+    last_tick: u32,
+    running: u8,
+    running_vel: u8,
+    running_dur: u32,
+    /// Gear hash of the chunk so far.
+    hash: u64,
+}
 
-    // Pass 1: note end ticks, indexed by note-on ordinal.
-    // Open notes per channel+key: FIFO as a linked list through `next` (head/tail ordinals).
-    let mut head = [NONE; 16 * 128];
-    let mut tail = [NONE; 16 * 128];
-    let mut tempos = Vec::new();
-    let mut pitch_range: Option<(u8, u8)> = None;
-    let end_tick = walk_raw_track(buf, |tick, ev| match ev {
-        RawEvent::Channel { status, d1, d2 } => {
-            let slot = (status as usize & 0x0F) * 128 + (d1 as usize & 0x7F);
-            match status & 0xF0 {
-                0x90 if d2 > 0 => {
-                    let ord = note_ends.len() as u32;
-                    note_ends.push(NEVER);
-                    next.push(NONE);
-                    match tail[slot] {
-                        NONE => head[slot] = ord,
-                        t => next[t as usize] = ord,
-                    }
-                    tail[slot] = ord;
-                    pitch_range = Some(match pitch_range {
-                        Some((lo, hi)) => (lo.min(d1), hi.max(d1)),
-                        None => (d1, d1),
-                    });
-                }
-                0x80 | 0x90 => {
-                    let ord = head[slot];
-                    if ord != NONE {
-                        note_ends[ord as usize] = tick;
-                        head[slot] = next[ord as usize];
-                        if head[slot] == NONE {
-                            tail[slot] = NONE;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        RawEvent::Tempo(t) => tempos.push((tick, t)),
-    })?;
-
-    // Pass 2: write records.
-    let mut last_tick = 0u32;
-    let mut running = 0u8;
-    let (mut running_vel, mut running_dur) = (0u8, 0u32);
-    let mut ord = 0usize;
-    let mut stats = PackStats::default();
-    // Chunk boundaries: after a record, when the rolling hash of the bytes since the
-    // last cut hits the mask (~256 bytes on average), within [MIN, MAX] bytes.
-    const MASK: u64 = (1 << 8) - 1;
-    const MIN: usize = 64;
-    const MAX: usize = 1024;
-    let (mut hash, mut chunk_start) = (0u64, 0usize);
-    let mut cut_after = |data: &mut Vec<u8>, record_start: usize, cuts: &mut Vec<usize>| {
-        for &b in &data[record_start..] {
-            hash = (hash << 1).wrapping_add(GEAR[b as usize]);
-        }
-        let len = data.len() - chunk_start;
-        if (len >= MIN && hash & MASK == 0) || len >= MAX {
-            cuts.push(data.len());
-            chunk_start = data.len();
-            hash = 0;
-        }
-    };
-    walk_raw_track(buf, |tick, ev| {
-        let RawEvent::Channel { status, d1, d2 } = ev else {
-            return;
-        };
-        let is_note_on = status & 0xF0 == 0x90 && d2 > 0;
-        if status & 0xF0 == 0x80 || (status & 0xF0 == 0x90 && !is_note_on) {
-            return; // note-offs are folded into durations
-        }
-        let delta = ((tick - last_tick) as u64) << 2;
-        last_tick = tick;
-        if !is_note_on {
-            let start = data.len();
-            put_vlv(data, delta);
-            if status != running {
-                data.push(status);
-                running = status;
-            }
-            data.push(d1);
-            if !matches!(status & 0xF0, 0xC0 | 0xD0) {
-                data.push(d2);
-            }
-            stats.other_bytes += (data.len() - start) as u64;
-            cut_after(data, start, cuts);
-            return;
-        }
-
-        let vel = quantize_velocity(d2, vel_levels);
-        let end = note_ends[ord];
-        ord += 1;
-        let dur = if end == NEVER { 0 } else { end - tick + 1 };
-        let new_vel = vel != running_vel;
-        let new_dur = dur != running_dur;
+impl Packer<'_> {
+    /// Write the record for `p` (its duration, if it's a note, is final).
+    fn emit(&mut self, p: &Pending) {
+        let data = &mut *self.data;
+        let delta = ((p.tick - self.last_tick) as u64) << 2;
+        self.last_tick = p.tick;
         let start = data.len();
+        if p.status & 0xF0 != 0x90 {
+            put_vlv(data, delta);
+            if p.status != self.running {
+                data.push(p.status);
+                self.running = p.status;
+            }
+            data.push(p.d1);
+            if !matches!(p.status & 0xF0, 0xC0 | 0xD0) {
+                data.push(p.d2);
+            }
+            self.stats.other_bytes += (data.len() - start) as u64;
+            return self.cut_after(start);
+        }
+
+        let vel = quantize_velocity(p.d2, self.vel_levels);
+        let dur = if p.end == NEVER { 0 } else { p.end - p.tick + 1 };
+        let new_vel = vel != self.running_vel;
+        let new_dur = dur != self.running_dur;
         put_vlv(data, delta | new_vel as u64 | (new_dur as u64) << 1);
         let long_delta = data.len() - start > 1;
-        let new_status = status != running;
+        let new_status = p.status != self.running;
         if new_status {
-            data.push(status);
-            running = status;
+            data.push(p.status);
+            self.running = p.status;
         }
-        data.push(d1);
+        data.push(p.d1);
         if new_vel {
             data.push(vel);
-            running_vel = vel;
+            self.running_vel = vel;
         }
         if new_dur {
             let before = data.len();
             put_vlv(data, dur as u64);
-            stats.duration_bytes += (data.len() - before) as u64;
-            running_dur = dur;
+            self.stats.duration_bytes += (data.len() - before) as u64;
+            self.running_dur = dur;
         }
-        stats.notes += 1;
-        stats.new_velocity += new_vel as u64;
-        stats.new_duration += new_dur as u64;
-        stats.long_delta += long_delta as u64;
-        stats.status_byte += new_status as u64;
-        stats.two_byte += (data.len() - start == 2) as u64;
-        cut_after(data, start, cuts);
-    })?;
-    if cuts.last().copied().unwrap_or(0) < data.len() {
-        cuts.push(data.len());
+        let s = &mut self.stats;
+        s.notes += 1;
+        s.new_velocity += new_vel as u64;
+        s.new_duration += new_dur as u64;
+        s.long_delta += long_delta as u64;
+        s.status_byte += new_status as u64;
+        s.two_byte += (data.len() - start == 2) as u64;
+        self.cut_after(start);
     }
 
-    let mut refs = Vec::with_capacity(cuts.len());
-    let mut start = 0;
-    for &end in cuts.iter() {
-        refs.push(dedup.insert(&data[start..end]));
-        start = end;
+    /// Chunk boundaries: after a record, when the rolling hash of the bytes since the
+    /// last cut hits the mask (~256 bytes on average), within [MIN, MAX] bytes.
+    fn cut_after(&mut self, record_start: usize) {
+        const MASK: u64 = (1 << 8) - 1;
+        const MIN: usize = 64;
+        const MAX: usize = 1024;
+        for &b in &self.data[record_start..] {
+            self.hash = (self.hash << 1).wrapping_add(GEAR[b as usize]);
+        }
+        let len = self.data.len();
+        if (len >= MIN && self.hash & MASK == 0) || len >= MAX {
+            self.flush();
+        }
     }
+
+    /// Store the current chunk, if any.
+    fn flush(&mut self) {
+        if !self.data.is_empty() {
+            self.logical_bytes += self.data.len() as u64;
+            self.refs.push(self.dedup.insert(self.data));
+            self.data.clear();
+        }
+        self.hash = 0;
+    }
+}
+
+/// Pack one MTrk payload in a single pass. Records are written in event order, but a
+/// note's record needs its duration, which is only known at its note-off (FIFO per
+/// channel+key). So events wait in a queue until nothing in front of them is waiting:
+/// memory use follows how many notes are held at once, not the length of the track.
+/// (A note that is never released holds up everything after it until the track ends.)
+///
+/// Sequencing events (`sequence`) and writing their records (`Packer`) are separate
+/// stages. Running them on two threads for a big track was tried: about 1.7x slower,
+/// not faster (batches handed over a channel; cause not found).
+fn pack_track<R: Read>(
+    input: &mut Input<R>,
+    vel_levels: u8,
+    scratch: &mut Scratch,
+    dedup: &Dedup,
+) -> Result<PackedTrack, ParseError> {
+    let Scratch { queue, data } = scratch;
+    queue.clear();
+    data.clear();
+    let mut out = Packer {
+        dedup,
+        vel_levels,
+        data,
+        refs: Vec::new(),
+        logical_bytes: 0,
+        stats: PackStats::default(),
+        last_tick: 0,
+        running: 0,
+        running_vel: 0,
+        running_dur: 0,
+        hash: 0,
+    };
+
+    let seq = sequence(input, queue, |p| out.emit(p))?;
+    out.flush();
 
     Ok(PackedTrack {
-        stats,
-        refs,
-        logical_bytes: data.len() as u64,
-        tempos,
-        end_tick,
-        note_count: note_ends.len() as u64,
-        pitch_range,
+        stats: out.stats,
+        refs: out.refs,
+        logical_bytes: out.logical_bytes,
+        tempos: seq.tempos,
+        end_tick: seq.end_tick,
+        note_count: seq.note_count,
+        pitch_range: seq.pitch_range,
     })
 }
 
-/// Walk a raw MTrk payload, calling `f` for channel events and tempo changes.
+/// What `sequence` learns about a track besides its records.
+struct Sequenced {
+    tempos: Vec<(u32, u32)>,
+    end_tick: u32,
+    note_count: u64,
+    pitch_range: Option<(u8, u8)>,
+}
+
+/// Pair note-ons with their note-offs and call `emit` for each record to write, in
+/// order, once its duration is known.
+fn sequence<R: Read>(
+    input: &mut Input<R>,
+    queue: &mut std::collections::VecDeque<Pending>,
+    mut emit: impl FnMut(&Pending),
+) -> Result<Sequenced, ParseError> {
+    const NONE: u32 = u32::MAX;
+    // Open notes per channel+key: a FIFO as a linked list through `Pending::next`
+    // (head/tail sequence numbers; the queue's front is `base`).
+    let mut head = [NONE; 16 * 128];
+    let mut tail = [NONE; 16 * 128];
+    let mut base = 0u32;
+    let mut tempos = Vec::new();
+    let mut pitch_range: Option<(u8, u8)> = None;
+    let mut note_count = 0u64;
+    let end_tick = walk_raw_track(input, |tick, ev| {
+        let RawEvent::Channel { status, d1, d2 } = ev else {
+            if let RawEvent::Tempo(t) = ev {
+                tempos.push((tick, t));
+            }
+            return;
+        };
+        let slot = (status as usize & 0x0F) * 128 + (d1 as usize & 0x7F);
+        let mut p = Pending { tick, end: 0, next: NONE, status, d1, d2 };
+        match status & 0xF0 {
+            0x90 if d2 > 0 => {
+                let seq = base.wrapping_add(queue.len() as u32);
+                p.end = NEVER;
+                match tail[slot] {
+                    NONE => head[slot] = seq,
+                    t => queue[t.wrapping_sub(base) as usize].next = seq,
+                }
+                tail[slot] = seq;
+                queue.push_back(p);
+                note_count += 1;
+                pitch_range = Some(match pitch_range {
+                    Some((lo, hi)) => (lo.min(d1), hi.max(d1)),
+                    None => (d1, d1),
+                });
+            }
+            0x80 | 0x90 => {
+                // Note-offs are folded into durations; one with nothing open is ignored.
+                let seq = head[slot];
+                if seq != NONE {
+                    let note = &mut queue[seq.wrapping_sub(base) as usize];
+                    note.end = tick;
+                    head[slot] = note.next;
+                    if note.next == NONE {
+                        tail[slot] = NONE;
+                    }
+                }
+            }
+            _ => queue.push_back(p),
+        }
+        while let Some(front) = queue.front() {
+            if front.end == NEVER {
+                break; // an open note
+            }
+            emit(front);
+            queue.pop_front();
+            base = base.wrapping_add(1);
+        }
+    })?;
+    // Notes still open were never released.
+    for p in queue.drain(..) {
+        emit(&p);
+    }
+    Ok(Sequenced { tempos, end_tick, note_count, pitch_range })
+}
+
+/// Walk a track, calling `f` for channel events and tempo changes.
 /// Returns the tick of the last event.
-fn walk_raw_track(buf: &[u8], mut f: impl FnMut(u32, RawEvent)) -> Result<u32, ParseError> {
-    let mut cursor: usize = 0;
-    let len = buf.len();
+fn walk_raw_track<R: Read>(
+    input: &mut Input<R>,
+    mut f: impl FnMut(u32, RawEvent),
+) -> Result<u32, ParseError> {
     let mut abs_tick: u32 = 0;
     let mut running_status: u8 = 0;
 
-    while cursor < len {
+    loop {
+        // Room for any event's fixed part: delta (4), status, type, length (4), tempo (3).
+        let w = input.window(16)?;
+        if w.is_empty() {
+            return Ok(abs_tick);
+        }
+        let len = w.len();
+
         // 1) delta (VLV)
-        let (delta, delta_len) = read_vlv_from_buf(&buf[cursor..])?;
-        cursor += delta_len;
+        let (delta, mut cursor) = read_vlv_from_buf(w)?;
         abs_tick = abs_tick.wrapping_add(delta);
 
         if cursor >= len {
@@ -792,7 +978,7 @@ fn walk_raw_track(buf: &[u8], mut f: impl FnMut(u32, RawEvent)) -> Result<u32, P
         }
 
         // 2) status / running status (only channel messages set running status)
-        let mut status = buf[cursor];
+        let mut status = w[cursor];
         if status & 0x80 == 0 {
             status = running_status;
         } else {
@@ -802,12 +988,15 @@ fn walk_raw_track(buf: &[u8], mut f: impl FnMut(u32, RawEvent)) -> Result<u32, P
             cursor += 1;
         }
 
+        // A payload to skip once the event's fixed part is consumed, and the error if
+        // the track ends inside it.
+        let mut skip = (0usize, "");
         match status {
             0x80..=0xBF | 0xE0..=0xEF => {
                 if cursor + 2 > len {
                     return Err("Unexpected end of track in 2-byte MIDI event".into());
                 }
-                let (d1, d2) = (buf[cursor] & 0x7F, buf[cursor + 1] & 0x7F);
+                let (d1, d2) = (w[cursor] & 0x7F, w[cursor + 1] & 0x7F);
                 f(abs_tick, RawEvent::Channel { status, d1, d2 });
                 cursor += 2;
             }
@@ -816,18 +1005,16 @@ fn walk_raw_track(buf: &[u8], mut f: impl FnMut(u32, RawEvent)) -> Result<u32, P
                 if cursor + 1 > len {
                     return Err("Unexpected end of track in 1-byte MIDI event".into());
                 }
-                let d1 = buf[cursor] & 0x7F;
+                let d1 = w[cursor] & 0x7F;
                 f(abs_tick, RawEvent::Channel { status, d1, d2: 0 });
                 cursor += 1;
             }
 
             // SysEx: skipped (never sent during playback)
             0xF0 | 0xF7 => {
-                let (sy_len, sy_len_len) = read_vlv_from_buf(&buf[cursor..])?;
-                cursor += sy_len_len + sy_len as usize;
-                if cursor > len {
-                    return Err("Unexpected end of track in sysex".into());
-                }
+                let (sy_len, sy_len_len) = read_vlv_from_buf(&w[cursor..])?;
+                cursor += sy_len_len;
+                skip = (sy_len as usize, "Unexpected end of track in sysex");
             }
 
             // Meta: only Set Tempo (0x51) is kept
@@ -835,26 +1022,26 @@ fn walk_raw_track(buf: &[u8], mut f: impl FnMut(u32, RawEvent)) -> Result<u32, P
                 if cursor >= len {
                     return Err("Unexpected end of track in meta type".into());
                 }
-                let meta_type = buf[cursor];
+                let meta_type = w[cursor];
                 cursor += 1;
-                let (m_len, m_len_len) = read_vlv_from_buf(&buf[cursor..])?;
+                let (m_len, m_len_len) = read_vlv_from_buf(&w[cursor..])?;
                 cursor += m_len_len;
-                let data = buf
-                    .get(cursor..cursor + m_len as usize)
-                    .ok_or("Unexpected end of track in meta data")?;
-                if meta_type == 0x51 && data.len() >= 3 {
-                    f(abs_tick, RawEvent::Tempo(u32::from_be_bytes([0, data[0], data[1], data[2]])));
+                if meta_type == 0x51 && m_len >= 3 {
+                    let d = w.get(cursor..cursor + 3).ok_or("Unexpected end of track in meta data")?;
+                    f(abs_tick, RawEvent::Tempo(u32::from_be_bytes([0, d[0], d[1], d[2]])));
                 }
-                cursor += data.len();
+                skip = (m_len as usize, "Unexpected end of track in meta data");
             }
 
             _ => {
                 return Err(format!("Unknown MIDI status byte: 0x{:X}", status).into());
             }
         }
+        input.pos += cursor;
+        if !input.skip(skip.0)? {
+            return Err(skip.1.into());
+        }
     }
-
-    Ok(abs_tick)
 }
 
 // ------------------------------------------------------------------
@@ -1016,10 +1203,16 @@ mod tests {
         assert_eq!((quantize_velocity(64, 2), quantize_velocity(65, 2)), (64, 127));
     }
 
+    /// Pack a raw track read through a window of `window` bytes (at least 16).
+    fn pack_raw(raw: &[u8], window: usize, scratch: &mut Scratch, dedup: &Dedup) -> PackedTrack {
+        let mut buf = vec![0u8; window];
+        pack_track(&mut Input::streaming(&mut buf, raw, raw.len()), 127, scratch, dedup).unwrap()
+    }
+
     /// Pack one raw track into a (one-track) MidiFile.
     fn pack_one(raw: &[u8]) -> MidiFile {
         let dedup = Dedup::new();
-        let t = pack_track(raw, 127, &mut Scratch::default(), &dedup).unwrap();
+        let t = pack_raw(raw, 1 << 10, &mut Scratch::default(), &dedup);
         MidiFile::assemble(96, [t], dedup, 0, Default::default())
     }
 
@@ -1039,7 +1232,7 @@ mod tests {
         let mut scratch = Scratch::default();
         let tracks: Vec<_> = [track(100), track(100), track(90)]
             .iter()
-            .map(|raw| pack_track(raw, 127, &mut scratch, &dedup).unwrap())
+            .map(|raw| pack_raw(raw, 1 << 10, &mut scratch, &dedup))
             .collect();
         let m = MidiFile::assemble(96, tracks, dedup, 0, Default::default());
         assert!((m.store.len() as u64) < m.logical_bytes / 2, "{} of {}", m.store.len(), m.logical_bytes);
@@ -1053,6 +1246,167 @@ mod tests {
                 n += 1;
             }
             assert_eq!(n, 2000);
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// What a raw track should pack to.
+    struct Expected {
+        records: Vec<(u32, Record)>,
+        tempos: Vec<(u32, u32)>,
+        end_tick: u32,
+    }
+
+    /// A random raw track (overlapping notes on a few keys, controllers, running status,
+    /// tempo, long meta and sysex payloads) and what packing it should give, with the
+    /// note-offs paired to note-ons the slow, obvious way.
+    fn random_track(rng: &mut Rng, events: usize) -> (Vec<u8>, Expected) {
+        let mut raw = vec![];
+        let mut want = Expected { records: vec![], tempos: vec![], end_tick: 0 };
+        let mut open: std::collections::HashMap<(u8, u8), std::collections::VecDeque<usize>> = Default::default();
+        let (mut tick, mut prev_status) = (0u32, 0u8);
+        for _ in 0..events {
+            let delta = match rng.below(10) {
+                0 => rng.below(300_000),
+                1..=4 => 0,
+                _ => rng.below(8),
+            } as u32;
+            tick += delta;
+            put_vlv(&mut raw, delta as u64);
+            let (ch, key) = (rng.below(3) as u8, 60 + rng.below(4) as u8);
+            let omit = rng.below(2) == 0; // running status, when the status repeats
+            let mut channel = |raw: &mut Vec<u8>, status: u8, data: &[u8]| {
+                if status != prev_status || !omit {
+                    raw.push(status);
+                }
+                prev_status = status;
+                raw.extend_from_slice(data);
+            };
+            match rng.below(15) {
+                0..=5 => {
+                    let vel = 1 + rng.below(127) as u8;
+                    channel(&mut raw, 0x90 | ch, &[key, vel]);
+                    want.records.push((tick, Record::Note { ch, key, vel, dur: None }));
+                    open.entry((ch, key)).or_default().push_back(want.records.len() - 1);
+                }
+                6..=8 => {
+                    if rng.below(2) == 0 {
+                        channel(&mut raw, 0x80 | ch, &[key, rng.below(128) as u8]);
+                    } else {
+                        channel(&mut raw, 0x90 | ch, &[key, 0]);
+                    }
+                    if let Some(i) = open.get_mut(&(ch, key)).and_then(|q| q.pop_front()) {
+                        let Record::Note { ch, key, vel, .. } = want.records[i].1 else { unreachable!() };
+                        let dur = Some(tick - want.records[i].0);
+                        want.records[i].1 = Record::Note { ch, key, vel, dur };
+                    }
+                }
+                9 => {
+                    let (d1, d2) = (rng.below(128) as u8, rng.below(128) as u8);
+                    channel(&mut raw, 0xB0 | ch, &[d1, d2]);
+                    want.records.push((tick, Record::Other { status: 0xB0 | ch, d1, d2 }));
+                }
+                10 => {
+                    let d1 = rng.below(128) as u8;
+                    channel(&mut raw, 0xC0 | ch, &[d1]);
+                    want.records.push((tick, Record::Other { status: 0xC0 | ch, d1, d2: 0 }));
+                }
+                11 => {
+                    let (d1, d2) = (rng.below(128) as u8, rng.below(128) as u8);
+                    channel(&mut raw, 0xE0 | ch, &[d1, d2]);
+                    want.records.push((tick, Record::Other { status: 0xE0 | ch, d1, d2 }));
+                }
+                12 => {
+                    let t = 1 + rng.below(0xFF_FFFF) as u32;
+                    raw.extend_from_slice(&[0xFF, 0x51, 3, (t >> 16) as u8, (t >> 8) as u8, t as u8]);
+                    want.tempos.push((tick, t));
+                    prev_status = 0;
+                }
+                _ => {
+                    // other meta or sysex, sometimes longer than the read window
+                    let n = if rng.below(4) == 0 { 100 + rng.below(200) } else { rng.below(20) } as usize;
+                    raw.extend_from_slice(if rng.below(2) == 0 { &[0xFF, 0x01] } else { &[0xF0] });
+                    put_vlv(&mut raw, n as u64);
+                    raw.extend(std::iter::repeat(0x55).take(n));
+                    prev_status = 0;
+                }
+            }
+        }
+        want.end_tick = tick;
+        (raw, want)
+    }
+
+    fn decode(m: &MidiFile, i: usize) -> Vec<(u32, Record)> {
+        let (mut r, mut out) = (TrackReader::default(), vec![]);
+        while let Some(x) = r.next(m.track(i)) {
+            out.push(x);
+        }
+        out
+    }
+
+    #[test]
+    fn packing_matches_a_naive_model() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for seed in 0..300 {
+            let events = if seed % 50 == 0 { 5000 } else { 1 + rng.below(200) as usize };
+            let (raw, want) = random_track(&mut rng, events);
+            // a tiny window forces refills in the middle of events and payloads
+            for window in [16, 17, 64, 1 << 20] {
+                let dedup = Dedup::new();
+                let t = pack_raw(&raw, window, &mut Scratch::default(), &dedup);
+                let m = MidiFile::assemble(96, [t], dedup, 0, Default::default());
+                assert_eq!(decode(&m, 0), want.records, "seed {seed}, window {window}");
+                assert_eq!((&m.tempos, m.end_tick), (&want.tempos, want.end_tick));
+                let notes = want.records.iter().filter(|r| matches!(r.1, Record::Note { .. })).count();
+                assert_eq!(m.note_count, notes as u64);
+            }
+            // a track already in memory
+            let (dedup, mut raw) = (Dedup::new(), raw);
+            let t = pack_track(&mut Input::whole(&mut raw), 127, &mut Scratch::default(), &dedup).unwrap();
+            let m = MidiFile::assemble(96, [t], dedup, 0, Default::default());
+            assert_eq!(decode(&m, 0), want.records, "seed {seed}, whole");
+        }
+    }
+
+    #[test]
+    fn file_stream_and_big_tracks_load_the_same() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut file = b"MThd".to_vec();
+        file.extend_from_slice(&[0, 0, 0, 6, 0, 1, 0, 3, 0, 96]);
+        let mut wants = vec![];
+        for events in [2000, 3, 800] {
+            let (raw, want) = random_track(&mut rng, events);
+            file.extend_from_slice(b"MTrk");
+            file.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+            file.extend_from_slice(&raw);
+            wants.push(want.records);
+        }
+        let path = std::env::temp_dir().join(format!("fmp_parser_test_{}.mid", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let from_file = MidiFile::open_and_parse(&path, 127, &progress).unwrap();
+        assert!(progress.load(std::sync::atomic::Ordering::Relaxed) >= file.len() as u64 - 14 - 3 * 8);
+        let _ = std::fs::remove_file(&path);
+        // all tracks pooled; only the biggest packed on the reading thread; all of them
+        for pooled_max in [usize::MAX, 1000, 0] {
+            let m = MidiFile::parse_stream_with(&file[..], 127, pooled_max).unwrap();
+            for (i, want) in wants.iter().enumerate() {
+                assert_eq!(&decode(&m, i), want, "pooled_max {pooled_max}, track {i}");
+            }
+            assert_eq!((m.note_count, m.end_tick, m.file_bytes), (from_file.note_count, from_file.end_tick, file.len() as u64));
+        }
+        for (i, want) in wants.iter().enumerate() {
+            assert_eq!(&decode(&from_file, i), want, "file, track {i}");
         }
     }
 }

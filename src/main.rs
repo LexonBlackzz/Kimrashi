@@ -503,6 +503,14 @@ impl eframe::App for AppState {
         };
         current_time_us = current_time_us.min(duration_us);
 
+        // Consumed before the widgets run, so a focused button doesn't also react to it.
+        if self.current_song.is_some()
+            && !ctx.wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        {
+            self.toggle_play(current_time_us);
+        }
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             // Wraps onto a second line instead of clipping when the window is narrow.
@@ -635,27 +643,35 @@ impl AppState {
         self.visible = VisibleNotes::default();
     }
 
+    fn toggle_play(&mut self, current_time_us: u64) {
+        self.playback_time_us = current_time_us;
+        if self.last_telemetry.is_playing {
+            let _ = self.cmd_tx.send(PlayerCommand::Pause);
+            self.last_telemetry.is_playing = false;
+            self.clock.set_paused(current_time_us);
+        } else {
+            let _ = self.cmd_tx.send(PlayerCommand::Resume);
+            self.last_telemetry.is_playing = true;
+            self.clock.set_running(current_time_us);
+        }
+    }
+
     fn transport_controls(&mut self, ui: &mut egui::Ui, current_time_us: u64) {
         if ui.button("Open MIDI…").clicked() {
             self.open_file();
         }
 
         let has_song = self.current_song.is_some();
-        if self.last_telemetry.is_playing {
-            if ui.button("⏸ Pause").clicked() {
-                let _ = self.cmd_tx.send(PlayerCommand::Pause);
-                self.last_telemetry.is_playing = false;
-                self.playback_time_us = current_time_us;
-                self.clock.set_paused(current_time_us);
-            }
-        } else if ui.add_enabled(has_song, egui::Button::new("▶ Play")).clicked() {
-            let _ = self.cmd_tx.send(PlayerCommand::Resume);
-            self.last_telemetry.is_playing = true;
-            self.playback_time_us = current_time_us;
-            self.clock.set_running(current_time_us);
+        let label = if self.last_telemetry.is_playing { "⏸ Pause" } else { "▶ Play" };
+        if ui.add_enabled(has_song, egui::Button::new(label)).clicked() {
+            self.toggle_play(current_time_us);
         }
 
-        if ui.add_enabled(has_song, egui::Button::new("⏹ Stop")).clicked() {
+        if ui
+            .add_enabled(has_song, egui::Button::new("Unload"))
+            .on_hover_text("Close the song and free its memory")
+            .clicked()
+        {
             self.slider_override_us = None;
             self.slider_grabbed = false;
             self.playback_time_us = 0;
