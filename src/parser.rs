@@ -31,6 +31,33 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+/// Bytes of a MIDI file that may know some tracks are repeats of the one just read
+/// (see `archive`): then they need not be read, parsed or stored again.
+pub trait Source: Read {
+    /// The track that just ended spanned bytes `start..end` of the file. How many more
+    /// identical tracks follow it, whose bytes will not be supplied?
+    fn extra_copies(&mut self, _start: u64, _end: u64) -> u64 {
+        0
+    }
+}
+
+/// A plain reader as a `Source`: no repeats.
+pub struct Plain<R>(pub R);
+
+impl<R: Read> Read for Plain<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<R: Read> Source for Plain<R> {}
+
+impl<S: Source + ?Sized> Source for Box<S> {
+    fn extra_copies(&mut self, start: u64, end: u64) -> u64 {
+        (**self).extra_copies(start, end)
+    }
+}
+
 /// How a load is going, and a way to stop it: the bytes read so far (for a progress
 /// bar), and a flag that makes the next read fail.
 #[derive(Default)]
@@ -235,6 +262,9 @@ pub struct MidiFile {
     /// For each packed track, the track of the file it came from (a big track may have
     /// been split by channel, see `pack_track_split`).
     pub track_origin: Vec<u32>,
+    /// How many tracks of the file each packed track stands for (more than 1 when
+    /// identical tracks follow each other; see `Source`).
+    pub track_copies: Vec<u64>,
     /// Number of tracks in the file.
     pub source_tracks: usize,
     /// How many of those have notes.
@@ -400,11 +430,11 @@ impl MidiFile {
     /// reads track chunks while the thread pool packs them; a bounded queue keeps only
     /// a few raw chunks in memory at a time. A track over `POOLED_MAX` is packed by the
     /// reading thread itself, straight off the stream, so it never sits in memory whole.
-    pub(crate) fn parse_stream(r: impl Read, vel_levels: u8) -> Result<Self, ParseError> {
+    pub(crate) fn parse_stream(r: impl Source, vel_levels: u8) -> Result<Self, ParseError> {
         Self::parse_stream_with(r, vel_levels, POOLED_MAX)
     }
 
-    fn parse_stream_with(mut r: impl Read, vel_levels: u8, pooled_max: usize) -> Result<Self, ParseError> {
+    fn parse_stream_with(mut r: impl Source, vel_levels: u8, pooled_max: usize) -> Result<Self, ParseError> {
         let mut hdr = [0u8; 14];
         if r.read_exact(&mut hdr).is_err() || &hdr[..4] != b"MThd" {
             return Err("Not a MIDI file (invalid MThd header)".into());
@@ -413,6 +443,8 @@ impl MidiFile {
 
         let parse_start = std::time::Instant::now();
         let mut file_bytes = 14u64;
+        // (track, how many identical tracks follow it)
+        let mut repeats: Vec<(usize, u64)> = Vec::new();
         let dedup = Dedup::new();
         let budget = ByteBudget::new();
         let (tx, rx) = crossbeam_channel::bounded::<(usize, Vec<u8>)>(rayon::current_num_threads() * 2);
@@ -436,29 +468,41 @@ impl MidiFile {
             let read_result = (|| -> Result<Vec<(usize, PackedTrack)>, ParseError> {
                 let mut own = Vec::new();
                 let (mut window, mut scratch) = (Vec::new(), Scratch::default());
-                for i in 0..num_tracks as usize {
+                let mut i = 0usize;
+                while i < num_tracks as usize {
                     let mut h = [0u8; 8];
                     r.read_exact(&mut h).map_err(|_| "Truncated MIDI file")?;
                     if &h[..4] != b"MTrk" {
                         return Err("Invalid MTrk header".into());
                     }
                     let len = u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as usize;
+                    let start = file_bytes;
                     file_bytes += 8 + len as u64;
                     if len > pooled_max {
                         window.resize(WINDOW, 0);
                         let mut input = Input::streaming(&mut window, r.by_ref().take(len as u64), len);
                         own.push((i, pack_track(&mut input, vel_levels, &mut scratch, dedup)?));
                         scratch.trim();
-                        continue;
+                    } else {
+                        if !budget.acquire(len as u64) {
+                            break; // the packer stopped on an error; it reports it
+                        }
+                        let mut raw = vec![0u8; len];
+                        r.read_exact(&mut raw).map_err(|_| "Truncated MIDI file")?;
+                        if tx.send((i, raw)).is_err() {
+                            break; // the packer stopped on an error; it reports it
+                        }
                     }
-                    if !budget.acquire(len as u64) {
-                        break; // the packer stopped on an error; it reports it
+                    // Identical tracks may follow without their bytes being supplied.
+                    let extra = r.extra_copies(start, file_bytes);
+                    if extra > 0 {
+                        if extra >= num_tracks as u64 - i as u64 {
+                            return Err("More repeated tracks than the header says".into());
+                        }
+                        file_bytes += extra * (8 + len as u64);
+                        repeats.push((i, extra));
                     }
-                    let mut raw = vec![0u8; len];
-                    r.read_exact(&mut raw).map_err(|_| "Truncated MIDI file")?;
-                    if tx.send((i, raw)).is_err() {
-                        break; // the packer stopped on an error; it reports it
-                    }
+                    i += 1 + extra as usize;
                 }
                 Ok(own)
             })();
@@ -468,13 +512,14 @@ impl MidiFile {
         let mut packed = packed?;
         packed.extend(read_result?);
         packed.sort_unstable_by_key(|(i, _)| *i);
-        Ok(Self::assemble(
-            division,
-            packed.into_iter().map(|(_, t)| vec![t]),
-            dedup,
-            file_bytes,
-            parse_start.elapsed(),
-        ))
+        let packed = packed
+            .into_iter()
+            .map(|(i, t)| {
+                let extra = repeats.iter().find(|r| r.0 == i).map_or(0, |r| r.1);
+                (i as u32, 1 + extra, t)
+            })
+            .collect();
+        Ok(Self::assemble_with(division, num_tracks as usize, packed, dedup, file_bytes, parse_start.elapsed()))
     }
 
     fn assemble(
@@ -485,16 +530,29 @@ impl MidiFile {
         parse_time: std::time::Duration,
     ) -> Self {
         let mut source_tracks = 0;
-        let mut packed: Vec<(u32, PackedTrack)> = Vec::new();
+        let mut packed: Vec<(u32, u64, PackedTrack)> = Vec::new();
         for (i, tracks) in packed_in.into_iter().enumerate() {
             source_tracks = i + 1;
-            packed.extend(tracks.into_iter().map(|t| (i as u32, t)));
+            packed.extend(tracks.into_iter().map(|t| (i as u32, 1, t)));
         }
-        let (store, chunks) = dedup.finish(packed.iter_mut().map(|(_, t)| &mut t.refs));
+        Self::assemble_with(division, source_tracks, packed, dedup, file_bytes, parse_time)
+    }
+
+    /// `packed`: (track of the file, how many identical tracks it stands for, track).
+    fn assemble_with(
+        division: u16,
+        source_tracks: usize,
+        mut packed: Vec<(u32, u64, PackedTrack)>,
+        dedup: Dedup,
+        file_bytes: u64,
+        parse_time: std::time::Duration,
+    ) -> Self {
+        let (store, chunks) = dedup.finish(packed.iter_mut().map(|(_, _, t)| &mut t.refs));
         let mut file = MidiFile {
             division,
             tracks: Vec::new(),
             track_origin: Vec::new(),
+            track_copies: Vec::new(),
             source_tracks,
             note_tracks: 0,
             channels_used: 0,
@@ -511,15 +569,16 @@ impl MidiFile {
             pack_stats: PackStats::default(),
         };
         let mut last_with_notes = None;
-        for (origin, t) in packed {
+        for (origin, copies, t) in packed {
             // (a track split by channel is several packed tracks in a row)
             if t.note_count > 0 && last_with_notes != Some(origin) {
                 last_with_notes = Some(origin);
-                file.note_tracks += 1;
+                file.note_tracks += copies as usize;
             }
             file.track_origin.push(origin);
+            file.track_copies.push(copies);
             file.end_tick = file.end_tick.max(t.end_tick);
-            file.note_count += t.note_count;
+            file.note_count += t.note_count * copies;
             file.pitch_range = match (file.pitch_range, t.pitch_range) {
                 (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
                 (a, b) => a.or(b),
@@ -527,7 +586,7 @@ impl MidiFile {
             file.channels_used |= t.channels;
             file.pack_stats.add(&t.stats);
             file.tempos.extend(t.tempos);
-            file.logical_bytes += t.logical_bytes;
+            file.logical_bytes += t.logical_bytes * copies;
             file.tracks.push(t.refs);
         }
         file
@@ -1685,7 +1744,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // all tracks pooled; only the biggest packed on the reading thread; all of them
         for pooled_max in [usize::MAX, 1000, 0] {
-            let m = MidiFile::parse_stream_with(&file[..], 127, pooled_max).unwrap();
+            let m = MidiFile::parse_stream_with(Plain(&file[..]), 127, pooled_max).unwrap();
             for (i, want) in wants.iter().enumerate() {
                 assert_eq!(&decode(&m, i), want, "pooled_max {pooled_max}, track {i}");
             }

@@ -1702,6 +1702,7 @@ fn load_info(song: &SongData) -> (String, String) {
 /// 1234567 -> "1.23M"
 fn si(v: f64) -> String {
     match v {
+        v if v >= 1e12 => format!("{:.2}T", v / 1e12),
         v if v >= 1e9 => format!("{:.2}B", v / 1e9),
         v if v >= 1e6 => format!("{:.2}M", v / 1e6),
         v if v >= 1e3 => format!("{:.1}K", v / 1e3),
@@ -1711,6 +1712,7 @@ fn si(v: f64) -> String {
 
 fn bytes(v: f64) -> String {
     match v {
+        v if v >= 1e12 => format!("{:.2} TB", v / 1e12),
         v if v >= 1e9 => format!("{:.2} GB", v / 1e9),
         v if v >= 1e6 => format!("{:.1} MB", v / 1e6),
         v if v >= 1e3 => format!("{:.1} KB", v / 1e3),

@@ -93,9 +93,10 @@ impl StatsAcc {
 #[derive(Clone, Debug)]
 pub struct PlayerTelemetry {
     pub notes_played: u64,
-    pub nps: u32,
-    /// Note-ons per second skipped to keep the synth in time.
-    pub skipped_nps: u32,
+    pub nps: u64,
+    /// Note-ons per second not played: skipped to keep the synth in time, or copies of
+    /// a repeated track (see `MidiFile::track_copies`).
+    pub skipped_nps: u64,
     /// How far behind the clock event sending is.
     pub lag_us: u64,
     pub polyphony: u32,
@@ -323,7 +324,7 @@ impl Cursor {
                 res.cursor.due.push(t, Due::Track(i as u32));
             }
             res.cursor.readers.push(r);
-            res.started += started;
+            res.started += started * midi.track_copies[i];
             for (ch, key, vel, end) in active {
                 res.chase.push(pack_short(0x90 | ch, key, vel));
                 if let Some(e) = end {
@@ -559,7 +560,9 @@ struct Engine {
     cur: Cursor,
     skipper: Skipper,
     notes_played: u64,
-    notes_this_second: u32,
+    notes_this_second: u64,
+    /// Notes left out because their track repeats an earlier one, since last taken.
+    repeats_skipped: u64,
     /// Notes decoded and notes sent, ever (the cost model takes differences).
     decoded: u64,
     sent: u64,
@@ -577,6 +580,7 @@ impl Engine {
             skipper,
             notes_played: 0,
             notes_this_second: 0,
+            repeats_skipped: 0,
             decoded: 0,
             sent: 0,
             polyphony: 0,
@@ -630,12 +634,15 @@ impl Engine {
         for &i in &self.track_buf {
             let data = song.midi.track(i as usize);
             let r = &mut cur.readers[i as usize];
+            // A track standing for identical ones counts them; they are not played again.
+            let copies = song.midi.track_copies[i as usize];
             while let Some(rec) = r.next_at(data, tick) {
                 match rec {
                     Record::Note { ch, key, vel, dur } => {
-                        self.notes_played += 1;
+                        self.notes_played += copies;
+                        self.repeats_skipped += copies - 1;
                         self.decoded += 1;
-                        self.notes_this_second = self.notes_this_second.saturating_add(1);
+                        self.notes_this_second += copies;
                         let end = dur.map(|d| tick + d);
                         let dur_us = match dur {
                             Some(d) if skipper.interval_us > 0 => (d as f32 * us_per_tick) as u64,
@@ -987,7 +994,8 @@ impl Player {
             // --- Telemetry and Stats ---
             if done - last_second >= Duration::from_secs(1) {
                 live.nps = std::mem::take(&mut eng.notes_this_second);
-                live.skipped_nps = std::mem::take(&mut eng.skipper.skipped);
+                live.skipped_nps =
+                    std::mem::take(&mut eng.skipper.skipped) as u64 + std::mem::take(&mut eng.repeats_skipped);
                 live.stats = acc.take();
                 live.stats.batched = self.out.batched();
                 live.playback_time_us = self.clock.now_us();
