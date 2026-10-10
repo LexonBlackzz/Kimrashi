@@ -182,6 +182,8 @@ pub struct MidiFile {
     pub track_origin: Vec<u32>,
     /// Number of tracks in the file.
     pub source_tracks: usize,
+    /// How many of those have notes.
+    pub note_tracks: usize,
     /// Distinct chunks: where each lives in `store`.
     pub chunks: Vec<Chunk>,
     /// Every distinct chunk's bytes, stored once.
@@ -437,6 +439,7 @@ impl MidiFile {
             tracks: Vec::new(),
             track_origin: Vec::new(),
             source_tracks,
+            note_tracks: 0,
             chunks,
             store,
             logical_bytes: 0,
@@ -449,7 +452,13 @@ impl MidiFile {
             source: None,
             pack_stats: PackStats::default(),
         };
+        let mut last_with_notes = None;
         for (origin, t) in packed {
+            // (a track split by channel is several packed tracks in a row)
+            if t.note_count > 0 && last_with_notes != Some(origin) {
+                last_with_notes = Some(origin);
+                file.note_tracks += 1;
+            }
             file.track_origin.push(origin);
             file.end_tick = file.end_tick.max(t.end_tick);
             file.note_count += t.note_count;
@@ -1383,6 +1392,7 @@ mod tests {
             .map(|raw| vec![pack_raw(raw, 1 << 10, &mut scratch, &dedup)])
             .collect();
         let m = MidiFile::assemble(96, tracks, dedup, 0, Default::default());
+        assert_eq!(m.note_tracks, 3);
         assert!((m.store.len() as u64) < m.logical_bytes / 2, "{} of {}", m.store.len(), m.logical_bytes);
         // every track still decodes to the same notes
         for i in 0..3 {
@@ -1592,6 +1602,8 @@ mod tests {
                 assert_eq!((&m.tempos, m.end_tick), (&want.tempos, want.end_tick));
                 let notes = want.records.iter().filter(|r| matches!(r.1, Record::Note { .. })).count();
                 assert_eq!(m.note_count, notes as u64);
+                // however many channels it was split into, it's one track with notes
+                assert_eq!(m.note_tracks, usize::from(notes > 0));
             }
         }
     }

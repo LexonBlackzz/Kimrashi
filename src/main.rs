@@ -199,6 +199,7 @@ fn main() {
                 last_frame: None,
                 timer_guard,
                 color_by_channel: setting(&saved, "color_by_channel").unwrap_or(true),
+                color_auto: setting(&saved, "color_auto").unwrap_or(true),
             }))
         }),
     );
@@ -449,6 +450,8 @@ struct AppState {
     #[allow(dead_code)]
     timer_guard: TimerGuard,
     color_by_channel: bool,
+    /// Pick by channel or by track from the song (see `colors_by_channel`).
+    color_auto: bool,
 }
 
 impl eframe::App for AppState {
@@ -618,7 +621,7 @@ impl eframe::App for AppState {
                     self.note_speed_seconds,
                     self.notes_upwards,
                     self.flat_notes,
-                    self.color_by_channel,
+                    self.colors_by_channel(),
                     (self.detailed_stats, self.synth_stats),
                     &mut self.visible,
                     &mut self.instances,
@@ -641,6 +644,15 @@ impl eframe::App for AppState {
 impl AppState {
     fn reset_visible_indices(&mut self) {
         self.visible = VisibleNotes::default();
+    }
+
+    /// What to color notes by: the setting, or for Auto, tracks when several have notes
+    /// (a file whose tracks are its parts), else channels.
+    fn colors_by_channel(&self) -> bool {
+        match (&self.current_song, self.color_auto) {
+            (Some(song), true) => song.data.midi.note_tracks < 2,
+            _ => self.color_by_channel,
+        }
     }
 
     fn toggle_play(&mut self, current_time_us: u64) {
@@ -727,8 +739,15 @@ impl AppState {
 
                     ui.label("Colors");
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.color_by_channel, true, "By channel");
-                        ui.selectable_value(&mut self.color_by_channel, false, "By track");
+                        ui.selectable_value(&mut self.color_auto, true, "Auto").on_hover_text(
+                            "By track if several tracks have notes, else by channel",
+                        );
+                        if ui.selectable_label(!self.color_auto && self.color_by_channel, "By channel").clicked() {
+                            (self.color_auto, self.color_by_channel) = (false, true);
+                        }
+                        if ui.selectable_label(!self.color_auto && !self.color_by_channel, "By track").clicked() {
+                            (self.color_auto, self.color_by_channel) = (false, false);
+                        }
                     });
                     ui.end_row();
 
@@ -874,12 +893,13 @@ impl AppState {
     fn save_settings(&self) {
         let output = self.outputs.get(self.output_idx).map_or("", |o| o.1.as_str());
         let text = format!(
-            "note_speed={}\nnotes_rise={}\nflat_notes={}\ncolor_by_channel={}\nvsync={}\n\
+            "note_speed={}\nnotes_rise={}\nflat_notes={}\ncolor_by_channel={}\ncolor_auto={}\nvsync={}\n\
              output={output}\nskip_notes={}\nsynth_limit={}\nvelocity_levels={}\nsvms_batch={}\ndetailed_stats={}\nsynth_stats={}\n",
             self.note_speed_seconds,
             self.notes_upwards,
             self.flat_notes,
             self.color_by_channel,
+            self.color_auto,
             self.vsync_enabled,
             self.skipping,
             self.synth_limit,
