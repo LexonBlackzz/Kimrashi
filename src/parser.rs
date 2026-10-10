@@ -39,6 +39,14 @@ pub trait Source: Read {
     fn extra_copies(&mut self, _start: u64, _end: u64) -> u64 {
         0
     }
+
+    /// A source not yet read that is xz streams, each stream repeated a number of times
+    /// in a row, can hand over one copy of each stream and its count, so that the
+    /// repeats need not be produced and read. (Nothing is consumed: `None` leaves the
+    /// source as it was.)
+    fn xz_runs(&mut self) -> Option<Vec<(Vec<u8>, u64)>> {
+        None
+    }
 }
 
 /// A plain reader as a `Source`: no repeats.
@@ -55,6 +63,10 @@ impl<R: Read> Source for Plain<R> {}
 impl<S: Source + ?Sized> Source for Box<S> {
     fn extra_copies(&mut self, start: u64, end: u64) -> u64 {
         (**self).extra_copies(start, end)
+    }
+
+    fn xz_runs(&mut self) -> Option<Vec<(Vec<u8>, u64)>> {
+        (**self).xz_runs()
     }
 }
 

@@ -316,6 +316,9 @@ fn scan_xz<'a, R: Read + 'a>(mut r: R) -> std::io::Result<XzScan<'a>> {
             let end = starts.get(w).copied().unwrap_or(cur.len());
             let piece = &cur[done..end];
             if stream_end(piece).is_none() {
+                if end < cur.len() {
+                    continue; // a magic inside the stream's data, not the next stream
+                }
                 return Ok(give_up(runs, cur, r)); // not a stream, or cut off
             }
             match runs.last_mut() {
@@ -338,7 +341,7 @@ fn scan_xz<'a, R: Read + 'a>(mut r: R) -> std::io::Result<XzScan<'a>> {
     if runs.iter().all(|run| run.count == 1) {
         return Ok(give_up(runs, cur, r));
     }
-    Ok(XzScan::Repeats(RepeatedXz { runs, run: 0, copy: 0, decoder: None, pos: 0, run_start: 0, peeked: None, skipped: false }))
+    Ok(XzScan::Repeats(RepeatedXz::new(runs)))
 }
 
 /// The decoded bytes of runs of identical xz streams, each run's first copy only if the
@@ -359,10 +362,17 @@ struct RepeatedXz {
 }
 
 impl RepeatedXz {
+    fn new(runs: Vec<XzRun>) -> Self {
+        Self { runs, run: 0, copy: 0, decoder: None, pos: 0, run_start: 0, peeked: None, skipped: false }
+    }
+
     fn decode(&self) -> Box<dyn Read> {
-        let bytes = &self.runs[self.run].bytes;
-        let end = stream_end(bytes).unwrap_or(bytes.len());
-        Box::new(lzma_rust2::XzReader::new(Cursor::new(bytes[..end].to_vec()), true))
+        Self::decode_run(&self.runs[self.run])
+    }
+
+    fn decode_run(run: &XzRun) -> Box<dyn Read> {
+        let end = stream_end(&run.bytes).unwrap_or(run.bytes.len());
+        Box::new(lzma_rust2::XzReader::new(Cursor::new(run.bytes[..end].to_vec()), true))
     }
 }
 
@@ -405,6 +415,36 @@ impl Read for RepeatedXz {
 }
 
 impl Source for RepeatedXz {
+    // When every run decodes to exactly one xz stream (a layer of xz made of repeats of
+    // xz streams), the layer above is those streams, each repeated as often as the run
+    // is: known without producing a byte of the repeats.
+    fn xz_runs(&mut self) -> Option<Vec<(Vec<u8>, u64)>> {
+        if self.run != 0 || self.copy != 0 || self.decoder.is_some() || self.peeked.is_some() || self.pos != 0 {
+            return None;
+        }
+        let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut stored = 0;
+        for run in &self.runs {
+            let mut decoder = Self::decode_run(run);
+            let mut magic = [0u8; 6];
+            decoder.read_exact(&mut magic).ok().filter(|_| magic == XZ_MAGIC)?;
+            let mut bytes = magic.to_vec();
+            decoder.take(XZ_STREAM_MAX as u64 + 1).read_to_end(&mut bytes).ok()?;
+            if bytes.len() > XZ_STREAM_MAX || stream_end(&bytes).is_none() || !magics(&bytes, 1).is_empty() {
+                return None;
+            }
+            stored += bytes.len();
+            if stored > XZ_STORE_MAX {
+                return None;
+            }
+            match out.last_mut() {
+                Some((last, count)) if *last == bytes => *count += run.count,
+                _ => out.push((bytes, run.count)),
+            }
+        }
+        Some(out)
+    }
+
     fn extra_copies(&mut self, start: u64, end: u64) -> u64 {
         let Some(run) = self.runs.get(self.run) else { return 0 };
         // A whole run, one track: its first copy began where the track did and ends here.
@@ -570,6 +610,11 @@ impl<'a> Ctx<'a> {
     fn stream(&mut self, mut r: Box<dyn Source + '_>, depth: usize) -> Result<MidiFile, ParseError> {
         if depth > MAX_DEPTH {
             return Err("Archive nested too deeply".into());
+        }
+        if let Some(runs) = r.xz_runs() {
+            self.layers.push("xz");
+            let runs = runs.into_iter().map(|(bytes, count)| XzRun { bytes, count }).collect();
+            return self.stream(Box::new(RepeatedXz::new(runs)), depth + 1);
         }
         let mut head = Vec::with_capacity(512);
         (&mut r).take(512).read_to_end(&mut head)?;
@@ -807,6 +852,31 @@ mod tests {
         std::fs::write(dir.join("mixed.mid.xz"), mixed).unwrap();
         assert_eq!(load("one.mid.xz").note_count, want.note_count);
         assert_eq!(load("mixed.mid.xz").track_copies, [1, 1, 1]);
+
+        // Repeats of repeats: each stream of that file compressed alone (as the real file
+        // does), so the layer above is known from the runs, without producing the copies.
+        let (first, repeated) = (track(20, 50), track(30, 300));
+        let mut plain = header(41);
+        plain.extend_from_slice(&first);
+        let (head, one) = (xz(&[&header(41)[..], &first].concat()), xz(&repeated));
+        let mut inner = [&head[..]].concat();
+        let mut outer = xz(&head);
+        for _ in 0..40 {
+            plain.extend_from_slice(&repeated);
+            inner.extend_from_slice(&one);
+            outer.extend_from_slice(&xz(&one));
+        }
+        std::fs::write(dir.join("plain3.mid"), &plain).unwrap();
+        std::fs::write(dir.join("nested.mid.xz.xz"), &outer).unwrap();
+        let mut scan = match scan_xz(Cursor::new(&outer)).unwrap() {
+            XzScan::Repeats(r) => r,
+            XzScan::Plain(_) => panic!("the outer streams repeat"),
+        };
+        let runs = scan.xz_runs().expect("the runs decode to whole streams");
+        assert_eq!(runs, [(head.clone(), 1), (one.clone(), 40)]);
+        let (want, got) = (load("plain3.mid"), load("nested.mid.xz.xz"));
+        assert_eq!(got.track_copies, [1, 40]);
+        assert_eq!((got.note_count, got.file_bytes), (want.note_count, want.file_bytes));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
