@@ -1,0 +1,32 @@
+[package]
+name = "kimrashi"
+version = "0.1.0"
+edition = "2021"
+description = "A MIDI player that keeps the whole song packed in memory, with a GPU-rendered piano roll"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+libloading = "0.8.9"
+crossbeam-channel = "0.5.15"
+eframe = { version = "0.32.3", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui = "0.32.3"
+rfd = "0.15.4"
+rayon = "1.11.0"
+egui-wgpu = "0.32.3"
+bytemuck = { version = "1.17", features = ["derive"] }
+# Compressed MIDI loading
+zip = { version = "9", default-features = false, features = ["deflate", "deflate64"] }
+sevenz-rust2 = "0.23"
+lzma-rust2 = "0.21"
+flate2 = "1"
+unrar = "0.5"
+zstd = { version = "0.13", default-features = false }
+tar = { version = "0.4", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["timeapi", "dwmapi", "dxgi", "winerror", "mmeapi", "mmsystem"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
