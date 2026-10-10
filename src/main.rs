@@ -377,6 +377,31 @@ impl NoteSegment {
     }
 }
 
+/// What the cross-track cull does with `note`, which starts no earlier than `prev` (the
+/// last note kept on its key). Layering is by track, higher on top (see `draw_order`):
+/// a note on the same or a higher track hides what it covers; a note on a lower track
+/// can be hidden by `prev`, but never hides it.
+#[derive(Debug, PartialEq)]
+enum Cull {
+    Keep,
+    /// `note` covers `prev` (see `absorb`).
+    MergeIntoPrev,
+    /// `prev` is above `note` and covers it.
+    DropNew,
+}
+
+fn cull_pair(prev: &NoteSegment, note: &NoteSegment, px_us: u64) -> Cull {
+    if note.track >= prev.track {
+        let covers = note.start_us.saturating_sub(prev.start_us) < px_us && note.end_us + px_us > prev.end_us;
+        if covers {
+            return Cull::MergeIntoPrev;
+        }
+    } else if note.end_us <= prev.end_us + px_us {
+        return Cull::DropNew;
+    }
+    Cull::Keep
+}
+
 /// Push `note`, or merge it into the last note pushed on its key (see `absorb`).
 /// `last` holds, per key, the index in `out` of the last note pushed there; only
 /// those from `base` on count (earlier ones belong to other tracks).
@@ -404,6 +429,47 @@ impl Decoded {
     }
 }
 
+/// Fill `out` with `make(note)` for each live note, in the order the GPU draws them,
+/// front to back: higher tracks first, and within a track the later note first. That
+/// is the layering Piano From Above gives, and black MIDI art relies on it: where
+/// tracks overlap, the highest track shows, however its notes are timed.
+/// `window` is in start order, `tracks` the number of tracks in the file.
+fn draw_order(
+    window: &[NoteSegment],
+    tracks: usize,
+    live: impl Fn(&NoteSegment) -> bool,
+    mut make: impl FnMut(&NoteSegment) -> gpu::NoteInstance,
+    counts: &mut Vec<u32>,
+    out: &mut Vec<gpu::NoteInstance>,
+) {
+    out.clear();
+    if tracks <= 1 {
+        out.extend(window.iter().rev().filter(|n| live(n)).map(&mut make));
+        return;
+    }
+    // A counting sort by track, stable (so later notes stay first within a track).
+    counts.clear();
+    counts.resize(tracks + 1, 0);
+    let slot = |n: &NoteSegment| (n.track as usize).min(tracks);
+    let mut total = 0;
+    for n in window.iter().filter(|n| live(n)) {
+        counts[slot(n)] += 1;
+        total += 1;
+    }
+    let mut at = 0;
+    for c in counts.iter_mut().rev() {
+        let n = *c;
+        *c = at;
+        at += n;
+    }
+    out.resize(total as usize, bytemuck::Zeroable::zeroed());
+    for n in window.iter().rev().filter(|n| live(n)) {
+        let dest = &mut counts[slot(n)];
+        out[*dest as usize] = make(n);
+        *dest += 1;
+    }
+}
+
 /// Notes on screen. Each note is decoded from the packed tracks once, when it enters
 /// the window, and dropped once it has finished.
 #[derive(Default)]
@@ -421,6 +487,8 @@ struct VisibleNotes {
     /// Notes in `window` after the last sweep of finished ones, and frames since.
     alive: usize,
     frames_since_sweep: u32,
+    /// Scratch for `draw_order`.
+    track_counts: Vec<u32>,
     /// Where the last `advance` spent its time (for `FrameLog`).
     timing: AdvanceTimes,
 }
@@ -542,10 +610,21 @@ impl VisibleNotes {
         for r in first_new..self.window.len() {
             let note = self.window[r];
             let k = note.pitch as usize & 127;
-            if last[k] == usize::MAX || !note.absorb(&mut self.window[last[k]], px_us) {
-                self.window[w] = note;
-                last[k] = w;
-                w += 1;
+            let action = if last[k] == usize::MAX {
+                Cull::Keep
+            } else {
+                cull_pair(&self.window[last[k]], &note, px_us)
+            };
+            match action {
+                Cull::Keep => {
+                    self.window[w] = note;
+                    last[k] = w;
+                    w += 1;
+                }
+                Cull::MergeIntoPrev => {
+                    note.absorb(&mut self.window[last[k]], px_us);
+                }
+                Cull::DropNew => {}
             }
         }
         self.window.truncate(w);
@@ -1260,34 +1339,35 @@ fn draw_piano_roll(
 
         // Reuses last frame's allocation once the GPU callback has dropped its clone.
         let buf = Arc::make_mut(instances);
-        buf.clear();
-        // Newest first: the GPU draws front to back (see the depth test in gpu.rs).
-        for note in visible
-            .window
-            .iter()
-            .rev()
-            .filter(|n| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us)
-        {
-            let color = song.color_for(note, color_by_channel);
-            // The newest sounding note on a key is the one shown on top.
-            if note.start_us <= now_us && note.end_us > now_us && !active_keys[note.pitch as usize] {
-                let idx = note.pitch as usize;
-                active_keys[idx] = true;
-                active_colors[idx] = color;
-            }
+        // The note shown on top of each sounding key: the one drawn first (see `draw_order`).
+        let mut top = [None::<(u16, u64)>; 128];
+        draw_order(
+            &visible.window,
+            song.data.midi.source_tracks,
+            |n| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us,
+            |note| {
+                let color = song.color_for(note, color_by_channel);
+                let idx = note.pitch as usize & 127;
+                if note.start_us <= now_us && note.end_us > now_us && top[idx] < Some((note.track, note.start_us)) {
+                    top[idx] = Some((note.track, note.start_us));
+                    active_keys[idx] = true;
+                    active_colors[idx] = color;
+                }
 
-            // Start is relative to `now_us` and can be negative (in the past); the shader clips.
-            let start_secs = (note.start_us as i64 - now_us as i64) as f32 / 1_000_000.0;
-            let len_secs = (note.end_us - note.start_us) as f32 / 1_000_000.0;
-            let color_u32 =
-                ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
-            buf.push(gpu::NoteInstance {
-                start: start_secs,
-                len: len_secs.max(0.000_1),
-                key_color: note.pitch as u32 | (color_u32 << 8),
-                border_width: 1,
-            });
-        }
+                // Start is relative to `now_us` and can be negative (in the past); the shader clips.
+                let start_secs = (note.start_us as i64 - now_us as i64) as f32 / 1_000_000.0;
+                let len_secs = (note.end_us - note.start_us) as f32 / 1_000_000.0;
+                let color_u32 = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+                gpu::NoteInstance {
+                    start: start_secs,
+                    len: len_secs.max(0.000_1),
+                    key_color: note.pitch as u32 | (color_u32 << 8),
+                    border_width: 1,
+                }
+            },
+            &mut visible.track_counts,
+            buf,
+        );
 
         times.build = t0.elapsed();
         times.instances = buf.len();
@@ -1731,6 +1811,39 @@ fn color_from_hsv(h: f32, s: f32, v: f32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn higher_tracks_are_drawn_in_front() {
+        let n = |track, start_us| NoteSegment { start_us, end_us: start_us + 5, track, channel: 0, pitch: 60 };
+        // in start order, as the window keeps them
+        let window = [n(0, 0), n(2, 10), n(1, 20), n(2, 30), n(2, 99_999)];
+        let live = |n: &NoteSegment| n.start_us < 1000;
+        let make = |n: &NoteSegment| gpu::NoteInstance { start: n.start_us as f32, len: 1.0, key_color: n.track as u32, border_width: 1 };
+        let (mut counts, mut out) = (vec![], vec![]);
+        draw_order(&window, 3, live, make, &mut counts, &mut out);
+        let got: Vec<_> = out.iter().map(|i| (i.key_color, i.start as u64)).collect();
+        // track 2 first, its later note in front of its earlier one; then 1, then 0
+        assert_eq!(got, [(2, 30), (2, 10), (1, 20), (0, 0)]);
+        // one track: just newest first
+        draw_order(&window, 1, live, make, &mut counts, &mut out);
+        let got: Vec<_> = out.iter().map(|i| i.start as u64).collect();
+        assert_eq!(got, [30, 20, 10, 0]);
+    }
+
+    #[test]
+    fn cross_track_cull_respects_layering() {
+        let n = |track, start_us, end_us| NoteSegment { start_us, end_us, track, channel: 0, pitch: 60 };
+        let px = 100;
+        // a later note on the same or a higher track that covers the earlier one hides it
+        assert_eq!(cull_pair(&n(1, 0, 500), &n(1, 10, 500), px), Cull::MergeIntoPrev);
+        assert_eq!(cull_pair(&n(1, 0, 500), &n(2, 10, 500), px), Cull::MergeIntoPrev);
+        // a lower track starting later is behind: it never hides the note above it...
+        assert_eq!(cull_pair(&n(2, 0, 500), &n(1, 10, 900), px), Cull::Keep);
+        // ...and it is dropped if that note covers it
+        assert_eq!(cull_pair(&n(2, 0, 500), &n(1, 10, 400), px), Cull::DropNew);
+        // a higher track that doesn't cover the earlier note leaves it showing
+        assert_eq!(cull_pair(&n(1, 0, 900), &n(2, 10, 300), px), Cull::Keep);
+    }
 
     #[test]
     fn culls_only_fully_hidden_notes() {
