@@ -30,7 +30,7 @@ struct Args {
     analyze: bool,
 }
 
-fn parse_time(s: &str) -> Result<u64, String> {
+pub fn parse_time(s: &str) -> Result<u64, String> {
     let secs = match s.split_once(':') {
         Some((m, s)) => m.parse::<f64>().map_err(|e| e.to_string())? * 60.0 + s.parse::<f64>().map_err(|e| e.to_string())?,
         None => s.parse::<f64>().map_err(|e| e.to_string())?,

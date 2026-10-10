@@ -16,6 +16,8 @@ pub struct TempoSegment {
 #[derive(Clone, Debug)]
 pub struct TempoMap {
     segments: Vec<TempoSegment>,
+    /// Microseconds per tick of each segment.
+    us_per_tick: Vec<f64>,
     division: u16,
     duration_ticks: u32,
     duration_us: u64,
@@ -105,6 +107,7 @@ impl TempoMap {
         }
 
         Self {
+            us_per_tick: segments.iter().map(|s| s.us_per_quarter as f64 / division as f64).collect(),
             segments,
             division,
             duration_ticks: final_duration_ticks,
@@ -144,6 +147,19 @@ impl TempoMap {
         }
 
         self.duration_us
+    }
+
+    /// `tick_to_time_with_cache` for drawing: a multiplication instead of an exact
+    /// division, so a microsecond off at most.
+    #[inline]
+    pub fn tick_to_time_approx(&self, tick: u32, cached_idx: &mut usize) -> u64 {
+        if let Some(seg) = self.segments.get(*cached_idx) {
+            if tick >= seg.start_tick && tick < seg.end_tick {
+                let ticks = (tick - seg.start_tick) as f64;
+                return seg.start_us + (ticks * self.us_per_tick[*cached_idx]) as u64;
+            }
+        }
+        self.tick_to_time_with_cache(tick, cached_idx)
     }
 
     pub fn time_to_tick(&self, time_us: u64) -> u32 {

@@ -25,7 +25,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::io::Write as _;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use winapi::um::timeapi::{timeBeginPeriod, timeEndPeriod};
@@ -159,12 +160,24 @@ fn main() {
         ..Default::default()
     };
 
+    // `kimrashi [file] [--from m:ss]`: open a file at startup, optionally seeking into it.
+    let mut open_path = None;
+    let mut open_at_us = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--from" => open_at_us = args.next().and_then(|t| bench::parse_time(&t).ok()),
+            _ if !arg.starts_with("--") => open_path = Some(std::path::PathBuf::from(arg)),
+            _ => {}
+        }
+    }
+
     let _ = eframe::run_native(
         "kimrashi",
         native_options,
         Box::new(move |_cc| {
             let timer_guard = create_timer_guard();
-            Ok(Box::new(AppState {
+            let mut state = AppState {
                 telemetry_rx,
                 cmd_tx,
                 stop,
@@ -200,9 +213,100 @@ fn main() {
                 timer_guard,
                 color_by_channel: setting(&saved, "color_by_channel").unwrap_or(true),
                 color_auto: setting(&saved, "color_auto").unwrap_or(true),
-            }))
+                frame_times: FrameTimes::default(),
+                frame_log: FrameLog::from_env(),
+                open_at_us,
+            };
+            if let Some(path) = open_path {
+                state.start_loading(path);
+            }
+            Ok(Box::new(state))
         }),
     );
+}
+
+/// Where a frame's CPU time went (see `FrameLog`).
+#[derive(Default, Clone, Copy)]
+struct FrameTimes {
+    /// Decoding notes into the window, culling and sorting them.
+    advance: AdvanceTimes,
+    /// Turning the window into GPU instances.
+    build: Duration,
+    instances: usize,
+    /// Notes decoded this frame.
+    decoded: usize,
+}
+
+/// With `KIM_FRAMELOG=path` set, one line per second of average frame numbers.
+struct FrameLog {
+    file: std::fs::File,
+    since: Instant,
+    frames: u32,
+    update: Duration,
+    worst: Duration,
+    /// Retain, decode, sort, cull, build.
+    parts: [Duration; 5],
+    instances: usize,
+    decoded: usize,
+}
+
+impl FrameLog {
+    fn from_env() -> Option<Self> {
+        let mut file = std::fs::File::create(std::env::var_os("KIM_FRAMELOG")?).ok()?;
+        let _ = writeln!(
+            file,
+            "fps,update_ms,worst_update_ms,retain_ms,decode_ms,sort_ms,cull_ms,build_ms,instances,new_per_frame"
+        );
+        Some(Self::new(file))
+    }
+
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file,
+            since: Instant::now(),
+            frames: 0,
+            update: Duration::ZERO,
+            worst: Duration::ZERO,
+            parts: [Duration::ZERO; 5],
+            instances: 0,
+            decoded: 0,
+        }
+    }
+
+    fn record(&mut self, update: Duration, t: &FrameTimes) {
+        self.frames += 1;
+        self.update += update;
+        self.worst = self.worst.max(update);
+        let a = t.advance;
+        for (sum, d) in self.parts.iter_mut().zip([a.retain, a.decode, a.sort, a.cull, t.build]) {
+            *sum += d;
+        }
+        self.instances = self.instances.max(t.instances);
+        self.decoded += t.decoded;
+        let wall = self.since.elapsed();
+        if wall >= Duration::from_secs(1) {
+            let n = self.frames.max(1) as f64;
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            let _ = writeln!(
+                self.file,
+                "{:.1},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{}",
+                self.frames as f64 / wall.as_secs_f64(),
+                ms(self.update) / n,
+                ms(self.worst),
+                ms(self.parts[0]) / n,
+                ms(self.parts[1]) / n,
+                ms(self.parts[2]) / n,
+                ms(self.parts[3]) / n,
+                ms(self.parts[4]) / n,
+                self.instances,
+                (self.decoded as f64 / n) as u64
+            );
+            let _ = self.file.flush();
+            if let Ok(file) = self.file.try_clone() {
+                *self = Self::new(file);
+            }
+        }
+    }
 }
 
 struct VisualSong {
@@ -296,6 +400,19 @@ struct VisibleNotes {
     px_us: u64,
     /// Notes decoded last frame, to decide whether decoding is worth parallelizing.
     last_batch: usize,
+    /// Notes in `window` after the last sweep of finished ones, and frames since.
+    alive: usize,
+    frames_since_sweep: u32,
+    /// Where the last `advance` spent its time (for `FrameLog`).
+    timing: AdvanceTimes,
+}
+
+#[derive(Default, Clone, Copy)]
+struct AdvanceTimes {
+    retain: Duration,
+    decode: Duration,
+    sort: Duration,
+    cull: Duration,
 }
 
 impl VisibleNotes {
@@ -313,7 +430,17 @@ impl VisibleNotes {
         self.px_us = self.px_us.max(px_us);
         let jumped = now_us - self.time_us > 1_000_000;
         self.time_us = now_us;
-        self.window.retain(|n| n.end_us + NOTE_HOLD_MICROS > now_us);
+        // Finished notes are skipped when drawing, and swept out now and then (a sweep
+        // visits every note on screen).
+        let t0 = Instant::now();
+        self.frames_since_sweep += 1;
+        if self.window.len() >= self.alive.max(4096) * 2 || self.frames_since_sweep >= 240 {
+            self.window.retain(|n| n.end_us + NOTE_HOLD_MICROS > now_us);
+            self.alive = self.window.len();
+            self.frames_since_sweep = 0;
+        }
+        self.timing.retain = t0.elapsed();
+        let t0 = Instant::now();
 
         let tempo = &song.tempo;
         let now_tick = tempo.time_to_tick(now_us);
@@ -322,25 +449,19 @@ impl VisibleNotes {
             let data = song.midi.track(track);
             let mut tempo_cache = 0;
             let mut last = [usize::MAX; 128];
-            loop {
-                let mut n = *r;
-                let Some((tick, rec)) = n.next(data) else { break };
-                if tick >= end_tick {
-                    break;
-                }
-                *r = n;
+            while let Some((tick, rec)) = r.next_before(data, end_tick) {
                 let Record::Note { ch, key, dur, .. } = rec else { continue };
                 // Cheap tick check first so fast-forwarding skips finished notes.
                 if dur.is_some_and(|d| tick + d < now_tick) {
                     continue;
                 }
                 let end_us = match dur {
-                    Some(d) => tempo.tick_to_time_with_cache(tick + d, &mut tempo_cache),
+                    Some(d) => tempo.tick_to_time_approx(tick + d, &mut tempo_cache),
                     None => tempo.duration_us(),
                 };
                 if end_us + NOTE_HOLD_MICROS > now_us {
                     let note = NoteSegment {
-                        start_us: tempo.tick_to_time_with_cache(tick, &mut tempo_cache),
+                        start_us: tempo.tick_to_time_approx(tick, &mut tempo_cache),
                         end_us,
                         track: song.midi.track_origin[track] as u16,
                         channel: ch,
@@ -370,12 +491,16 @@ impl VisibleNotes {
                 decode(i, r, &mut self.window);
             }
         }
+        self.timing.decode = t0.elapsed();
+        let t0 = Instant::now();
         // Draw order = start time, so later notes cover earlier ones. New notes all start
         // after the existing ones, so sorting just the batch keeps each key in order.
         // Stable: equal starts keep track order (higher track on top). Each track's run is
         // already sorted, so this is a cheap run merge.
         self.last_batch = self.window.len() - first_new;
         self.window[first_new..].sort_by_key(|n| n.start_us);
+        self.timing.sort = t0.elapsed();
+        let t0 = Instant::now();
 
         // Cull across tracks too (tracks were culled individually while decoding),
         // compacting the batch in place.
@@ -391,6 +516,7 @@ impl VisibleNotes {
             }
         }
         self.window.truncate(w);
+        self.timing.cull = t0.elapsed();
     }
 }
 
@@ -452,6 +578,10 @@ struct AppState {
     color_by_channel: bool,
     /// Pick by channel or by track from the song (see `colors_by_channel`).
     color_auto: bool,
+    frame_times: FrameTimes,
+    frame_log: Option<FrameLog>,
+    /// Where to seek once the file given on the command line has loaded.
+    open_at_us: Option<u64>,
 }
 
 impl eframe::App for AppState {
@@ -630,10 +760,15 @@ impl eframe::App for AppState {
                     (self.detailed_stats, self.synth_stats),
                     &mut self.visible,
                     &mut self.instances,
+                    &mut self.frame_times,
                 );
             });
 
         self.settings_window(ctx);
+
+        if let Some(log) = &mut self.frame_log {
+            log.record(frame_start.elapsed(), &self.frame_times);
+        }
 
         // Always keep egui's animation loop active.
         ctx.request_repaint();
@@ -976,6 +1111,9 @@ impl AppState {
                 // Reset the clock before Play so it can't override the player's start.
                 self.clock.set_paused(0);
                 let _ = self.cmd_tx.send(PlayerCommand::Play(song.clone()));
+                if let Some(us) = self.open_at_us.take() {
+                    let _ = self.cmd_tx.send(PlayerCommand::Seek(us));
+                }
 
                 self.last_telemetry.midi_path = song.path.clone();
                 self.last_telemetry.duration_us = duration;
@@ -1011,6 +1149,7 @@ fn draw_piano_roll(
     (detailed_stats, synth_stats): (bool, bool),
     visible: &mut VisibleNotes,
     instances: &mut Arc<Vec<gpu::NoteInstance>>,
+    times: &mut FrameTimes,
 ) {
     let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
     let rect = response.rect;
@@ -1082,12 +1221,20 @@ fn draw_piano_roll(
     if let Some(song) = song {
         let px_us = future_us as f32 / (note_area.height() * ui.ctx().pixels_per_point()).max(1.0);
         visible.advance(&song.data, now_us, window_end, px_us as u64);
+        times.advance = visible.timing;
+        times.decoded = visible.last_batch;
+        let t0 = Instant::now();
 
         // Reuses last frame's allocation once the GPU callback has dropped its clone.
         let buf = Arc::make_mut(instances);
         buf.clear();
         // Newest first: the GPU draws front to back (see the depth test in gpu.rs).
-        for note in visible.window.iter().rev().filter(|n| n.start_us < window_end) {
+        for note in visible
+            .window
+            .iter()
+            .rev()
+            .filter(|n| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us)
+        {
             let color = song.color_for(note, color_by_channel);
             // The newest sounding note on a key is the one shown on top.
             if note.start_us <= now_us && note.end_us > now_us && !active_keys[note.pitch as usize] {
@@ -1109,6 +1256,8 @@ fn draw_piano_roll(
             });
         }
 
+        times.build = t0.elapsed();
+        times.instances = buf.len();
         if let Some(state) = frame.wgpu_render_state() {
             if !buf.is_empty() {
                 painter.add(gpu::NotesCallback::new(

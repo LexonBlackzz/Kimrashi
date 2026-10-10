@@ -143,6 +143,22 @@ impl TrackReader {
         Some(self.tick.wrapping_add((v >> 2) as u32))
     }
 
+    /// Decode the next record and its tick if the tick is below `limit`; otherwise leave
+    /// the reader as it is.
+    #[inline]
+    pub fn next_before(&mut self, t: Track, limit: u32) -> Option<(u32, Record)> {
+        let (pos, end, next_chunk) = self.locate(t)?;
+        let (v, p) = get_vlv(t.store, pos);
+        let at = self.tick.wrapping_add((v >> 2) as u32);
+        if at >= limit {
+            return None;
+        }
+        self.end = end;
+        self.next_chunk = next_chunk;
+        self.tick = at;
+        Some((at, self.body(t.store, v, p)))
+    }
+
     /// Decode the next record if it is at `tick`; otherwise leave the reader as it is.
     #[inline]
     pub fn next_at(&mut self, t: Track, tick: u32) -> Option<Record> {
