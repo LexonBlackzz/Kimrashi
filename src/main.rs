@@ -378,13 +378,29 @@ impl NoteSegment {
 }
 
 /// Push `note`, or merge it into the last note pushed on its key (see `absorb`).
-/// `last` holds, per key, the index in `out` of the last note pushed there.
+/// `last` holds, per key, the index in `out` of the last note pushed there; only
+/// those from `base` on count (earlier ones belong to other tracks).
 /// This is what keeps polyphony bombs bounded: at most ~one note per key per pixel row.
-fn push_culled(out: &mut Vec<NoteSegment>, last: &mut [usize; 128], note: NoteSegment, px_us: u64) {
+fn push_culled(out: &mut Vec<NoteSegment>, last: &mut [usize; 128], base: usize, note: NoteSegment, px_us: u64) {
     let k = note.pitch as usize & 127;
-    if !out.get_mut(last[k]).is_some_and(|prev| note.absorb(prev, px_us)) {
+    let prev = if last[k] >= base { out.get_mut(last[k]) } else { None };
+    if !prev.is_some_and(|prev| note.absorb(prev, px_us)) {
         last[k] = out.len();
         out.push(note);
+    }
+}
+
+/// What one worker decoded, over a run of tracks.
+struct Decoded {
+    notes: Vec<NoteSegment>,
+    last: [usize; 128],
+    /// Records looked at.
+    scanned: usize,
+}
+
+impl Decoded {
+    fn new(notes: Vec<NoteSegment>) -> Self {
+        Self { notes, last: [usize::MAX; 128], scanned: 0 }
     }
 }
 
@@ -398,8 +414,10 @@ struct VisibleNotes {
     window: Vec<NoteSegment>,
     /// Coarsest time-per-pixel used to cull notes now in `window`.
     px_us: u64,
-    /// Notes decoded last frame, to decide whether decoding is worth parallelizing.
+    /// Notes decoded last frame (after culling), and records looked at, to decide
+    /// whether decoding is worth parallelizing.
     last_batch: usize,
+    last_scanned: usize,
     /// Notes in `window` after the last sweep of finished ones, and frames since.
     alive: usize,
     frames_since_sweep: u32,
@@ -445,11 +463,15 @@ impl VisibleNotes {
         let tempo = &song.tempo;
         let now_tick = tempo.time_to_tick(now_us);
         let end_tick = tempo.time_to_tick(window_end);
-        let decode = |track: usize, r: &mut TrackReader, out: &mut Vec<NoteSegment>| {
+        let decode = |track: usize, r: &mut TrackReader, acc: &mut Decoded| {
             let data = song.midi.track(track);
+            if r.peek_tick(data).map_or(true, |t| t >= end_tick) {
+                return; // nothing new in this track (most of the 60,000 in some files)
+            }
             let mut tempo_cache = 0;
-            let mut last = [usize::MAX; 128];
+            let base = acc.notes.len();
             while let Some((tick, rec)) = r.next_before(data, end_tick) {
+                acc.scanned += 1;
                 let Record::Note { ch, key, dur, .. } = rec else { continue };
                 // Cheap tick check first so fast-forwarding skips finished notes.
                 if dur.is_some_and(|d| tick + d < now_tick) {
@@ -467,29 +489,36 @@ impl VisibleNotes {
                         channel: ch,
                         pitch: key,
                     };
-                    push_culled(out, &mut last, note, px_us);
+                    push_culled(&mut acc.notes, &mut acc.last, base, note, px_us);
                 }
             }
         };
 
         let first_new = self.window.len();
         // Seek / big skip / dense passage: decode all tracks in parallel.
-        if jumped || self.last_batch > 20_000 {
-            let parts: Vec<Vec<NoteSegment>> = self
+        if jumped || self.last_scanned > 50_000 {
+            // Each worker takes a run of tracks into one list (in track order).
+            let parts: Vec<Decoded> = self
                 .readers
                 .par_iter_mut()
                 .enumerate()
-                .map(|(i, r)| {
-                    let mut out = Vec::new();
-                    decode(i, r, &mut out);
-                    out
+                .fold(|| Decoded::new(Vec::new()), |mut acc, (i, r)| {
+                    decode(i, r, &mut acc);
+                    acc
                 })
                 .collect();
-            self.window.extend(parts.into_iter().flatten());
-        } else {
-            for (i, r) in self.readers.iter_mut().enumerate() {
-                decode(i, r, &mut self.window);
+            self.last_scanned = parts.iter().map(|p| p.scanned).sum();
+            self.window.reserve(parts.iter().map(|p| p.notes.len()).sum());
+            for p in parts {
+                self.window.extend(p.notes);
             }
+        } else {
+            let mut acc = Decoded::new(std::mem::take(&mut self.window));
+            for (i, r) in self.readers.iter_mut().enumerate() {
+                decode(i, r, &mut acc);
+            }
+            self.last_scanned = acc.scanned;
+            self.window = acc.notes;
         }
         self.timing.decode = t0.elapsed();
         let t0 = Instant::now();
@@ -498,7 +527,11 @@ impl VisibleNotes {
         // Stable: equal starts keep track order (higher track on top). Each track's run is
         // already sorted, so this is a cheap run merge.
         self.last_batch = self.window.len() - first_new;
-        self.window[first_new..].sort_by_key(|n| n.start_us);
+        if self.last_batch > 50_000 {
+            self.window[first_new..].par_sort_by_key(|n| n.start_us);
+        } else {
+            self.window[first_new..].sort_by_key(|n| n.start_us);
+        }
         self.timing.sort = t0.elapsed();
         let t0 = Instant::now();
 
@@ -1705,12 +1738,12 @@ mod tests {
         let px = 100; // 100 µs per pixel row
         let mut out = vec![];
         let mut last = [usize::MAX; 128];
-        push_culled(&mut out, &mut last, n(0, 500, 60), px);
-        push_culled(&mut out, &mut last, n(10, 500, 60), px); // within a pixel, same end: merged
-        push_culled(&mut out, &mut last, n(20, 300, 60), px); // ends well earlier: still visible
-        push_culled(&mut out, &mut last, n(30, 900, 61), px); // other key
-        push_culled(&mut out, &mut last, n(150, 900, 60), px); // over a pixel later: visible
-        push_culled(&mut out, &mut last, n(240, 1000, 60), px); // merged, keeping start 150
+        push_culled(&mut out, &mut last, 0, n(0, 500, 60), px);
+        push_culled(&mut out, &mut last, 0, n(10, 500, 60), px); // within a pixel, same end: merged
+        push_culled(&mut out, &mut last, 0, n(20, 300, 60), px); // ends well earlier: still visible
+        push_culled(&mut out, &mut last, 0, n(30, 900, 61), px); // other key
+        push_culled(&mut out, &mut last, 0, n(150, 900, 60), px); // over a pixel later: visible
+        push_culled(&mut out, &mut last, 0, n(240, 1000, 60), px); // merged, keeping start 150
         let got: Vec<_> = out.iter().map(|n| (n.start_us, n.end_us, n.pitch)).collect();
         assert_eq!(got, [(0, 500, 60), (20, 300, 60), (30, 900, 61), (150, 1000, 60)]);
     }
