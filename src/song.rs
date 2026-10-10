@@ -167,6 +167,11 @@ impl TempoMap {
     pub fn duration_us(&self) -> u64 {
         self.duration_us
     }
+
+    /// Microseconds per tick in segment `idx` (as left by `tick_to_time_with_cache`).
+    pub fn us_per_tick(&self, idx: usize) -> f32 {
+        self.segments.get(idx).map_or(0.0, |s| s.us_per_quarter as f32 / self.division as f32)
+    }
 }
 
 pub struct SongData {

@@ -92,7 +92,7 @@ impl StatsAcc {
 
 #[derive(Clone, Debug)]
 pub struct PlayerTelemetry {
-    pub notes_played: u32,
+    pub notes_played: u64,
     pub nps: u32,
     /// Note-ons per second skipped to keep the synth in time.
     pub skipped_nps: u32,
@@ -251,9 +251,8 @@ impl<T: Copy> RadixHeap<T> {
     }
 }
 
-/// A pending note-off: (channel, key, virtual). Virtual offs belong to skipped notes;
-/// they only keep the polyphony count right and are never sent.
-type PendingOff = (u8, u8, bool);
+/// A pending note-off: (channel, key).
+type PendingOff = (u8, u8);
 
 /// Something due at a tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -328,7 +327,7 @@ impl Cursor {
             for (ch, key, vel, end) in active {
                 res.chase.push(pack_short(0x90 | ch, key, vel));
                 if let Some(e) = end {
-                    res.cursor.due.push(e, Due::Off((ch, key, false)));
+                    res.cursor.due.push(e, Due::Off((ch, key)));
                 }
             }
         }
@@ -352,17 +351,43 @@ enum OffAction {
     Hold,
 }
 
+/// What sending costs, for `Skipper::regulate` to budget with.
+#[derive(Clone, Copy)]
+struct Costs {
+    /// Time in the synth per message sent (ns).
+    synth_ns: f32,
+    /// Our own time per note decoded (ns).
+    engine_ns: f32,
+    /// Messages sent per note sent (its note-off, and events riding along).
+    msgs_per_note: f32,
+    /// Song time runs this much faster than the wall clock.
+    speed: f64,
+}
+
+impl Default for Costs {
+    fn default() -> Self {
+        Self { synth_ns: 100.0, engine_ns: 20.0, msgs_per_note: 2.0, speed: 1.0 }
+    }
+}
+
 /// Smart note skipping for synths that can't keep up.
 ///
-/// While playback is on time, nothing is skipped. When sending falls behind the clock
-/// (or exceeds the user's synth limit), a minimum re-strike interval per channel+key
-/// kicks in and adapts: a note-on that re-strikes a key sooner than that is skipped.
+/// Every few ms the skipper works out how many notes per second the thread can send
+/// (its time, minus what decoding takes, over what the synth charges per note) and
+/// compares that with the notes the song asks for, counted per channel+key. When the
+/// song asks for more, every key gets the same minimum re-strike interval, the one at
+/// which the keys together just fit: a key played less often than that is never
+/// touched, a key hammered faster is thinned to that rate. A note-on that re-strikes
+/// a key sooner than the interval is skipped:
 /// - If the key is still sounding, the skipped note is merged into it: the sounding
 ///   note's note-off is postponed to the skipped note's end, so sustain isn't chopped.
 /// - A note on a silent key is only skipped if it's also short (shorter than the
 ///   interval); longer notes are always played.
 /// - Controllers, pitch bend etc. and note-offs of sent notes are never dropped, so
 ///   nothing gets stuck, and every key keeps sounding at a bounded rate.
+///
+/// The cost model can be off (a synth's price per message varies with its load), so
+/// lag behind the clock scales the budget down, and on-time playback scales it back up.
 struct Skipper {
     /// Minimum time between note-ons on one channel+key; 0 = send everything.
     interval_us: u64,
@@ -372,16 +397,26 @@ struct Skipper {
     sounding: Box<[u32; SLOTS]>,
     /// Per slot: tick the sounding note must last until to cover merged notes (0 = none).
     hold_until: Box<[u32; SLOTS]>,
+    /// Note-ons per slot since the last `regulate`, sent or not.
+    demand: Box<[u32; SLOTS]>,
+    /// Note-ons per second per slot, smoothed: up at once, down slowly.
+    rate: Box<[f32; SLOTS]>,
     limit_nps: u32,
     /// Off: never skip (interval stays 0).
     enabled: bool,
     window_start: Instant,
-    sent_in_window: u32,
+    /// Scales the time budget: lower when behind the clock.
+    gain: f32,
+    /// Skipped since the telemetry last took it.
     skipped: u32,
 }
 
 impl Skipper {
     const NEVER: u32 = u32::MAX;
+    /// How much of the thread's time to plan on using; the rest absorbs jitter.
+    const UTILIZATION: f32 = 0.9;
+    /// Seconds between budget updates.
+    const STEP: f32 = 0.004;
 
     fn new(limit_nps: u32, enabled: bool) -> Self {
         Self {
@@ -390,9 +425,11 @@ impl Skipper {
             last_on_us: Box::new([u64::MAX; SLOTS]),
             sounding: Box::new([0; SLOTS]),
             hold_until: Box::new([0; SLOTS]),
+            demand: Box::new([0; SLOTS]),
+            rate: Box::new([0.0; SLOTS]),
             limit_nps,
             window_start: Instant::now(),
-            sent_in_window: 0,
+            gain: 1.0,
             skipped: 0,
         }
     }
@@ -403,7 +440,9 @@ impl Skipper {
 
     /// Decide whether to send a note-on at `time_us`. `end` is its end tick (None =
     /// never released) and `dur_us` its length.
+    #[inline]
     fn note_on(&mut self, slot: usize, time_us: u64, end: Option<u32>, dur_us: u64) -> bool {
+        self.demand[slot] += 1;
         let last = self.last_on_us[slot];
         let too_soon = last != u64::MAX && time_us.saturating_sub(last) < self.interval_us;
         if too_soon {
@@ -420,11 +459,11 @@ impl Skipper {
         }
         self.last_on_us[slot] = time_us;
         self.sounding[slot] += 1;
-        self.sent_in_window += 1;
         true
     }
 
     /// A sent note's note-off is due at `tick`.
+    #[inline]
     fn note_off(&mut self, slot: usize, tick: u32) -> OffAction {
         let hold = self.hold_until[slot];
         if self.sounding[slot] == 1 && hold > tick {
@@ -441,37 +480,55 @@ impl Skipper {
         OffAction::Send
     }
 
-    /// Adapt the re-strike interval to how far behind sending is (`lag_us`) and to the
-    /// note rate limit. Grows fast under pressure (at least a quarter of the lag, so a
-    /// sudden bomb is caught within a few ms), decays slowly once comfortably on time.
-    fn regulate(&mut self, lag_us: u64) {
+    /// Set the re-strike interval for the notes the song is asking for, given how far
+    /// behind the clock sending is (`lag_us`) and what sending costs. Does nothing
+    /// until `STEP` has passed since the last time.
+    fn regulate(&mut self, lag_us: u64, now: Instant, costs: Costs) {
         if !self.enabled {
             self.interval_us = 0;
             return;
         }
-        let elapsed = self.window_start.elapsed();
-        if elapsed < Duration::from_millis(5) {
+        let elapsed = now.saturating_duration_since(self.window_start).as_secs_f32();
+        if elapsed < Self::STEP {
             return;
         }
-        let rate = self.sent_in_window as f64 / elapsed.as_secs_f64();
-        let limit = self.limit_nps as f64;
-        let over_limit = self.limit_nps != 0 && rate > limit;
-        if lag_us > 20_000 || over_limit {
-            self.interval_us = (self.interval_us * 2).max(lag_us / 4).clamp(250, 500_000);
-        } else if lag_us < 5_000 && (self.limit_nps == 0 || rate < limit * 0.8) {
-            self.interval_us = self.interval_us * 3 / 4;
-            if self.interval_us < 250 {
-                self.interval_us = 0;
-            }
+        self.window_start = now;
+        let mut asked = 0.0;
+        for (rate, n) in self.rate.iter_mut().zip(self.demand.iter_mut()) {
+            let new = *n as f32 / elapsed;
+            *rate = if new > *rate { new } else { *rate * 0.9 + new * 0.1 };
+            *n = 0;
+            asked += *rate;
         }
-        self.window_start = Instant::now();
-        self.sent_in_window = 0;
+        self.gain = match lag_us {
+            8_001.. => (self.gain * 0.85).max(0.05),
+            2_001.. => self.gain * 0.98,
+            0..1_000 => (self.gain * 1.01).min(1.3),
+            _ => self.gain,
+        };
+        let budget_ns = 1e9 * Self::UTILIZATION * self.gain - asked * costs.engine_ns;
+        let mut can_send = (budget_ns / (costs.msgs_per_note.max(1.0) * costs.synth_ns).max(1.0)).max(2_000.0);
+        if self.limit_nps != 0 {
+            can_send = can_send.min(self.limit_nps as f32);
+        }
+        // Once limiting, stay until the demand is clearly under, so it doesn't flap.
+        let slack = if self.interval_us > 0 { 0.9 } else { 1.0 };
+        if asked <= can_send * slack {
+            self.interval_us = 0;
+            return;
+        }
+        let per_key = fair_share(&self.rate[..], can_send);
+        // Wall-clock rate to a song-time interval.
+        let interval = 1e6 / per_key.max(1.0) as f64 * costs.speed;
+        self.interval_us = (interval as u64).clamp(100, 500_000);
     }
 
     /// Forget all per-key state (after a seek or output change); `chase` are the
     /// note-ons sent to restore the sound at `time_us`.
     fn reset(&mut self, chase: &[u32], time_us: u64) {
+        let gain = self.gain;
         *self = Self::new(self.limit_nps, self.enabled);
+        self.gain = gain;
         for &msg in chase {
             let slot = Self::slot(msg as u8, (msg >> 8) as u8);
             self.sounding[slot] += 1;
@@ -480,16 +537,34 @@ impl Skipper {
     }
 }
 
+/// The rate `c` at which `sum(min(rate, c)) == budget`: each key gets what it asks for
+/// up to `c`. (If everything fits, the largest rate.)
+fn fair_share(rates: &[f32], budget: f32) -> f32 {
+    let (mut lo, mut hi) = (0.0f32, rates.iter().copied().fold(0.0, f32::max));
+    for _ in 0..24 {
+        let mid = (lo + hi) / 2.0;
+        let sum: f32 = rates.iter().map(|&r| r.min(mid)).sum();
+        if sum > budget {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    lo
+}
+
 /// The playback thread's hot path: turns ticks into MIDI messages. Free of clocks,
 /// channels and synth calls, so it can be benchmarked on its own.
 struct Engine {
     cur: Cursor,
     skipper: Skipper,
-    notes_played: u32,
+    notes_played: u64,
     notes_this_second: u32,
+    /// Notes decoded and notes sent, ever (the cost model takes differences).
+    decoded: u64,
+    sent: u64,
     polyphony: u32,
     peak_polyphony: u32,
-    end_tempo_idx: usize,
     /// Scratch: what's due this tick, and its tracks.
     due_buf: Vec<Due>,
     track_buf: Vec<u32>,
@@ -502,9 +577,10 @@ impl Engine {
             skipper,
             notes_played: 0,
             notes_this_second: 0,
+            decoded: 0,
+            sent: 0,
             polyphony: 0,
             peak_polyphony: 0,
-            end_tempo_idx: 0,
             due_buf: Vec::new(),
             track_buf: Vec::new(),
         }
@@ -517,10 +593,10 @@ impl Engine {
         live.peak_polyphony = self.peak_polyphony;
     }
 
-    /// Append the messages for `tick` (which plays at `target_us`) to `batch`: due
-    /// note-offs first, so a key struck again on this tick isn't cut off, then every
-    /// track's records at this tick.
-    fn process_tick(&mut self, song: &SongData, tick: u32, target_us: u64, batch: &mut Vec<u32>) {
+    /// Append the messages for `tick` (which plays at `target_us`, `us_per_tick` long)
+    /// to `batch`: due note-offs first, so a key struck again on this tick isn't cut
+    /// off, then every track's records at this tick.
+    fn process_tick(&mut self, song: &SongData, tick: u32, target_us: u64, us_per_tick: f32, batch: &mut Vec<u32>) {
         let cur = &mut self.cur;
         let skipper = &mut self.skipper;
 
@@ -530,23 +606,19 @@ impl Engine {
         }
         cur.due.take_min(&mut self.due_buf);
         for &due in &self.due_buf {
-            let (ch, key, virt) = match due {
+            let (ch, key) = match due {
                 Due::Off(off) => off,
                 Due::Track(i) => {
                     self.track_buf.push(i);
                     continue;
                 }
             };
-            if virt {
-                self.polyphony = self.polyphony.saturating_sub(1);
-                continue;
-            }
             match skipper.note_off(Skipper::slot(ch, key), tick) {
                 OffAction::Send => {
                     self.polyphony = self.polyphony.saturating_sub(1);
                     batch.push(pack_short(0x80 | ch, key, 0));
                 }
-                OffAction::Postpone(t2) => cur.due.push(t2, Due::Off((ch, key, false))),
+                OffAction::Postpone(t2) => cur.due.push(t2, Due::Off((ch, key))),
                 OffAction::Hold => {}
             }
         }
@@ -558,34 +630,27 @@ impl Engine {
         for &i in &self.track_buf {
             let data = song.midi.track(i as usize);
             let r = &mut cur.readers[i as usize];
-            loop {
-                let mut n = *r;
-                let rec = match n.next(data) {
-                    Some((t, rec)) if t == tick => rec,
-                    _ => break,
-                };
-                *r = n;
+            while let Some(rec) = r.next_at(data, tick) {
                 match rec {
                     Record::Note { ch, key, vel, dur } => {
-                        self.notes_played = self.notes_played.saturating_add(1);
+                        self.notes_played += 1;
+                        self.decoded += 1;
                         self.notes_this_second = self.notes_this_second.saturating_add(1);
-                        self.polyphony += 1;
-                        self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
                         let end = dur.map(|d| tick + d);
-                        let dur_us = match end {
-                            Some(e) if skipper.interval_us > 0 => song
-                                .tempo
-                                .tick_to_time_with_cache(e, &mut self.end_tempo_idx)
-                                - target_us,
+                        let dur_us = match dur {
+                            Some(d) if skipper.interval_us > 0 => (d as f32 * us_per_tick) as u64,
                             _ => 0,
                         };
-                        let send = skipper.note_on(Skipper::slot(ch, key), target_us, end, dur_us);
-                        if let Some(e) = end {
-                            // A zero-length note's off lands on this tick: it's taken on
-                            // the next call, after this note-on, as in the file.
-                            cur.due.push(e, Due::Off((ch, key, !send)));
-                        }
-                        if send {
+                        // A skipped note leaves nothing behind: no note-off, no polyphony.
+                        if skipper.note_on(Skipper::slot(ch, key), target_us, end, dur_us) {
+                            self.sent += 1;
+                            self.polyphony += 1;
+                            self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
+                            if let Some(e) = end {
+                                // A zero-length note's off lands on this tick: it's taken on
+                                // the next call, after this note-on, as in the file.
+                                cur.due.push(e, Due::Off((ch, key)));
+                            }
                             batch.push(pack_short(0x90 | ch, key, vel));
                         }
                     }
@@ -708,6 +773,9 @@ impl Player {
         }
 
         const UI_UPDATE: Duration = Duration::from_millis(33);
+        /// Most messages sent in one call, so a long backlog doesn't hold up the synth
+        /// for long before the first of them is heard.
+        const MAX_SLICE_MSGS: usize = 1 << 15;
 
         let tempo = &song.tempo;
         let duration_us = tempo.duration_us();
@@ -715,6 +783,7 @@ impl Player {
         // One tick's messages, sent to the synth in one timed call (or loop).
         let mut batch: Vec<u32> = Vec::new();
         let mut acc = StatsAcc::new();
+        let mut costs = Costs::default();
         let open_log = |on: bool| on.then(|| StatsLog::create(&song.path)).and_then(|r| {
             r.map_err(|e| eprintln!("Could not create stats log: {e}")).ok()
         });
@@ -730,7 +799,7 @@ impl Player {
             ..PlayerTelemetry::default()
         };
         let mut abs_time_us: u64 = 0;
-        let mut current_tempo_segment_idx: usize = 0;
+        let mut seg_idx: usize = 0;
 
         let mut last_second = Instant::now();
         let mut last_ui = Instant::now();
@@ -803,7 +872,8 @@ impl Player {
                 }
             }
 
-            if self.clock.is_paused() {
+            let (paused, now_us, speed) = self.clock.snapshot();
+            if paused {
                 thread::sleep(Duration::from_millis(5));
                 continue;
             }
@@ -812,12 +882,12 @@ impl Player {
                 let target_tick = tempo.time_to_tick(target_us.min(duration_us));
                 let seek = Cursor::seek(&song, target_tick);
                 eng.cur = seek.cursor;
-                eng.notes_played = seek.started as u32;
+                eng.notes_played = seek.started;
                 eng.polyphony = seek.chase.len() as u32;
                 eng.peak_polyphony = eng.peak_polyphony.max(eng.polyphony);
                 eng.notes_this_second = 0;
                 abs_time_us =
-                    tempo.tick_to_time_with_cache(target_tick, &mut current_tempo_segment_idx);
+                    tempo.tick_to_time_with_cache(target_tick, &mut seg_idx);
                 eng.skipper.reset(&seek.chase, abs_time_us);
                 self.clock.set_running(abs_time_us);
                 eng.sync(&mut live);
@@ -832,7 +902,7 @@ impl Player {
             }
 
             let Some(tick) = eng.cur.next_tick() else {
-                if self.clock.now_us() >= duration_us {
+                if now_us >= duration_us {
                     // Finished: pause at the end but stay on this song so seeks still work.
                     self.all_notes_off();
                     abs_time_us = duration_us;
@@ -850,12 +920,10 @@ impl Player {
                 continue;
             };
 
-            let target_us = tempo.tick_to_time_with_cache(tick, &mut current_tempo_segment_idx);
+            let target_us = tempo.tick_to_time_with_cache(tick, &mut seg_idx);
 
             // Wait for the event's time. Sleep in short slices (commands stay responsive),
             // then spin the last stretch for accuracy.
-            let now_us = self.clock.now_us();
-            let speed = self.clock.speed();
             if target_us > now_us {
                 // Song time runs `speed`x faster than wall time.
                 let wait_us = ((target_us - now_us) as f64 / speed) as u64;
@@ -866,25 +934,58 @@ impl Player {
                 }
                 continue;
             }
-            let tick_start = Instant::now();
-            abs_time_us = target_us;
-            live.lag_us = ((now_us - target_us) as f64 / speed) as u64; // wall time
-            eng.skipper.regulate(live.lag_us);
-            batch.clear();
-            eng.process_tick(&song, tick, target_us, &mut batch);
 
-            // Send this tick's messages, timing the synth separately from our own work.
+            // Everything due by now goes out in one call, in order. (When behind, that
+            // is a lot of ticks: one clock read, one synth call and one stats update
+            // instead of one each per tick.)
+            let slice_start = Instant::now();
+            live.lag_us = ((now_us - target_us) as f64 / speed) as u64; // wall time
+            costs.speed = speed;
+            eng.skipper.regulate(live.lag_us, slice_start, costs);
+            batch.clear();
+            let (decoded0, sent0) = (eng.decoded, eng.sent);
+            let (mut tick, mut target_us) = (tick, target_us);
+            loop {
+                abs_time_us = target_us;
+                eng.process_tick(&song, tick, target_us, tempo.us_per_tick(seg_idx), &mut batch);
+                acc.ticks += 1;
+                if batch.len() >= MAX_SLICE_MSGS {
+                    break;
+                }
+                let Some(next) = eng.cur.next_tick() else { break };
+                let next_us = tempo.tick_to_time_with_cache(next, &mut seg_idx);
+                if next_us > now_us {
+                    break;
+                }
+                (tick, target_us) = (next, next_us);
+            }
+
+            // Send, timing the synth separately from our own work.
             let send_start = Instant::now();
             self.out.send_batch(&batch);
-            let send_time = send_start.elapsed();
-            acc.sched += send_start - tick_start;
+            let done = Instant::now();
+            let (send_time, own_time) = (done - send_start, send_start - slice_start);
+            acc.sched += own_time;
             acc.synth += send_time;
             acc.worst_batch = acc.worst_batch.max(send_time);
             acc.msgs += batch.len() as u64;
-            acc.ticks += 1;
+
+            // What things cost, for the skipper's budget (only from slices big enough
+            // to measure).
+            let (decoded, sent) = ((eng.decoded - decoded0) as f32, (eng.sent - sent0) as f32);
+            let ewma = |cost: &mut f32, sample: f32| *cost += 0.2 * (sample - *cost);
+            if batch.len() >= 32 {
+                ewma(&mut costs.synth_ns, send_time.as_nanos() as f32 / batch.len() as f32);
+            }
+            if decoded >= 32.0 {
+                ewma(&mut costs.engine_ns, own_time.as_nanos() as f32 / decoded);
+            }
+            if sent >= 32.0 {
+                ewma(&mut costs.msgs_per_note, batch.len() as f32 / sent);
+            }
 
             // --- Telemetry and Stats ---
-            if last_second.elapsed() >= Duration::from_secs(1) {
+            if done - last_second >= Duration::from_secs(1) {
                 live.nps = std::mem::take(&mut eng.notes_this_second);
                 live.skipped_nps = std::mem::take(&mut eng.skipper.skipped);
                 live.stats = acc.take();
@@ -894,16 +995,16 @@ impl Player {
                 if let Some(log) = &mut log {
                     log.row(&live, speed, &self.choice, self.skipping);
                 }
-                last_second = Instant::now();
+                last_second = done;
             }
 
-            if last_ui.elapsed() >= UI_UPDATE {
+            if done - last_ui >= UI_UPDATE {
                 eng.sync(&mut live);
                 live.svms = self.out.svms_stats();
                 live.playback_time_us = self.clock.now_us();
                 live.is_playing = !self.clock.is_paused();
                 self.telemetry_tx.send(live.clone()).ok();
-                last_ui = Instant::now();
+                last_ui = done;
             }
         }
     }
@@ -950,7 +1051,7 @@ mod tests {
         let mut offs: Vec<_> = cursor.due.buckets.iter().flatten().copied().collect();
         offs.retain(|(_, d)| matches!(d, Due::Off(_)));
         offs.sort();
-        assert_eq!(offs, [(192, Due::Off((0, 60, false))), (384, Due::Off((1, 48, false)))]);
+        assert_eq!(offs, [(192, Due::Off((0, 60))), (384, Due::Off((1, 48)))]);
     }
 
     #[test]
@@ -984,5 +1085,165 @@ mod tests {
         assert!(s.note_on(slot, 0, Some(10), 100));
         assert!(!s.note_on(slot, 10, None, 0));
         assert_eq!(s.note_off(slot, 10), OffAction::Hold);
+    }
+    /// What a tick should send: its note-offs (sorted), then its messages in track order.
+    type Tick = (Vec<u32>, Vec<u32>);
+
+    /// Write a song of three tracks of notes on different keys (and some controllers) to
+    /// `path`, and return what each tick should send.
+    fn random_song(path: &std::path::Path) -> std::collections::BTreeMap<u32, Tick> {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut want: std::collections::BTreeMap<u32, Tick> = Default::default();
+        let mut file = b"MThd".to_vec();
+        file.extend_from_slice(&[0, 0, 0, 6, 0, 1, 0, 3, 0, 96]);
+        for _ in 0..3 {
+            // (tick, 0 = note-off, which goes first in a tick, and the message)
+            let mut events: Vec<(u32, u8, u32)> = vec![];
+            let mut busy_until = [0u32; 16 * 128];
+            let mut tick = 0u32;
+            for _ in 0..300 {
+                tick += rnd(6) as u32;
+                let (ch, key) = (rnd(3) as u8, 60 + rnd(12) as u8);
+                if rnd(5) == 0 {
+                    let (d1, d2) = (rnd(128) as u8, rnd(128) as u8);
+                    events.push((tick, 1, pack_short(0xB0 | ch, d1, d2)));
+                } else if busy_until[Skipper::slot(ch, key)] <= tick {
+                    let (vel, len) = (1 + rnd(127) as u8, 1 + rnd(20) as u32);
+                    busy_until[Skipper::slot(ch, key)] = tick + len;
+                    events.push((tick, 1, pack_short(0x90 | ch, key, vel)));
+                    events.push((tick + len, 0, pack_short(0x80 | ch, key, 0)));
+                }
+            }
+            events.sort_by_key(|e| (e.0, e.1)); // stable: generation order within a kind
+            let (mut trk, mut last) = (vec![], 0);
+            for &(t, kind, msg) in &events {
+                // delta as a variable-length quantity
+                let mut delta = vec![((t - last) & 0x7F) as u8];
+                let mut d = (t - last) >> 7;
+                while d > 0 {
+                    delta.push((d & 0x7F) as u8 | 0x80);
+                    d >>= 7;
+                }
+                trk.extend(delta.iter().rev());
+                let data = [msg as u8, (msg >> 8) as u8, (msg >> 16) as u8];
+                trk.extend_from_slice(if msg as u8 & 0xF0 == 0xC0 { &data[..2] } else { &data[..] });
+                last = t;
+                let e = want.entry(t).or_default();
+                if kind == 0 {
+                    e.0.push(msg)
+                } else {
+                    e.1.push(msg)
+                }
+            }
+            file.extend_from_slice(b"MTrk");
+            file.extend_from_slice(&(trk.len() as u32).to_be_bytes());
+            file.extend_from_slice(&trk);
+        }
+        std::fs::write(path, file).unwrap();
+        for (offs, _) in want.values_mut() {
+            offs.sort();
+        }
+        want
+    }
+
+    fn load_random_song(name: &str) -> (Arc<SongData>, std::collections::BTreeMap<u32, Tick>) {
+        let path = std::env::temp_dir().join(format!("kimrashi_{name}_{}.mid", std::process::id()));
+        let want = random_song(&path);
+        let song = SongData::load(&path, 127, &Default::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        (song, want)
+    }
+
+    #[test]
+    fn engine_sends_what_the_file_says_when_nothing_is_skipped() {
+        let (song, want) = load_random_song("engine");
+        let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
+        let mut got: std::collections::BTreeMap<u32, Tick> = Default::default();
+        while let Some(tick) = eng.cur.next_tick() {
+            let mut batch = vec![];
+            eng.process_tick(&song, tick, 0, 0.0, &mut batch);
+            let n_offs = batch.iter().take_while(|&&m| m & 0xF0 == 0x80).count();
+            let (offs, rest) = batch.split_at(n_offs);
+            let e = got.entry(tick).or_default();
+            e.0.extend(offs);
+            e.0.sort();
+            e.1.extend_from_slice(rest);
+        }
+        assert_eq!(got, want);
+        assert_eq!(eng.polyphony, 0);
+    }
+
+    #[test]
+    fn engine_skipping_leaves_no_stuck_notes() {
+        let (song, want) = load_random_song("engine_skip");
+        let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
+        eng.skipper.interval_us = 600; // 100 us per tick: a key can sound every 6th tick
+        let (mut ons, mut offs) = ([0i32; 16 * 128], [0i32; 16 * 128]);
+        let mut sent = 0;
+        while let Some(tick) = eng.cur.next_tick() {
+            let mut batch = vec![];
+            eng.process_tick(&song, tick, tick as u64 * 100, 100.0, &mut batch);
+            for m in batch {
+                let slot = Skipper::slot(m as u8, (m >> 8) as u8);
+                match m & 0xF0 {
+                    0x90 => {
+                        ons[slot] += 1;
+                        sent += 1;
+                    }
+                    0x80 => offs[slot] += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(ons, offs);
+        let asked = want.values().flat_map(|t| &t.1).filter(|&&m| m & 0xF0 == 0x90).count();
+        assert!(sent > 0 && sent < asked, "{sent} of {asked}");
+        assert_eq!(eng.polyphony, 0);
+    }
+
+    #[test]
+    fn budget_goes_to_the_keys_that_ask_for_more_than_their_share() {
+        // Many keys at 1000 notes/s and one sparse key at 10/s; a slow synth (1 us per
+        // message, 2 messages per note) can take 450K notes/s: 450 per key.
+        let mut rates = vec![1000.0f32; 1000];
+        rates.push(10.0);
+        let share = fair_share(&rates, 450_000.0);
+        assert!((share - 450.0).abs() < 1.0, "{share}");
+        // Everything fits: nobody is capped (the share is at least the largest rate).
+        assert!(fair_share(&rates, 2_000_000.0) >= 999.0);
+
+        let costs = Costs { synth_ns: 1000.0, engine_ns: 0.0, msgs_per_note: 2.0, speed: 1.0 };
+        let ask = |s: &mut Skipper| {
+            for slot in 0..1000 {
+                for _ in 0..5 {
+                    s.note_on(slot, 0, Some(1), 0); // 5 in 5 ms = 1000/s
+                }
+            }
+        };
+        let mut s = Skipper::new(0, true);
+        ask(&mut s);
+        s.regulate(0, s.window_start + Duration::from_millis(5), costs);
+        // 450 notes/s per key is one every 2.2 ms
+        assert!((2_100..2_350).contains(&s.interval_us), "{}", s.interval_us);
+
+        // A fast synth takes it all: no skipping.
+        let mut s = Skipper::new(0, true);
+        ask(&mut s);
+        let fast = Costs { synth_ns: 50.0, ..costs };
+        s.regulate(0, s.window_start + Duration::from_millis(5), fast);
+        assert_eq!(s.interval_us, 0);
+
+        // Falling behind the clock shrinks the budget even if the model says all is well.
+        for _ in 0..20 {
+            ask(&mut s);
+            s.regulate(50_000, s.window_start + Duration::from_millis(5), fast);
+        }
+        assert!(s.interval_us > 0 && s.gain < 0.2, "{} {}", s.interval_us, s.gain);
     }
 }

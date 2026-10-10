@@ -72,6 +72,15 @@ impl PlaybackClock {
         state.offset_us.saturating_add(elapsed as u64)
     }
 
+    /// Whether it's paused, the position and the speed, under one lock.
+    pub fn snapshot(&self) -> (bool, u64, f64) {
+        let state = self.state.lock().unwrap();
+        match state.anchor {
+            Some(anchor) => (false, Self::position(&state, anchor), state.speed),
+            None => (true, state.offset_us, state.speed),
+        }
+    }
+
     pub fn is_paused(&self) -> bool {
         self.state.lock().unwrap().anchor.is_none()
     }

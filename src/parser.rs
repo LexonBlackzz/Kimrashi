@@ -119,6 +119,21 @@ impl TrackReader {
         Some(self.tick.wrapping_add((v >> 2) as u32))
     }
 
+    /// Decode the next record if it is at `tick`; otherwise leave the reader as it is.
+    #[inline]
+    pub fn next_at(&mut self, t: Track, tick: u32) -> Option<Record> {
+        let (pos, end, next_chunk) = self.locate(t)?;
+        let (v, p) = get_vlv(t.store, pos);
+        let at = self.tick.wrapping_add((v >> 2) as u32);
+        if at != tick {
+            return None;
+        }
+        self.end = end;
+        self.next_chunk = next_chunk;
+        self.tick = at;
+        Some(self.body(t.store, v, p))
+    }
+
     /// Decode the next record and its absolute tick.
     #[inline]
     pub fn next(&mut self, t: Track) -> Option<(u32, Record)> {
