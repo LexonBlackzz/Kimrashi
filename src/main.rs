@@ -196,6 +196,8 @@ fn main() {
                 log_stats: false,
                 detailed_stats: setting(&saved, "detailed_stats").unwrap_or(false),
                 synth_stats: setting(&saved, "synth_stats").unwrap_or(false),
+                loading_details: setting(&saved, "loading_details").unwrap_or(false),
+                verify_repeats: setting(&saved, "verify_repeats").unwrap_or(false),
                 svms_batch,
                 loading: None,
                 show_settings: false,
@@ -571,6 +573,86 @@ impl VisibleNotes {
     }
 }
 
+/// A byte count with a unit (decimal: kB to PB).
+fn si_bytes(b: u64) -> String {
+    let (mut v, mut unit) = (b as f64, 0);
+    while v >= 1000.0 && unit < 5 {
+        v /= 1000.0;
+        unit += 1;
+    }
+    format!("{v:.1} {}", ["B", "kB", "MB", "GB", "TB", "PB"][unit])
+}
+
+/// The load's counters (all relaxed atomics the worker bumps once per track): rates are
+/// averages since the start, so nothing is sampled.
+fn loading_details(ui: &mut egui::Ui, l: &Loading) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = &l.progress;
+    let live = p.live_notes.load(Relaxed);
+    let (read, midi, notes) = (p.bytes.load(Relaxed), p.midi_bytes.load(Relaxed), p.notes.load(Relaxed) + live);
+    let done = p.tracks_done.load(Relaxed);
+    let total = p.tracks_total.load(Relaxed).max(done); // (a header can undercount)
+    let secs_f = l.started.elapsed().as_secs_f64().max(0.001);
+    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1e6);
+    let layers = p.layers.lock().map(|s| s.clone()).unwrap_or_default();
+    egui::Grid::new("loading_details").num_columns(2).show(ui, |ui| {
+        ui.label("Format");
+        ui.label(if layers.is_empty() { "mid".to_owned() } else { format!("{layers} › mid") });
+        ui.end_row();
+        ui.label("Read from disk");
+        ui.label(format!("{} of {} ({}/s)", mb(read.min(l.total)), mb(l.total), mb((read as f64 / secs_f) as u64)));
+        ui.end_row();
+        ui.label("MIDI parsed");
+        ui.label(format!("{} ({}/s)", mb(midi), mb((midi as f64 / secs_f) as u64)));
+        ui.end_row();
+        let scanned = p.scan_done.load(Relaxed);
+        if scanned > 0 {
+            // The layer is read in full to find the repeated tracks; a track's share of it
+            // times the track count is a guess at the whole.
+            let unit = p.scan_unit.load(Relaxed);
+            let guess = unit * p.tracks_total.load(Relaxed);
+            // The speed over the last ~10 s (an average since the start would count the
+            // time spent parsing, when nothing was scanned).
+            let id = egui::Id::new("scan_samples");
+            let mut samples: Vec<(f64, u64)> = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+            if samples.last().is_none_or(|s| secs_f - s.0 >= 0.5) {
+                samples.push((secs_f, scanned));
+            }
+            samples.retain(|s| s.0 <= secs_f && secs_f - s.0 <= 10.0);
+            let rate = match samples.first() {
+                Some(&(t, b)) if secs_f - t > 1.0 => scanned.saturating_sub(b) as f64 / (secs_f - t),
+                _ => scanned as f64 / secs_f,
+            };
+            ui.data_mut(|d| d.insert_temp(id, samples));
+            ui.label("Scanning repeats");
+            ui.label(if guess > scanned {
+                let left = (guess - scanned) as f64 / rate.max(1.0);
+                format!("{} of ~{} ({}/s, ~{} left)", si_bytes(scanned), si_bytes(guess), si_bytes(rate as u64), secs(left))
+            } else {
+                format!("{} ({}/s)", si_bytes(scanned), si_bytes(rate as u64))
+            });
+            ui.end_row();
+        }
+        let trusted = p.trusted_tracks.load(Relaxed);
+        if trusted > 0 {
+            ui.label("Repeats");
+            ui.label(format!("{trusted} tracks counted without reading (sizes add up)"));
+            ui.end_row();
+        }
+        ui.label("Tracks");
+        ui.label(if total == 0 { "waiting for the header…".to_owned() } else { format!("{done} of {total}") });
+        ui.end_row();
+        if live > 0 {
+            ui.label("Current track");
+            ui.label(format!("{} notes found so far", si(live as f64)));
+            ui.end_row();
+        }
+        ui.label("Notes");
+        ui.label(format!("{} ({}/s)", si(notes as f64), si(notes as f64 / secs_f)));
+        ui.end_row();
+    });
+}
+
 /// A file being loaded on a worker thread.
 struct Loading {
     name: String,
@@ -606,6 +688,11 @@ struct AppState {
     detailed_stats: bool,
     /// Synth/player/SVMS lines in the detailed overlay.
     synth_stats: bool,
+    /// Show the loading stats in a window while a file loads (they're always in the
+    /// progress bar's tooltip).
+    loading_details: bool,
+    /// Read every repeat of a track instead of trusting a pattern that checks out.
+    verify_repeats: bool,
     /// Submit through SVMS's native batch API (SVMS only).
     svms_batch: bool,
     loading: Option<Loading>,
@@ -724,9 +811,13 @@ impl eframe::App for AppState {
                         egui::ProgressBar::new(frac)
                             .desired_width(220.0)
                             .text(format!("{:.0}% · {}", frac * 100.0, secs(l.started.elapsed().as_secs_f64()))),
-                    );
+                    )
+                    .on_hover_ui(|ui| loading_details(ui, l));
                     cancel = ui.button("Cancel").clicked();
                 });
+                if self.loading_details {
+                    egui::Window::new("Loading").collapsible(false).resizable(false).show(ctx, |ui| loading_details(ui, l));
+                }
             }
             if cancel {
                 self.cancel_loading();
@@ -1090,6 +1181,18 @@ impl AppState {
                          velocity.",
                     );
                     ui.end_row();
+                    ui.label("Repeats");
+                    ui.checkbox(&mut self.verify_repeats, "Read every repeated track")
+                        .on_hover_text(
+                            "A file of one track repeated thousands of times (in xz) is loaded by reading \
+                             a few copies and counting the rest, if the sizes add up to whole copies. \
+                             Tick this to read every copy instead: exact, but a huge file can take hours.",
+                        );
+                    ui.end_row();
+                    ui.label("Details");
+                    ui.checkbox(&mut self.loading_details, "Show a stats window while loading")
+                        .on_hover_text("Hovering the progress bar shows the same stats.");
+                    ui.end_row();
                 });
             });
         if self.show_settings && !open {
@@ -1103,7 +1206,7 @@ impl AppState {
         let output = self.outputs.get(self.output_idx).map_or("", |o| o.1.as_str());
         let text = format!(
             "note_speed={}\nnotes_rise={}\nflat_notes={}\ncolor_by_channel={}\ncolor_auto={}\npiano_layout={}\nvsync={}\n\
-             output={output}\nskip_notes={}\nsynth_limit={}\nvelocity_levels={}\nsvms_batch={}\ndetailed_stats={}\nsynth_stats={}\n",
+             output={output}\nskip_notes={}\nsynth_limit={}\nvelocity_levels={}\nsvms_batch={}\ndetailed_stats={}\nsynth_stats={}\nloading_details={}\nverify_repeats={}\n",
             self.note_speed_seconds,
             self.notes_upwards,
             self.flat_notes,
@@ -1117,6 +1220,8 @@ impl AppState {
             self.svms_batch,
             self.detailed_stats,
             self.synth_stats,
+            self.loading_details,
+            self.verify_repeats,
         );
         if let Some(path) = settings_path() {
             let _ = std::fs::write(path, text);
@@ -1152,6 +1257,7 @@ impl AppState {
         let total = std::fs::metadata(&path).map_or(1, |m| m.len());
         self.cancel_loading();
         let progress = Arc::new(parser::Progress::default());
+        progress.verify_all.store(self.verify_repeats, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (vel_levels, p) = (self.vel_levels, progress.clone());
         std::thread::spawn(move || {

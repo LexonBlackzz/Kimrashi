@@ -47,6 +47,12 @@ pub trait Source: Read {
     fn xz_runs(&mut self) -> Option<Vec<(Vec<u8>, u64)>> {
         None
     }
+
+    /// At the end of the file: copies counted while reading on, as (the `start` of a track
+    /// given to `extra_copies`, how many more copies of it there were).
+    fn late_copies(&mut self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
 }
 
 /// A plain reader as a `Source`: no repeats.
@@ -68,6 +74,10 @@ impl<S: Source + ?Sized> Source for Box<S> {
     fn xz_runs(&mut self) -> Option<Vec<(Vec<u8>, u64)>> {
         (**self).xz_runs()
     }
+
+    fn late_copies(&mut self) -> Vec<(u64, u64)> {
+        (**self).late_copies()
+    }
 }
 
 /// How a load is going, and a way to stop it: the bytes read so far (for a progress
@@ -76,11 +86,38 @@ impl<S: Source + ?Sized> Source for Box<S> {
 pub struct Progress {
     pub bytes: std::sync::atomic::AtomicU64,
     cancelled: std::sync::atomic::AtomicBool,
+    /// Details for the loading window. Updated once per finished track (or archive
+    /// layer), never per event, so they cost the parse nothing.
+    pub tracks_total: std::sync::atomic::AtomicU64,
+    pub tracks_done: std::sync::atomic::AtomicU64,
+    /// Uncompressed MIDI bytes parsed so far (repeated tracks included).
+    pub midi_bytes: std::sync::atomic::AtomicU64,
+    pub notes: std::sync::atomic::AtomicU64,
+    /// The archive layers unwrapped so far, e.g. "7z › xz".
+    pub layers: std::sync::Mutex<String>,
+    /// Bytes of an xz layer scanned for repeats so far (see `archive`), and, once a track
+    /// has been seen, how many such bytes one track takes (so a total can be guessed).
+    pub scan_done: std::sync::atomic::AtomicU64,
+    /// Read every repeat of a track instead of trusting a pattern that checks out (see
+    /// `archive`), and how many tracks were taken on trust.
+    pub verify_all: std::sync::atomic::AtomicBool,
+    pub trusted_tracks: std::sync::atomic::AtomicU64,
+    /// Notes found so far in the big track being read on its own (0 between tracks).
+    pub live_notes: std::sync::atomic::AtomicU64,
+    pub scan_unit: std::sync::atomic::AtomicU64,
 }
 
 impl Progress {
     pub fn cancel(&self) {
         self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A track of `bytes` (standing for `copies` identical ones) holding `notes` is packed.
+    pub fn track_done(&self, bytes: u64, copies: u64, notes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.tracks_done.fetch_add(copies, Relaxed);
+        self.midi_bytes.fetch_add((bytes + 8) * copies, Relaxed);
+        self.notes.fetch_add(notes, Relaxed);
     }
 
     /// Count `n` more bytes read; fails if the load was cancelled.
@@ -386,13 +423,19 @@ impl MidiFile {
         // Step 1: locate the track chunks (offset, length).
         let mut chunks: Vec<(u64, usize)> = Vec::with_capacity(num_tracks as usize);
         let mut pos = 14u64;
-        for _ in 0..num_tracks {
+        // The header's count is a minimum: giant files have more tracks than its 16 bits
+        // can say, so tracks are read to the end of the file. What follows is ignored
+        // if it isn't a track.
+        let mut n = 0;
+        while n < num_tracks as usize || pos < file_bytes {
+            let extra = n >= num_tracks as usize;
+            n += 1;
             let mut h = [0u8; 8];
             if read_at(&file, pos, &mut h).is_err() {
-                return Err("Truncated MIDI file".into());
+                if extra { break } else { return Err("Truncated MIDI file".into()) }
             }
             if &h[..4] != b"MTrk" {
-                return Err("Invalid MTrk header".into());
+                if extra { break } else { return Err("Invalid MTrk header".into()) }
             }
             let len = u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as u64;
             if pos + 8 + len > file_bytes {
@@ -403,6 +446,7 @@ impl MidiFile {
         }
 
         // Step 2: read and pack each track in parallel.
+        progress.tracks_total.store(num_tracks as u64, std::sync::atomic::Ordering::Relaxed);
         let parse_start = std::time::Instant::now();
         let dedup = Dedup::new();
         // A big track whose channels are all busy can use more cores (see
@@ -427,10 +471,13 @@ impl MidiFile {
                     let packed = if split {
                         pack_track_split(&mut input, vel_levels, &dedup, SPLIT_BATCH)
                     } else {
-                        pack_track(&mut input, vel_levels, scratch, &dedup).map(|t| vec![t])
+                        pack_track(&mut input, vel_levels, scratch, &dedup, None).map(|t| vec![t])
                     };
                     scratch.trim();
                     let _ = progress.add(8);
+                    if let Ok(t) = &packed {
+                        progress.track_done(len as u64, 1, t.iter().map(|t| t.note_count).sum());
+                    }
                     packed
                 },
             )
@@ -442,16 +489,17 @@ impl MidiFile {
     /// reads track chunks while the thread pool packs them; a bounded queue keeps only
     /// a few raw chunks in memory at a time. A track over `POOLED_MAX` is packed by the
     /// reading thread itself, straight off the stream, so it never sits in memory whole.
-    pub(crate) fn parse_stream(r: impl Source, vel_levels: u8) -> Result<Self, ParseError> {
-        Self::parse_stream_with(r, vel_levels, POOLED_MAX)
+    pub(crate) fn parse_stream(r: impl Source, vel_levels: u8, progress: &Progress) -> Result<Self, ParseError> {
+        Self::parse_stream_with(r, vel_levels, POOLED_MAX, progress)
     }
 
-    fn parse_stream_with(mut r: impl Source, vel_levels: u8, pooled_max: usize) -> Result<Self, ParseError> {
+    fn parse_stream_with(mut r: impl Source, vel_levels: u8, pooled_max: usize, progress: &Progress) -> Result<Self, ParseError> {
         let mut hdr = [0u8; 14];
         if r.read_exact(&mut hdr).is_err() || &hdr[..4] != b"MThd" {
             return Err("Not a MIDI file (invalid MThd header)".into());
         }
         let (num_tracks, division) = parse_header(&hdr)?;
+        progress.tracks_total.store(num_tracks as u64, std::sync::atomic::Ordering::Relaxed);
 
         let parse_start = std::time::Instant::now();
         let mut file_bytes = 14u64;
@@ -467,7 +515,10 @@ impl MidiFile {
                     .into_iter()
                     .par_bridge()
                     .map_init(Scratch::default, |scratch, (i, mut raw)| {
-                        let packed = pack_track(&mut Input::whole(&mut raw), vel_levels, scratch, dedup).map(|t| (i, t));
+                        let packed = pack_track(&mut Input::whole(&mut raw), vel_levels, scratch, dedup, None).map(|t| (i, t));
+                        if let Ok((_, t)) = &packed {
+                            progress.track_done(raw.len() as u64, 1, t.note_count);
+                        }
                         scratch.trim();
                         budget.release(raw.len() as u64);
                         packed
@@ -481,11 +532,27 @@ impl MidiFile {
                 let mut own = Vec::new();
                 let (mut window, mut scratch) = (Vec::new(), Scratch::default());
                 let mut i = 0usize;
-                while i < num_tracks as usize {
+                // (start, track, length) of each track read, and the copies counted later
+                let mut placed: Vec<(u64, usize, u64)> = Vec::new();
+                let mut late: Vec<(u64, u64)> = Vec::new();
+                // The header's count is a minimum (see `open_and_parse`): the end of the
+                // stream ends the file, and what isn't a track after the count is ignored.
+                loop {
+                    let extra = i >= num_tracks as usize;
                     let mut h = [0u8; 8];
-                    r.read_exact(&mut h).map_err(|_| "Truncated MIDI file")?;
+                    let mut first = [0u8; 1];
+                    if r.read(&mut first)? == 0 {
+                        // The end: copies counted on the way make up the tracks not read.
+                        late = r.late_copies();
+                        let covered = i as u64 + late.iter().map(|l| l.1).sum::<u64>();
+                        if extra || covered >= num_tracks as u64 { break } else { return Err("Truncated MIDI file".into()) }
+                    }
+                    h[0] = first[0];
+                    if r.read_exact(&mut h[1..]).is_err() {
+                        if extra { break } else { return Err("Truncated MIDI file".into()) }
+                    }
                     if &h[..4] != b"MTrk" {
-                        return Err("Invalid MTrk header".into());
+                        if extra { break } else { return Err("Invalid MTrk header".into()) }
                     }
                     let len = u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as usize;
                     let start = file_bytes;
@@ -493,7 +560,10 @@ impl MidiFile {
                     if len > pooled_max {
                         window.resize(WINDOW, 0);
                         let mut input = Input::streaming(&mut window, r.by_ref().take(len as u64), len);
-                        own.push((i, pack_track(&mut input, vel_levels, &mut scratch, dedup)?));
+                        let t = pack_track(&mut input, vel_levels, &mut scratch, dedup, Some(&progress.live_notes))?;
+                        progress.live_notes.store(0, std::sync::atomic::Ordering::Relaxed);
+                        progress.track_done(len as u64, 1, t.note_count);
+                        own.push((i, t));
                         scratch.trim();
                     } else {
                         if !budget.acquire(len as u64) {
@@ -507,14 +577,23 @@ impl MidiFile {
                     }
                     // Identical tracks may follow without their bytes being supplied.
                     let extra = r.extra_copies(start, file_bytes);
+                    placed.push((start, i, len as u64));
                     if extra > 0 {
-                        if extra >= num_tracks as u64 - i as u64 {
-                            return Err("More repeated tracks than the header says".into());
-                        }
                         file_bytes += extra * (8 + len as u64);
                         repeats.push((i, extra));
+                        progress.track_done(len as u64, extra, 0); // (their notes are counted at the end)
                     }
                     i += 1 + extra as usize;
+                }
+                for (start, extra) in late {
+                    let Ok(at) = placed.binary_search_by_key(&start, |p| p.0) else { continue };
+                    let (_, track, len) = placed[at];
+                    file_bytes += extra * (8 + len);
+                    match repeats.iter_mut().find(|r| r.0 == track) {
+                        Some(r) => r.1 += extra,
+                        None => repeats.push((track, extra)),
+                    }
+                    progress.track_done(len, extra, 0);
                 }
                 Ok(own)
             })();
@@ -524,14 +603,16 @@ impl MidiFile {
         let mut packed = packed?;
         packed.extend(read_result?);
         packed.sort_unstable_by_key(|(i, _)| *i);
-        let packed = packed
+        let packed: Vec<(u32, u64, PackedTrack)> = packed
             .into_iter()
             .map(|(i, t)| {
                 let extra = repeats.iter().find(|r| r.0 == i).map_or(0, |r| r.1);
                 (i as u32, 1 + extra, t)
             })
             .collect();
-        Ok(Self::assemble_with(division, num_tracks as usize, packed, dedup, file_bytes, parse_start.elapsed()).with_smpte_tempo(&hdr))
+        // (a header can undercount: the last track read says how many there were)
+        let tracks = packed.last().map_or(0, |(i, copies, _)| (*i as u64 + copies) as usize).max(num_tracks as usize);
+        Ok(Self::assemble_with(division, tracks, packed, dedup, file_bytes, parse_start.elapsed()).with_smpte_tempo(&hdr))
     }
 
     /// With an SMPTE division the speed is fixed: the tempo events are ignored.
@@ -1102,13 +1183,25 @@ fn pack_track<R: Read>(
     vel_levels: u8,
     scratch: &mut Scratch,
     dedup: &Dedup,
+    live: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<PackedTrack, ParseError> {
     let Scratch { queue, data } = scratch;
     let mut out = Packer::new(dedup, vel_levels, data);
     let mut seq = Sequencer::new(queue);
     let mut tempos = Vec::new();
+    // The notes found so far are published every so many events, not every note.
+    let mut since = 0u32;
     let end_tick = walk_raw_track(input, |tick, ev| match ev {
-        RawEvent::Channel { status, d1, d2 } => seq.event(tick, status, d1, d2, &mut |p| out.emit(p)),
+        RawEvent::Channel { status, d1, d2 } => {
+            seq.event(tick, status, d1, d2, &mut |p| out.emit(p));
+            since += 1;
+            if since >= 1 << 20 {
+                since = 0;
+                if let Some(l) = live {
+                    l.store(seq.note_count, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
         RawEvent::Tempo(t) => tempos.push((tick, t)),
     })?;
     seq.finish(&mut |p| out.emit(p));
@@ -1609,7 +1702,7 @@ mod tests {
     /// Pack a raw track read through a window of `window` bytes (at least 16).
     fn pack_raw(raw: &[u8], window: usize, scratch: &mut Scratch, dedup: &Dedup) -> PackedTrack {
         let mut buf = vec![0u8; window];
-        pack_track(&mut Input::streaming(&mut buf, raw, raw.len()), 127, scratch, dedup).unwrap()
+        pack_track(&mut Input::streaming(&mut buf, raw, raw.len()), 127, scratch, dedup, None).unwrap()
     }
 
     /// Pack one raw track into a (one-track) MidiFile.
@@ -1783,7 +1876,7 @@ mod tests {
             }
             // a track already in memory
             let (dedup, mut raw) = (Dedup::new(), raw);
-            let t = pack_track(&mut Input::whole(&mut raw), 127, &mut Scratch::default(), &dedup).unwrap();
+            let t = pack_track(&mut Input::whole(&mut raw), 127, &mut Scratch::default(), &dedup, None).unwrap();
             let m = MidiFile::assemble(96, [vec![t]], dedup, 0, Default::default());
             assert_eq!(decode(&m, 0), want.records, "seed {seed}, whole");
         }
@@ -1810,7 +1903,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // all tracks pooled; only the biggest packed on the reading thread; all of them
         for pooled_max in [usize::MAX, 1000, 0] {
-            let m = MidiFile::parse_stream_with(Plain(&file[..]), 127, pooled_max).unwrap();
+            let m = MidiFile::parse_stream_with(Plain(&file[..]), 127, pooled_max, &Progress::default()).unwrap();
             for (i, want) in wants.iter().enumerate() {
                 assert_eq!(&decode(&m, i), want, "pooled_max {pooled_max}, track {i}");
             }
@@ -1820,6 +1913,29 @@ mod tests {
             assert_eq!(&decode(&from_file, i), want, "file, track {i}");
         }
     }
+    #[test]
+    fn tracks_are_read_past_the_headers_count() {
+        let mut rng = Rng(7);
+        let mut file = b"MThd".to_vec();
+        file.extend_from_slice(&[0, 0, 0, 6, 0, 1, 0, 1, 0, 96]); // says 1 track
+        for _ in 0..3 {
+            let (raw, _) = random_track(&mut rng, 50);
+            file.extend_from_slice(b"MTrk");
+            file.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+            file.extend_from_slice(&raw);
+        }
+        let tracks_end = file.len() as u64;
+        file.extend_from_slice(b"junk"); // ignored
+        let m = MidiFile::parse_stream_with(Plain(&file[..]), 127, usize::MAX, &Progress::default()).unwrap();
+        assert_eq!((m.source_tracks, m.file_bytes), (3, tracks_end));
+        assert_eq!(m.tracks.len(), 3);
+        let path = std::env::temp_dir().join(format!("fmp_sat_test_{}.mid", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let f = MidiFile::open_and_parse(&path, 127, &Progress::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((f.note_count, f.tracks.len()), (m.note_count, 3));
+    }
+
     #[test]
     fn splitting_by_channel_keeps_every_channel_the_same() {
         let mut rng = Rng(0x1234_5678_9ABC_DEF1);
