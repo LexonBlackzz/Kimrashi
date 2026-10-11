@@ -420,6 +420,20 @@ impl<'a> Pull<'a> {
     }
 }
 
+/// For the benchmark: run the scan's streaming and comparing over `layer`; its bytes.
+pub fn bench_scan(layer: &[u8]) -> u64 {
+    let mut pull = Pull::new(Box::new(Cursor::new(layer)), None);
+    let (mut store, mut index, mut bytes): (Vec<Vec<u8>>, RunIndex, u64) = (Vec::new(), RunIndex::default(), 0);
+    while let Ok(Piece::Stream(p)) = pull.next() {
+        bytes += p.len() as u64;
+        if index.find(&store, &p).is_none() {
+            index.add(&p, store.len());
+            store.push(p);
+        }
+    }
+    bytes
+}
+
 /// Read `r` as xz streams back to back, keeping each distinct stream once.
 /// (`total`: how many bytes the layer is, if known.)
 fn scan_xz<'a, R: Read + 'a>(r: R, progress: Option<&'a Progress>, total: Option<u64>) -> std::io::Result<XzScan<'a>> {

@@ -27,7 +27,7 @@ zstd = { version = "0.13", default-features = false }
 tar = { version = "0.4", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["timeapi", "dwmapi", "dxgi", "winerror", "mmeapi", "mmsystem"] }
+winapi = { version = "0.3", features = ["timeapi", "dwmapi", "dxgi", "winerror", "mmeapi", "mmsystem", "sysinfoapi", "processthreadsapi", "winbase"] }
 
 [profile.release]
 # No whole-program LTO or single codegen unit: neither measurably changed load or

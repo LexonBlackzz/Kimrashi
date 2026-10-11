@@ -2,6 +2,7 @@ mod omnimidi;
 mod output;
 mod archive;
 mod bench;
+mod benchmark;
 mod clock;
 mod gpu;
 mod parser;
@@ -80,7 +81,7 @@ const NOTE_HOLD_MICROS: u64 = 1_000; // keep notes visible 1ms after Note Off to
 
 fn main() {
     let _timer = create_timer_guard();
-    if bench::run_from_args() {
+    if bench::run_from_args() || benchmark::run_from_args() {
         return;
     }
     let omni_opt: Option<Arc<OmniMIDI>> = unsafe {
@@ -198,6 +199,7 @@ fn main() {
                 synth_stats: setting(&saved, "synth_stats").unwrap_or(false),
                 loading_details: setting(&saved, "loading_details").unwrap_or(false),
                 verify_repeats: setting(&saved, "verify_repeats").unwrap_or(false),
+                benchmark: None,
                 svms_batch,
                 loading: None,
                 show_settings: false,
@@ -653,6 +655,20 @@ fn loading_details(ui: &mut egui::Ui, l: &Loading) {
     });
 }
 
+enum BenchMsg {
+    Step(usize, String),
+    Done(benchmark::Report),
+}
+
+/// A benchmark running on a worker thread, or its result.
+struct BenchRun {
+    rx: Receiver<BenchMsg>,
+    step: usize,
+    name: String,
+    report: Option<benchmark::Report>,
+    started: Instant,
+}
+
 /// A file being loaded on a worker thread.
 struct Loading {
     name: String,
@@ -693,6 +709,8 @@ struct AppState {
     loading_details: bool,
     /// Read every repeat of a track instead of trusting a pattern that checks out.
     verify_repeats: bool,
+    /// The benchmark window (see `benchmark`).
+    benchmark: Option<BenchRun>,
     /// Submit through SVMS's native batch API (SVMS only).
     svms_batch: bool,
     loading: Option<Loading>,
@@ -910,6 +928,7 @@ impl eframe::App for AppState {
             });
 
         self.settings_window(ctx);
+        self.benchmark_window(ctx);
 
         if let Some(log) = &mut self.frame_log {
             log.record(frame_start.elapsed(), &self.frame_times);
@@ -1000,7 +1019,72 @@ impl AppState {
         }
     }
 
+    fn start_benchmark(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let report = benchmark::run(benchmark::Scale::FULL, |i, name| {
+                let _ = tx.send(BenchMsg::Step(i, name.to_owned()));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(BenchMsg::Done(report));
+            ctx.request_repaint();
+        });
+        self.benchmark = Some(BenchRun { rx, step: 0, name: String::new(), report: None, started: Instant::now() });
+    }
+
+    fn benchmark_window(&mut self, ctx: &egui::Context) {
+        let Some(b) = &mut self.benchmark else { return };
+        while let Ok(m) = b.rx.try_recv() {
+            match m {
+                BenchMsg::Step(i, name) => (b.step, b.name) = (i, name),
+                BenchMsg::Done(r) => b.report = Some(r),
+            }
+        }
+        let mut open = true;
+        egui::Window::new("Benchmark")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| match &b.report {
+                None => {
+                    ui.label(format!("Test {} of {}: {}", b.step + 1, benchmark::REFERENCE.len(), b.name));
+                    ui.label(secs(b.started.elapsed().as_secs_f64()));
+                    ui.add_space(6.0);
+                    ui.weak("Hands off the mouse. Every program left open costs points.");
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
+                Some(r) => {
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(format!("{:.0}", r.score)).size(64.0).strong());
+                        ui.label(format!("points · benchmark v{}", benchmark::VERSION));
+                    });
+                    ui.add_space(8.0);
+                    egui::Grid::new("benchmark_results").num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
+                        for t in &r.tests {
+                            ui.label(t.name);
+                            ui.label(format!("{:.2} {}", t.rate, t.unit));
+                            ui.label(format!("{:.0}", t.points));
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.weak(format!("{} · {} threads · {:.0} GB RAM · {}", r.cpu, r.threads, r.ram_gb, secs(r.secs)));
+                    ui.add_space(4.0);
+                    ui.label(benchmark::nag(r));
+                    if ui.button("Copy to share").clicked() {
+                        ctx.copy_text(r.line());
+                    }
+                }
+            });
+        if !open {
+            self.benchmark = None;
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut start_benchmark = false;
         let mut open = self.show_settings;
         egui::Window::new("Settings")
             .open(&mut open)
@@ -1194,7 +1278,24 @@ impl AppState {
                         .on_hover_text("Hovering the progress bar shows the same stats.");
                     ui.end_row();
                 });
+                ui.add_space(8.0);
+                ui.heading("Benchmark");
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(self.benchmark.is_none(), |ui| {
+                        if ui.button("Run (~1.5 min)").clicked() {
+                            start_benchmark = true;
+                        }
+                    });
+                })
+                .response
+                .on_hover_text(
+                    "Times loading and playback code on made-up data and scores it. Close other \
+                     programs first, and pause playback.",
+                );
             });
+        if start_benchmark {
+            self.start_benchmark(ctx);
+        }
         if self.show_settings && !open {
             self.save_settings();
         }

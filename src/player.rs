@@ -672,6 +672,17 @@ impl Engine {
     }
 }
 
+/// For the benchmark: what the engine does with every note of `song`, offline and as fast
+/// as it goes (no synth, no clock).
+pub fn bench_engine(song: &SongData) {
+    let mut eng = Engine::new(Cursor::seek(song, 0).cursor, Skipper::new(0, true));
+    let mut batch = Vec::new();
+    while let Some(tick) = eng.cur.next_tick() {
+        batch.clear();
+        eng.process_tick(song, tick, 0, 0.0, &mut batch);
+    }
+}
+
 pub struct Player {
     omni: Option<Arc<OmniMIDI>>,
     choice: OutputChoice,

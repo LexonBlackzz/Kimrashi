@@ -1178,6 +1178,12 @@ impl<'a> Packer<'a> {
 /// stages. Running them on two threads was tried: about 1.7x slower, not faster
 /// (batches handed over a channel; cause not found). `pack_track_split` instead gives
 /// each channel its own thread.
+/// For the benchmark: pack one track's body on this thread; how many notes it held.
+pub fn bench_pack(raw: &mut [u8]) -> u64 {
+    let (dedup, mut scratch) = (Dedup::new(), Scratch::default());
+    pack_track(&mut Input::whole(raw), 127, &mut scratch, &dedup, None).map_or(0, |t| t.note_count)
+}
+
 fn pack_track<R: Read>(
     input: &mut Input<R>,
     vel_levels: u8,
