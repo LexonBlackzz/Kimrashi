@@ -218,6 +218,7 @@ fn main() {
                 timer_guard,
                 color_by_channel: setting(&saved, "color_by_channel").unwrap_or(true),
                 color_auto: setting(&saved, "color_auto").unwrap_or(true),
+                collapse_overlaps: setting(&saved, "collapse_overlaps").unwrap_or(true),
                 piano_layout: setting(&saved, "piano_layout").unwrap_or(false),
                 frame_times: FrameTimes::default(),
                 frame_log: FrameLog::from_env(),
@@ -641,6 +642,50 @@ fn decode_notes(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach
     out
 }
 
+fn push_collapsed(notes: &mut Vec<NoteSegment>, open: &mut [usize; 2048], note: NoteSegment) {
+    let k = note.channel as usize * 128 + note.pitch as usize;
+    if let Some(prev) = notes.get_mut(open[k]) {
+        // Packed notes already contain their matching off. The active count is
+        // nonzero exactly while these intervals overlap; only its union is needed.
+        if note.start_us < prev.end_us {
+            prev.end_us = prev.end_us.max(note.end_us);
+            return;
+        }
+    }
+    open[k] = notes.len();
+    notes.push(note);
+}
+
+fn collapsed_notes(song: &SongData) -> Arc<Vec<NoteSegment>> {
+    let parts: Vec<Vec<NoteSegment>> = (0..song.midi.tracks.len()).into_par_iter().map(|track| {
+        let mut reader = TrackReader::default();
+        let data = song.midi.track(track);
+        let mut cache = 0;
+        let mut notes = Vec::new();
+        let mut open = [usize::MAX; 2048];
+        while let Some((tick, rec)) = reader.next_before(data, u32::MAX) {
+            let Record::Note { ch, key, dur, .. } = rec else { continue };
+            let start_us = song.tempo.tick_to_time_approx(tick, &mut cache);
+            let end_us = dur.map_or(song.tempo.duration_us(), |d|
+                song.tempo.tick_to_time_approx(tick + d, &mut cache));
+            push_collapsed(&mut notes, &mut open, NoteSegment {
+                start_us, end_us, track: song.midi.track_origin[track] as u16, channel: ch, pitch: key,
+            });
+        }
+        // Collapse precedes the usual exact coverage cull.
+        let mut out = Vec::new();
+        let mut last = [usize::MAX; 128];
+        for note in notes { push_culled(&mut out, &mut last, 0, note); }
+        out
+    }).collect();
+    let mut notes: Vec<_> = parts.into_iter().flatten().collect();
+    notes.par_sort_by_key(|n| n.start_us);
+    let mut out = Vec::with_capacity(notes.len());
+    let mut last = [usize::MAX; 128];
+    for note in notes { push_culled(&mut out, &mut last, 0, note); }
+    Arc::new(out)
+}
+
 struct NoteBatch {
     generation: u64,
     notes: Vec<NoteSegment>,
@@ -654,6 +699,7 @@ struct DecodeWorker {
     receiver: std::sync::mpsc::Receiver<NoteBatch>,
     pending: Option<NoteBatch>,
     song: Arc<SongData>,
+    collapsed: Option<Arc<Vec<NoteSegment>>>,
     thread: std::thread::Thread,
 }
 
@@ -666,22 +712,34 @@ impl Drop for DecodeWorker {
 }
 
 impl DecodeWorker {
-    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64) -> Self {
+    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64, collapsed: Option<Arc<Vec<NoteSegment>>>) -> Self {
         let now = Arc::new(AtomicU64::new(0));
         let target = Arc::new(AtomicU64::new(through));
         let stop = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = std::sync::mpsc::sync_channel(8);
         let (worker_now, worker_target, worker_stop, worker_song) =
             (now.clone(), target.clone(), stop.clone(), song.clone());
+        let worker_collapsed = collapsed.clone();
         let handle = std::thread::Builder::new().name("note-decode".into()).spawn(move || {
             let mut through = through;
+            let mut position = worker_collapsed.as_ref().map_or(0, |notes|
+                notes.partition_point(|n| n.start_us < through));
             while !worker_stop.load(Ordering::Acquire) {
                 let reach = worker_target.load(Ordering::Acquire);
                 if reach <= through {
                     std::thread::park_timeout(Duration::from_millis(2));
                     continue;
                 }
-                let decoded = decode_notes(&worker_song, &mut readers, worker_now.load(Ordering::Acquire), reach);
+                let decoded = if let Some(notes) = &worker_collapsed {
+                    let end = notes.partition_point(|n| n.start_us < reach);
+                    let now = worker_now.load(Ordering::Acquire);
+                    let batch = notes[position..end].iter().copied()
+                        .filter(|n| n.end_us + NOTE_HOLD_MICROS > now).collect();
+                    position = end;
+                    Decoded::new(batch)
+                } else {
+                    decode_notes(&worker_song, &mut readers, worker_now.load(Ordering::Acquire), reach)
+                };
                 if worker_stop.load(Ordering::Acquire) { break; }
                 let mut notes = decoded.notes.into_iter().peekable();
                 loop {
@@ -694,7 +752,7 @@ impl DecodeWorker {
                 through = reach;
             }
         }).expect("note decode worker");
-        Self { now, target, stop, receiver, pending: None, song, thread: handle.thread().clone() }
+        Self { now, target, stop, receiver, pending: None, song, collapsed, thread: handle.thread().clone() }
     }
 }
 
@@ -702,6 +760,8 @@ impl DecodeWorker {
 /// the window, and dropped once it has finished.
 struct VisibleNotes {
     time_us: u64,
+    collapse_overlaps: bool,
+    collapsed: Option<Arc<Vec<NoteSegment>>>,
     worker: Option<DecodeWorker>,
     generation: u64,
     through: u64,
@@ -735,7 +795,7 @@ struct VisibleNotes {
 impl Default for VisibleNotes {
     fn default() -> Self {
         Self {
-            time_us: 0, worker: None, generation: 0, through: 0, window: Vec::new(), last_batch: 0,
+            time_us: 0, collapse_overlaps: true, collapsed: None, worker: None, generation: 0, through: 0, window: Vec::new(), last_batch: 0,
             last_scanned: 0, alive: 0, frames_since_sweep: 0,
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
@@ -756,12 +816,20 @@ struct AdvanceTimes {
 }
 
 impl VisibleNotes {
+    fn set_collapse(&mut self, enabled: bool) {
+        if self.collapse_overlaps != enabled {
+            *self = Self { collapse_overlaps: enabled, generation: self.generation.wrapping_add(1), ..Default::default() };
+        }
+    }
+
     fn advance(&mut self, song: &Arc<SongData>, now_us: u64, window_end: u64, _px_us: u64) {
         let reset = now_us < self.time_us || now_us.saturating_sub(self.time_us) > 1_000_000
             || self.worker.as_ref().is_some_and(|w| !Arc::ptr_eq(&w.song, song));
         if reset {
             let generation = self.generation.wrapping_add(1);
-            *self = Self { generation, ..Default::default() };
+            let collapsed = self.worker.as_ref().filter(|w| Arc::ptr_eq(&w.song, song))
+                .and_then(|w| w.collapsed.clone());
+            *self = Self { generation, collapse_overlaps: self.collapse_overlaps, collapsed, ..Default::default() };
         }
         self.time_us = now_us;
         for key in &mut self.keys { key.added_start = u64::MAX; }
@@ -786,12 +854,16 @@ impl VisibleNotes {
         self.last_batch = 0;
         if self.worker.is_none() {
             let mut readers = vec![TrackReader::default(); song.midi.tracks.len()];
-            let decoded = decode_notes(song, &mut readers, now_us, window_end);
+            let decoded = if self.collapse_overlaps {
+                let notes = self.collapsed.get_or_insert_with(|| collapsed_notes(song));
+                Decoded::new(notes.iter().take_while(|n| n.start_us < window_end).copied()
+                    .filter(|n| n.end_us + NOTE_HOLD_MICROS > now_us).collect())
+            } else { decode_notes(song, &mut readers, now_us, window_end) };
             self.last_scanned = decoded.scanned;
             self.last_batch = decoded.notes.len();
             self.window.extend(decoded.notes);
             self.through = window_end;
-            self.worker = Some(DecodeWorker::new(song.clone(), readers, window_end, self.generation));
+            self.worker = Some(DecodeWorker::new(song.clone(), readers, window_end, self.generation, self.collapsed.clone()));
         }
         let worker = self.worker.as_mut().unwrap();
         worker.now.store(now_us, Ordering::Release);
@@ -1135,6 +1207,7 @@ struct AppState {
     color_auto: bool,
     /// Notes laid out like the keys (see `key_columns`) rather than an even grid.
     piano_layout: bool,
+    collapse_overlaps: bool,
     frame_times: FrameTimes,
     frame_log: Option<FrameLog>,
     /// Where to seek once the file given on the command line has loaded.
@@ -1303,6 +1376,7 @@ impl eframe::App for AppState {
             ui.add_space(4.0);
         });
 
+        self.visible.set_collapse(self.collapse_overlaps);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -1513,6 +1587,11 @@ impl AppState {
                     });
                     ui.end_row();
 
+                    ui.label("Overlaps");
+                    ui.checkbox(&mut self.collapse_overlaps, "Collapse same channel/key")
+                        .on_hover_text("Joins overlapping notes within a track. Off keeps every original span.");
+                    ui.end_row();
+
                     ui.label("Shading");
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.flat_notes, false, "Shaded");
@@ -1704,7 +1783,7 @@ impl AppState {
     /// Remember settings between runs (see `load_settings`).
     fn save_settings(&self) {
         let output = self.outputs.get(self.output_idx).map_or("", |o| o.1.as_str());
-        let text = format!(
+        let mut text = format!(
             "note_speed={}\nnotes_rise={}\nflat_notes={}\ncolor_by_channel={}\ncolor_auto={}\npiano_layout={}\nvsync={}\n\
              output={output}\nskip_notes={}\nsynth_limit={}\nvelocity_levels={}\nsvms_batch={}\ndetailed_stats={}\nsynth_stats={}\nloading_details={}\nverify_repeats={}\n",
             self.note_speed_seconds,
@@ -1724,7 +1803,8 @@ impl AppState {
             self.verify_repeats,
         );
         if let Some(path) = settings_path() {
-            let _ = std::fs::write(path, text);
+            text.push_str(&format!("collapse_overlaps={}\n", self.collapse_overlaps));
+        let _ = std::fs::write(path, text);
         }
     }
 
@@ -2787,6 +2867,27 @@ mod tests {
         let generation = visible.generation;
         visible.advance(&test_song().data, 0, 1_000_000, 1000);
         assert_ne!(visible.generation, generation);
+    }
+
+    #[test]
+    fn overlap_union_keeps_channels_and_touching_notes_separate() {
+        let mut notes = Vec::new();
+        let mut open = [usize::MAX; 2048];
+        let n = |start_us, end_us, channel| NoteSegment { start_us, end_us, channel, pitch: 60, track: 0 };
+        for note in [n(0, 100, 0), n(10, 50, 0), n(30, 200, 0), n(40, 80, 1), n(200, 300, 0)] {
+            push_collapsed(&mut notes, &mut open, note);
+        }
+        assert_eq!(notes, [n(0, 200, 0), n(40, 80, 1), n(200, 300, 0)]);
+    }
+
+    #[test]
+    fn no_overlap_collapse_matches_exact_notes_and_pixels() {
+        let song = test_song();
+        let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
+        let exact = decode_notes(&song.data, &mut readers, 0, 20_000_000).notes;
+        assert_eq!(*collapsed_notes(&song.data), exact);
+        let mut visible = indexed(exact, false);
+        assert_raster_equal(&song, &mut visible, 123_456, 3.0, 900);
     }
 
     #[test]

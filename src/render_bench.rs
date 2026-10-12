@@ -178,6 +178,7 @@ pub fn run_from_args() -> bool {
     let mut renderer = gpu::RenderBenchmark::new(device, queue, 1920, 900);
     let visual = VisualSong::new(song);
     let mut visible = VisibleNotes::default();
+    visible.set_collapse(!args.iter().any(|a| a == "--no-collapse-overlaps"));
     let mut reference_readers = vec![crate::TrackReader::default(); visual.data.midi.tracks.len()];
     let mut reference_window = Vec::new();
     let mut instances = Arc::new(Vec::new());
