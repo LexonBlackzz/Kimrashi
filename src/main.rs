@@ -24,7 +24,7 @@ use parser::{Record, TrackReader};
 use song::SongData;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::io::Write as _;
@@ -459,8 +459,9 @@ impl RowNotes {
     }
 }
 
-/// Track records one frame may decode before the rest waits for the next.
-const DECODE_BUDGET: usize = 500_000;
+/// Finished, globally ordered notes appended and indexed in one frame.
+const NOTE_BATCH: usize = 300_000;
+const DECODE_AHEAD_US: u64 = 2_000_000;
 
 const NOTE_BLOCK: usize = 64;
 
@@ -580,22 +581,135 @@ impl KeyNotes {
     }
 }
 
+fn decode_notes(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64) -> Decoded {
+    let tempo = &song.tempo;
+    let now_tick = tempo.time_to_tick(now_us);
+    let end_tick = tempo.time_to_tick(reach);
+    let decode = |track: usize, r: &mut TrackReader, acc: &mut Decoded| {
+        let data = song.midi.track(track);
+        if r.peek_tick(data).map_or(true, |t| t >= end_tick) {
+            return; // nothing new in this track (most of the 60,000 in some files)
+        }
+        let mut tempo_cache = 0;
+        let base = acc.notes.len();
+        while let Some((tick, rec)) = r.next_before(data, end_tick) {
+            acc.scanned += 1;
+            let Record::Note { ch, key, dur, .. } = rec else { continue };
+            // Cheap tick check first so fast-forwarding skips finished notes.
+            if dur.is_some_and(|d| tick + d < now_tick) {
+                continue;
+            }
+            let end_us = match dur {
+                Some(d) => tempo.tick_to_time_approx(tick + d, &mut tempo_cache),
+                None => tempo.duration_us(),
+            };
+            if end_us + NOTE_HOLD_MICROS > now_us {
+                let note = NoteSegment {
+                    start_us: tempo.tick_to_time_approx(tick, &mut tempo_cache),
+                    end_us,
+                    track: song.midi.track_origin[track] as u16,
+                    channel: ch,
+                    pitch: key,
+                };
+                push_culled(&mut acc.notes, &mut acc.last, base, note);
+            }
+        }
+    };
+    // Indexed collection preserves track order before the stable start sort.
+    let parts: Vec<_> = readers.par_iter_mut().enumerate().map(|(i, r)| {
+        let mut acc = Decoded::new(Vec::new());
+        decode(i, r, &mut acc);
+        acc
+    }).collect();
+    let mut out = Decoded::new(Vec::new());
+    out.scanned = parts.iter().map(|p| p.scanned).sum();
+    out.notes.reserve(parts.iter().map(|p| p.notes.len()).sum());
+    for part in parts { out.notes.extend(part.notes); }
+    out.notes.par_sort_by_key(|n| n.start_us);
+    let mut last = [usize::MAX; 128];
+    let mut w = 0;
+    for r in 0..out.notes.len() {
+        let note = out.notes[r];
+        let k = note.pitch as usize & 127;
+        if last[k] == usize::MAX || !note.absorb(&mut out.notes[last[k]]) {
+            out.notes[w] = note;
+            last[k] = w;
+            w += 1;
+        }
+    }
+    out.notes.truncate(w);
+    out
+}
+
+struct NoteBatch {
+    generation: u64,
+    notes: Vec<NoteSegment>,
+    through: u64,
+}
+
+struct DecodeWorker {
+    now: Arc<AtomicU64>,
+    target: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    receiver: std::sync::mpsc::Receiver<NoteBatch>,
+    pending: Option<NoteBatch>,
+    song: Arc<SongData>,
+    thread: std::thread::Thread,
+}
+
+impl Drop for DecodeWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.thread.unpark();
+        // Dropping the receiver cancels a blocked send; never join in a frame.
+    }
+}
+
+impl DecodeWorker {
+    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64) -> Self {
+        let now = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(AtomicU64::new(through));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let (worker_now, worker_target, worker_stop, worker_song) =
+            (now.clone(), target.clone(), stop.clone(), song.clone());
+        let handle = std::thread::Builder::new().name("note-decode".into()).spawn(move || {
+            let mut through = through;
+            while !worker_stop.load(Ordering::Acquire) {
+                let reach = worker_target.load(Ordering::Acquire);
+                if reach <= through {
+                    std::thread::park_timeout(Duration::from_millis(2));
+                    continue;
+                }
+                let decoded = decode_notes(&worker_song, &mut readers, worker_now.load(Ordering::Acquire), reach);
+                if worker_stop.load(Ordering::Acquire) { break; }
+                let mut notes = decoded.notes.into_iter().peekable();
+                loop {
+                    let batch: Vec<_> = notes.by_ref().take(NOTE_BATCH).collect();
+                    let watermark = notes.peek().map_or(reach, |n| n.start_us);
+                    if sender.send(NoteBatch { generation, notes: batch, through: watermark }).is_err() { return; }
+                    if notes.peek().is_none() { break; }
+                    if worker_stop.load(Ordering::Acquire) { return; }
+                }
+                through = reach;
+            }
+        }).expect("note decode worker");
+        Self { now, target, stop, receiver, pending: None, song, thread: handle.thread().clone() }
+    }
+}
+
 /// Notes on screen. Each note is decoded from the packed tracks once, when it enters
 /// the window, and dropped once it has finished.
 struct VisibleNotes {
     time_us: u64,
-    /// Per track: position of the first record not yet decoded.
-    readers: Vec<TrackReader>,
+    worker: Option<DecodeWorker>,
+    generation: u64,
+    through: u64,
     window: Vec<NoteSegment>,
     /// Notes decoded last frame (after culling), and records looked at, to decide
     /// whether decoding is worth parallelizing.
     last_batch: usize,
     last_scanned: usize,
-    /// Song time decoded up to, and how far one frame may extend it: a burst of millions
-    /// of notes is taken over several frames (the far top of the screen fills in late)
-    /// instead of stalling one, which would only bring in even more notes the next.
-    frontier_us: u64,
-    step_us: u64,
     /// Notes in `window` after the last sweep of finished ones, and frames since.
     alive: usize,
     frames_since_sweep: u32,
@@ -621,8 +735,8 @@ struct VisibleNotes {
 impl Default for VisibleNotes {
     fn default() -> Self {
         Self {
-            time_us: 0, readers: Vec::new(), window: Vec::new(), last_batch: 0,
-            last_scanned: 0, frontier_us: 0, step_us: u64::MAX, alive: 0, frames_since_sweep: 0,
+            time_us: 0, worker: None, generation: 0, through: 0, window: Vec::new(), last_batch: 0,
+            last_scanned: 0, alive: 0, frames_since_sweep: 0,
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
             instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
@@ -642,16 +756,13 @@ struct AdvanceTimes {
 }
 
 impl VisibleNotes {
-    fn advance(&mut self, song: &SongData, now_us: u64, window_end: u64, _px_us: u64) {
-        let tracks = &song.midi.tracks;
-        // Pixel selection is view-dependent; zooming needs no destructive re-decode.
-        if now_us < self.time_us || self.readers.len() != tracks.len() {
-            *self = VisibleNotes {
-                readers: vec![TrackReader::default(); tracks.len()],
-                ..Default::default()
-            };
+    fn advance(&mut self, song: &Arc<SongData>, now_us: u64, window_end: u64, _px_us: u64) {
+        let reset = now_us < self.time_us || now_us.saturating_sub(self.time_us) > 1_000_000
+            || self.worker.as_ref().is_some_and(|w| !Arc::ptr_eq(&w.song, song));
+        if reset {
+            let generation = self.generation.wrapping_add(1);
+            *self = Self { generation, ..Default::default() };
         }
-        let jumped = now_us - self.time_us > 1_000_000;
         self.time_us = now_us;
         for key in &mut self.keys { key.added_start = u64::MAX; }
         // Finished notes are skipped when drawing, and swept out now and then (a sweep
@@ -670,113 +781,45 @@ impl VisibleNotes {
         }
         self.timing.retain = t0.elapsed();
         let t0 = Instant::now();
-        let tempo = &song.tempo;
-        let now_tick = tempo.time_to_tick(now_us);
-        // A fresh start or a seek takes everything at once; otherwise spend about
-        // DECODE_BUDGET records a frame, but always reach notes about to sound.
-        let reach = if jumped || self.frontier_us == 0 {
-            window_end
-        } else {
-            window_end.min(self.frontier_us.saturating_add(self.step_us)).max((now_us + 100_000).min(window_end))
-        };
-        let end_tick = tempo.time_to_tick(reach);
-        let decode = |track: usize, r: &mut TrackReader, acc: &mut Decoded| {
-            let data = song.midi.track(track);
-            if r.peek_tick(data).map_or(true, |t| t >= end_tick) {
-                return; // nothing new in this track (most of the 60,000 in some files)
+        self.timing.decode = Duration::ZERO;
+        self.timing.sort = Duration::ZERO;
+        self.last_batch = 0;
+        if self.worker.is_none() {
+            let mut readers = vec![TrackReader::default(); song.midi.tracks.len()];
+            let decoded = decode_notes(song, &mut readers, now_us, window_end);
+            self.last_scanned = decoded.scanned;
+            self.last_batch = decoded.notes.len();
+            self.window.extend(decoded.notes);
+            self.through = window_end;
+            self.worker = Some(DecodeWorker::new(song.clone(), readers, window_end, self.generation));
+        }
+        let worker = self.worker.as_mut().unwrap();
+        worker.now.store(now_us, Ordering::Release);
+        worker.target.store(window_end.saturating_add(DECODE_AHEAD_US), Ordering::Release);
+        worker.thread.unpark();
+        while self.last_batch < NOTE_BATCH || self.through < now_us.saturating_add(100_000).min(window_end) {
+            let urgent = self.through < now_us.saturating_add(100_000).min(window_end);
+            let batch = worker.pending.take().or_else(|| {
+                if urgent { worker.receiver.recv().ok() } else { worker.receiver.try_recv().ok() }
+            });
+            let Some(batch) = batch else { break };
+            if batch.generation != self.generation { continue; }
+            if !urgent && batch.notes.first().is_some_and(|n| n.start_us >= window_end) {
+                worker.pending = Some(batch);
+                break;
             }
-            let mut tempo_cache = 0;
-            let base = acc.notes.len();
-            while let Some((tick, rec)) = r.next_before(data, end_tick) {
-                acc.scanned += 1;
-                let Record::Note { ch, key, dur, .. } = rec else { continue };
-                // Cheap tick check first so fast-forwarding skips finished notes.
-                if dur.is_some_and(|d| tick + d < now_tick) {
-                    continue;
-                }
-                let end_us = match dur {
-                    Some(d) => tempo.tick_to_time_approx(tick + d, &mut tempo_cache),
-                    None => tempo.duration_us(),
-                };
-                if end_us + NOTE_HOLD_MICROS > now_us {
-                    let note = NoteSegment {
-                        start_us: tempo.tick_to_time_approx(tick, &mut tempo_cache),
-                        end_us,
-                        track: song.midi.track_origin[track] as u16,
-                        channel: ch,
-                        pitch: key,
-                    };
-                    push_culled(&mut acc.notes, &mut acc.last, base, note);
-                }
+            if !urgent && self.last_batch + batch.notes.len() > NOTE_BATCH {
+                worker.pending = Some(batch);
+                break;
             }
-        };
-
-        let first_new = self.window.len();
-        // Seek / big skip / dense passage: decode all tracks in parallel.
-        if jumped || self.last_scanned > 50_000 {
-            // Each worker takes a run of tracks into one list (in track order).
-            let parts: Vec<Decoded> = self
-                .readers
-                .par_iter_mut()
-                .enumerate()
-                .fold(|| Decoded::new(Vec::new()), |mut acc, (i, r)| {
-                    decode(i, r, &mut acc);
-                    acc
-                })
-                .collect();
-            self.last_scanned = parts.iter().map(|p| p.scanned).sum();
-            self.window.reserve(parts.iter().map(|p| p.notes.len()).sum());
-            for p in parts {
-                self.window.extend(p.notes);
-            }
-        } else {
-            let mut acc = Decoded::new(std::mem::take(&mut self.window));
-            for (i, r) in self.readers.iter_mut().enumerate() {
-                decode(i, r, &mut acc);
-            }
-            self.last_scanned = acc.scanned;
-            self.window = acc.notes;
+            self.last_batch += batch.notes.len();
+            self.window.extend(batch.notes);
+            self.through = batch.through;
         }
         self.timing.decode = t0.elapsed();
-        let span = reach.saturating_sub(self.frontier_us.max(now_us)).max(1);
-        self.step_us = if self.last_scanned > DECODE_BUDGET {
-            // Over: the same span of song would cost this much too, so take less of it.
-            ((span as u128 * DECODE_BUDGET as u128 / self.last_scanned as u128) as u64).max(2_000)
-        } else {
-            self.step_us.min(1 << 40).saturating_mul(3) / 2 + 1_000
-        };
-        self.frontier_us = reach;
         let t0 = Instant::now();
-        // Draw order = start time, so later notes cover earlier ones. New notes all start
-        // after the existing ones, so sorting just the batch keeps each key in order.
-        // Stable: equal starts keep track order (higher track on top). Each track's run is
-        // already sorted, so this is a cheap run merge.
-        self.last_batch = self.window.len() - first_new;
-        if self.last_batch > 50_000 {
-            self.window[first_new..].par_sort_by_key(|n| n.start_us);
-        } else {
-            self.window[first_new..].sort_by_key(|n| n.start_us);
-        }
-        self.timing.sort = t0.elapsed();
-        let t0 = Instant::now();
-
-        // Cull across tracks too (tracks were culled individually while decoding),
-        // compacting the batch in place.
-        let mut last = [usize::MAX; 128];
-        let mut w = first_new;
-        for r in first_new..self.window.len() {
-            let note = self.window[r];
-            let k = note.pitch as usize & 127;
-            if last[k] == usize::MAX || !note.absorb(&mut self.window[last[k]]) {
-                self.window[w] = note;
-                last[k] = w;
-                w += 1;
-            }
-        }
-        self.window.truncate(w);
-        if w > first_new { self.revision = self.revision.wrapping_add(1); }
-        // Index at once, however large: drawing a big unindexed window exactly costs
-        // far more (tens of ms a frame, for dozens of frames) than building the index.
+        if self.last_batch > 0 { self.revision = self.revision.wrapping_add(1); }
+        // Fully index the received batch so the exact pixel selector stays cheap.
         self.index_notes(self.indexed);
         self.timing.cull = t0.elapsed();
     }
@@ -2726,6 +2769,35 @@ mod tests {
         build(&mut stepped, &mut a, 0);
         build(&mut fresh, &mut b, 0);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn worker_reset_discards_pending_batches_and_same_track_count_songs() {
+        let song = test_song();
+        let mut visible = VisibleNotes::default();
+        visible.advance(&song.data, 2_000_000, 3_000_000, 1000);
+        let generation = visible.generation;
+        visible.worker.as_mut().unwrap().pending = Some(NoteBatch {
+            generation, notes: vec![NoteSegment { start_us: 2_500_000, end_us: 9_000_000,
+                track: 99, channel: 0, pitch: 60 }], through: 9_000_000,
+        });
+        visible.advance(&song.data, 0, 1_000_000, 1000);
+        assert_ne!(visible.generation, generation);
+        assert!(visible.window.iter().all(|n| n.track != 99));
+        let generation = visible.generation;
+        visible.advance(&test_song().data, 0, 1_000_000, 1000);
+        assert_ne!(visible.generation, generation);
+    }
+
+    #[test]
+    fn equal_start_batches_preserve_track_order() {
+        let song = test_song();
+        let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
+        let decoded = decode_notes(&song.data, &mut readers, 0, 1_000_000);
+        // Identical spans on all three tracks: highest track must win.
+        assert_eq!(decoded.notes.len(), 1);
+        assert_eq!(decoded.notes[0].track, 2);
+        assert_eq!(decoded.notes[0].start_us, 0);
     }
 
     #[test]
