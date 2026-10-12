@@ -16,7 +16,7 @@ egui-wgpu = "0.32.3"
 bytemuck = { version = "1.17", features = ["derive"] }
 # Compressed MIDI loading
 zip = { version = "9", default-features = false, features = ["deflate", "deflate64"] }
-sevenz-rust2 = "0.23"
+sevenz-rust2 = { version = "0.23", features = ["zstd"] }
 lzma-rust2 = "0.21"
 # C liblzma for xz layers: ~3.5x faster than lzma-rust2 on streams of long matches (bomb-like files)
 liblzma = { version = "0.4", features = ["static"] }

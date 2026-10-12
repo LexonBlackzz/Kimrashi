@@ -51,6 +51,7 @@ impl Kind {
         })
     }
 
+    #[allow(dead_code)]
     fn name(self) -> &'static str {
         match self {
             Kind::Midi => "mid",
@@ -1074,6 +1075,11 @@ mod tests {
         sz.push_archive_entry(ArchiveEntry::new_file("a_small.mid"), Some(&midi[..14])).unwrap();
         sz.push_archive_entry(ArchiveEntry::new_file("b_song.mid"), Some(&midi[..])).unwrap();
         sz.finish().unwrap();
+        // 7z with a zstd coder
+        let mut sz = ArchiveWriter::create(dir.join("zstd.7z")).unwrap();
+        sz.set_content_methods(vec![sevenz_rust2::encoder_options::ZstandardOptions::default().into()]);
+        sz.push_archive_entry(ArchiveEntry::new_file("song.mid"), Some(&midi[..])).unwrap();
+        sz.finish().unwrap();
 
         // tar.gz: a tar holding the song, gzipped
         let mut tar = tar::Builder::new(Vec::new());
@@ -1092,6 +1098,7 @@ mod tests {
             ("song.zip", "zip › gz"),
             ("solid.7z", "7z"),
             ("separate.7z", "7z"),
+            ("zstd.7z", "7z"),
             ("song.tar.gz", "gz › tar"),
         ] {
             let m = load(name).unwrap();
