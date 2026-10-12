@@ -743,14 +743,9 @@ impl VisibleNotes {
         }
         self.window.truncate(w);
         if w > first_new { self.revision = self.revision.wrapping_add(1); }
-        // Show a large seek immediately using the exact loop. Build its row index
-        // over the following frames, then maintain it only for entering notes.
-        if self.window.len() <= 50_000 {
-            self.index_notes(self.indexed);
-        } else if first_new > 0 {
-            let end = self.indexed.saturating_add(self.last_batch).saturating_add(200_000).min(self.window.len());
-            self.index_until(self.indexed, end);
-        }
+        // Index at once, however large: drawing a big unindexed window exactly costs
+        // far more (tens of ms a frame, for dozens of frames) than building the index.
+        self.index_notes(self.indexed);
         self.timing.cull = t0.elapsed();
     }
 
@@ -786,6 +781,22 @@ impl VisibleNotes {
                 self.indexed = end;
                 return;
             }
+        }
+        if end - first > 20_000 {
+            // A dense passage: bucket the new notes by key, then each key takes its own.
+            let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); 128];
+            for (i, note) in self.window[..end].iter().enumerate().skip(first) {
+                buckets[note.pitch as usize & 127].push(i);
+                self.max_len_us = self.max_len_us.max(note.end_us - note.start_us);
+                self.total_len_us = self.total_len_us.saturating_add(note.end_us - note.start_us);
+            }
+            let window = &self.window;
+            self.keys.par_iter_mut().zip(buckets.par_iter()).zip(counts.par_iter()).for_each(|((key, new), &count)| {
+                for &i in new { key.push(i, &window[i]); }
+                key.update_tree(count);
+            });
+            self.indexed = end;
+            return;
         }
         for (i, note) in self.window[..end].iter().enumerate().skip(first) {
             self.keys[note.pitch as usize & 127].push(i, note);
@@ -2683,31 +2694,6 @@ mod tests {
         build(&mut stepped, &mut a, 0);
         build(&mut fresh, &mut b, 0);
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn a_partial_row_index_keeps_drawing_exact_notes_until_ready() {
-        let song = test_song();
-        let mut visible = VisibleNotes {
-            readers: vec![TrackReader::default(); song.data.midi.tracks.len()],
-            window: (0..300_000).map(|i| NoteSegment {
-                start_us: 0, end_us: 1_000_000, track: (i % 3) as u16,
-                channel: (i % 3) as u8, pitch: 60 + (i % 3) as u8,
-            }).collect(),
-            alive: 300_000, ..Default::default()
-        };
-        let mut instances = Arc::new(Vec::new());
-        build_note_instances(&song, &mut visible, 0, 1_000_000, 1.0, 100, false, true, &mut instances);
-        assert_eq!(instances.len(), 300_000);
-        let unindexed = instances.clone();
-        visible.advance(&song.data, 0, 0, 100); // no entering records, first chunk
-        assert_eq!(visible.indexed, 200_000);
-        build_note_instances(&song, &mut visible, 0, 1_000_000, 1.0, 100, false, true, &mut instances);
-        assert!(Arc::ptr_eq(&unindexed, &instances));
-        visible.advance(&song.data, 0, 0, 100); // completes the index
-        assert_eq!(visible.indexed, visible.window.len());
-        build_note_instances(&song, &mut visible, 0, 1_000_000, 1.0, 100, false, true, &mut instances);
-        assert_eq!(instances.len(), 3);
     }
 
     #[test]
