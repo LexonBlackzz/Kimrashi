@@ -17,20 +17,20 @@ struct Globals {
     direction_sign: f32,
     flat_mode: u32,
     instance_count: u32,
-    _pad1: u32,
-    _pad2: u32,
+    now_lo: u32,
+    now_hi: u32,
 };
 
 @group(0) @binding(0)
-var<storage, read> key_positions: array<KeyPosition, 256u>;
+var<uniform> key_positions: array<KeyPosition, 256u>;
 
 @group(0) @binding(1)
 var<uniform> globals: Globals;
 
 struct VertexInput {
-    @location(0) start_length: vec2<f32>,
-    @location(1) key_color: u32,
-    @location(2) border_width: u32,
+    @location(0) start_us: vec2<u32>,
+    @location(1) length: f32,
+    @location(2) key_color: u32,
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
 };
@@ -43,6 +43,32 @@ struct VertexOutput {
     @location(3) win_size: vec2<f32>,
     @location(4) border_width: f32,
 };
+
+fn microseconds_as_float(lo: u32, hi: u32) -> f32 {
+    if hi == 0u { return f32(lo); }
+    // Round the integer once, including ties to even. Rounding the low word first
+    // can change an end pixel when an hours-long note reaches the current window.
+    let shift = firstLeadingBit(hi) + 9u;
+    var significant: u32;
+    var round_up: bool;
+    if shift < 32u {
+        significant = (hi << (32u - shift)) | (lo >> shift);
+        let remainder = lo & ((1u << shift) - 1u);
+        let half = 1u << (shift - 1u);
+        round_up = remainder > half || (remainder == half && (significant & 1u) != 0u);
+    } else if shift == 32u {
+        significant = hi;
+        round_up = lo > 2147483648u || (lo == 2147483648u && (significant & 1u) != 0u);
+    } else {
+        let high_shift = shift - 32u;
+        significant = hi >> high_shift;
+        let remainder = hi & ((1u << high_shift) - 1u);
+        let half = 1u << (high_shift - 1u);
+        round_up = remainder > half || (remainder == half && (lo != 0u || (significant & 1u) != 0u));
+    }
+    significant += select(0u, 1u, round_up);
+    return f32(significant) * exp2(f32(shift));
+}
 
 @vertex
 fn vs_notes(input: VertexInput) -> VertexOutput {
@@ -66,8 +92,21 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     let right = key_pos.right * 2.0 - 1.0;
 
     let safe_height = max(globals.height_time, 1e-6);
-    let start_norm = clamp(input.start_length.x / safe_height, 0.0, 2.0);
-    let end_norm = clamp((input.start_length.x + input.start_length.y) / safe_height, 0.0, 2.0);
+    // Subtract integer microseconds before converting, just as the CPU used to.
+    // Absolute f32 seconds would lose visible detail in long songs at close zoom.
+    let negative = input.start_us.y < globals.now_hi ||
+        (input.start_us.y == globals.now_hi && input.start_us.x < globals.now_lo);
+    let later = select(input.start_us, vec2<u32>(globals.now_lo, globals.now_hi), negative);
+    let earlier = select(vec2<u32>(globals.now_lo, globals.now_hi), input.start_us, negative);
+    let lo = later.x - earlier.x;
+    let hi = later.y - earlier.y - select(0u, 1u, later.x < earlier.x);
+    let delta = microseconds_as_float(lo, hi);
+    // A GPU division may multiply by a rounded reciprocal. Include its low part
+    // with one rounding, matching the CPU's f32 / 1_000_000 at raster boundaries.
+    let seconds = fma(delta, 0.000001, delta * 2.52475729e-15);
+    let start = select(seconds, -seconds, negative);
+    let start_norm = clamp(start / safe_height, 0.0, 2.0);
+    let end_norm = clamp((start + input.length) / safe_height, 0.0, 2.0);
 
     var start_clip = 1.0 - start_norm * 2.0;
     var end_clip = 1.0 - end_norm * 2.0;
@@ -94,7 +133,7 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     out.uv = uv;
     out.note_size = vec2<f32>(right - left, abs(start_clip - end_clip));
     out.win_size = vec2<f32>(globals.win_width, globals.win_height);
-    out.border_width = f32(input.border_width);
+    out.border_width = 1.0;
     return out;
 }
 

@@ -8,6 +8,7 @@ pub type DWORD = u32;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+#[allow(non_snake_case)] // KDMAPI's C ABI names
 pub struct DebugInfo {
     pub RenderingTime: f32,
     pub ActiveVoices: [u32; 16],
@@ -36,6 +37,7 @@ pub struct OmniMIDI {
     pub is_av: Option<Fn_IsKDMAPIAvailable>,
     pub init: Option<Fn_InitializeKDMAPIStream>,
     pub term: Option<Fn_TerminateKDMAPIStream>,
+    #[allow(dead_code)] // optional KDMAPI diagnostics entry point
     pub getdbg: Option<Fn_GetDriverDebugInfo>,
     pub send_direct: Option<Fn_SendDirectData>,
     pub send_batch: Option<Fn_SendDirectDataBatch>,
@@ -104,6 +106,7 @@ impl OmniMIDI {
             f(w);
         }
     }
+    #[allow(dead_code)]
     pub unsafe fn get_debug(&self) -> Option<&'static DebugInfo> {
         if let Some(f) = self.getdbg {
             let p = f();

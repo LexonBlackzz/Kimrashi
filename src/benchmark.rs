@@ -214,7 +214,7 @@ fn drain(mut r: impl Read) -> f64 {
 
 fn cpu_name() -> String {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
+    {
         use std::arch::x86_64::__cpuid;
         if __cpuid(0x8000_0000).eax >= 0x8000_0004 {
             let mut b = Vec::new();
@@ -371,7 +371,7 @@ pub fn run_from_args() -> bool {
     if !args.iter().any(|a| a == "--benchmark") {
         return false;
     }
-    println!("Kimrashi benchmark v{VERSION}: close other programs for a fair score.");
+    println!("Kimrashi benchmark v{VERSION} ({}): close other programs for a fair score.", Scale::FULL.name);
     let r = run(Scale::FULL, |i, name| println!("[{}/{}] {name} ...", i + 1, REFERENCE.len()));
     println!("\n{} · {} threads · {:.0} GB RAM", r.cpu, r.threads, r.ram_gb);
     for t in &r.tests {
