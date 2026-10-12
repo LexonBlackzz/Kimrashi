@@ -420,6 +420,34 @@ struct KeyNotes {
     end_times: Vec<u64>,
     ends: Vec<u64>,
     tree: Vec<u64>,
+    rows: Vec<RowNotes>,
+    row_head: usize,
+    row_time: u64,
+    row_view: (u32, u64),
+    added_start: u64,
+}
+
+struct RowNotes {
+    lo: u64,
+    hi: u64,
+    expiry: u64,
+    first: usize,
+    second: usize,
+    rest: Vec<usize>,
+}
+
+impl Default for RowNotes {
+    fn default() -> Self {
+        Self { lo: u64::MAX, hi: 0, expiry: 0, first: usize::MAX, second: usize::MAX, rest: Vec::new() }
+    }
+}
+
+impl RowNotes {
+    fn push(&mut self, i: usize) {
+        if self.first == usize::MAX { self.first = i; }
+        else if self.second == usize::MAX { self.second = i; }
+        else { self.rest.push(i); }
+    }
 }
 
 const NOTE_BLOCK: usize = 64;
@@ -430,6 +458,7 @@ fn rendered_end(note: &NoteSegment) -> u64 {
 
 impl KeyNotes {
     fn push(&mut self, index: usize, note: &NoteSegment) {
+        self.added_start = self.added_start.min(note.start_us);
         self.push_time(note);
         self.indices.push(index);
     }
@@ -468,6 +497,62 @@ impl KeyNotes {
         let mid = (lo + hi) / 2;
         self.last_block(node * 2 + 1, mid, hi, before, time)
             .or_else(|| self.last_block(node * 2, lo, mid, before, time))
+    }
+
+    fn last_block_cert(&self, node: usize, lo: usize, hi: usize, before: usize, time: u64, missed: &mut u64) -> Option<usize> {
+        if lo >= before { return None; }
+        if self.tree[node] < time { *missed = (*missed).max(self.tree[node]); return None; }
+        if hi - lo == 1 { return Some(lo); }
+        let mid = (lo + hi) / 2;
+        self.last_block_cert(node * 2 + 1, mid, hi, before, time, missed)
+            .or_else(|| self.last_block_cert(node * 2, lo, mid, before, time, missed))
+    }
+
+    fn covering_cert(&self, mut before: usize, time: u64, missed: &mut u64) -> Option<usize> {
+        while before > 0 {
+            let block = (before - 1) / NOTE_BLOCK;
+            for i in (block * NOTE_BLOCK..before).rev() {
+                let end = self.end_times[i];
+                if end >= time { return Some(i); }
+                *missed = (*missed).max(end);
+            }
+            let block = self.last_block_cert(1, 0, self.tree.len() / 2, block, time, missed)?;
+            before = ((block + 1) * NOTE_BLOCK).min(self.indices.len());
+        }
+        None
+    }
+
+    fn query_row(&self, window: &[NoteSegment], now: u64, window_end: u64, time: u64, guard: u64, row: &mut RowNotes) {
+        let lo = time.saturating_sub(guard);
+        let hi = time.saturating_add(guard);
+        let mut before = self.starts.partition_point(|&start| start <= hi);
+        row.lo = if before > 0 { self.starts[before - 1].saturating_sub(guard) } else { 0 };
+        row.hi = window_end.saturating_sub(guard);
+        if before < self.starts.len() { row.hi = row.hi.min(self.starts[before].saturating_sub(guard)); }
+        row.expiry = u64::MAX;
+        row.first = usize::MAX;
+        row.second = usize::MAX;
+        row.rest.clear();
+        let mut missed = 0;
+        while let Some(p) = self.covering_cert(before, lo, &mut missed) {
+            let i = self.indices[p];
+            let note = &window[i];
+            let end = rendered_end(note);
+            row.hi = row.hi.min(end.saturating_add(guard).saturating_add(1));
+            if note.start_us < window_end && note.end_us + NOTE_HOLD_MICROS > now {
+                row.push(i);
+                row.expiry = row.expiry.min(note.end_us + NOTE_HOLD_MICROS);
+                if note.start_us <= lo && end >= hi {
+                    row.lo = row.lo.max(note.start_us.saturating_add(guard));
+                    row.hi = row.hi.min(end.saturating_sub(guard).saturating_add(1));
+                    break;
+                }
+                if note.start_us > lo { row.hi = row.hi.min(note.start_us.saturating_add(guard)); }
+                if end < hi { row.lo = row.lo.max(end.saturating_sub(guard).saturating_add(1)); }
+            }
+            before = p;
+        }
+        if missed > 0 { row.lo = row.lo.max(missed.saturating_add(guard).saturating_add(1)); }
     }
 
     fn covering(&self, mut before: usize, time: u64) -> Option<usize> {
@@ -509,6 +594,9 @@ struct VisibleNotes {
     instance_revision: u64,
     instance_height_time: u32,
     instance_expiry: u64,
+    /// Keyboard, row queries, bitset collection, instance packing.
+    build_profile: [Duration; 4],
+    row_counts: [usize; 2],
     /// Where the last `advance` spent its time (for `FrameLog`).
     timing: AdvanceTimes,
 }
@@ -521,6 +609,8 @@ impl Default for VisibleNotes {
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
             instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
+            build_profile: [Duration::ZERO; 4],
+            row_counts: [0; 2],
             timing: AdvanceTimes::default(),
         }
     }
@@ -546,6 +636,7 @@ impl VisibleNotes {
         }
         let jumped = now_us - self.time_us > 1_000_000;
         self.time_us = now_us;
+        for key in &mut self.keys { key.added_start = u64::MAX; }
         // Finished notes are skipped when drawing, and swept out now and then (a sweep
         // visits every note on screen).
         let t0 = Instant::now();
@@ -706,6 +797,7 @@ impl VisibleNotes {
     }
 
     fn select_pixels(&mut self, now_us: u64, window_end: u64, height_time: f32, height_px: u32) {
+        let t0 = Instant::now();
         self.selected.clear();
         if !self.dense(height_time, height_px) {
             self.selected.extend(self.window.iter().enumerate()
@@ -720,31 +812,59 @@ impl VisibleNotes {
         // subpixel raster grid must never hide an exposed colour/border pixel.
         let guard = 2 + (((height_time as f64 * 1e6) as u64).saturating_add(self.max_len_us) >> 21)
             + (px_us / 256.0).ceil() as u64;
-        for key in &self.keys {
+        let height = height_px.max(1) as usize;
+        self.row_counts = [0; 2];
+        for key in &mut self.keys {
             if key.indices.is_empty() { continue; }
             let last = *key.indices.last().unwrap();
             if self.window[last].start_us <= now_us && self.window[last].end_us >= window_end.saturating_add(guard) {
                 self.selected_bits[last / 64] |= 1 << (last % 64);
+                key.rows.clear();
                 continue; // top note covers the whole viewport, including its borders
             }
-            let mut row_before = key.starts.partition_point(|&start| start <= now_us);
-            for row in 0..height_px.max(1) {
-                let time = now_us.saturating_add(((row as f64 + 0.5) * px_us) as u64);
-                let lo = time.saturating_sub(guard);
-                let hi = time.saturating_add(guard);
-                while row_before < key.starts.len() && key.starts[row_before] <= hi { row_before += 1; }
-                let mut before = row_before;
-                while let Some(p) = key.covering(before, lo) {
-                    let i = key.indices[p];
-                    let note = &self.window[i];
-                    if note.start_us < window_end && note.end_us + NOTE_HOLD_MICROS > now_us {
-                        self.selected_bits[i / 64] |= 1 << (i % 64);
-                        if note.start_us <= lo && rendered_end(note) >= hi { break; }
-                    }
-                    before = p;
+            let view = (height_time.to_bits(), guard);
+            let mut rows = std::mem::take(&mut key.rows);
+            if rows.len() != height || key.row_view != view || now_us < key.row_time {
+                rows.clear();
+                rows.resize_with(height, RowNotes::default);
+                key.row_head = 0;
+            } else {
+                let shift = ((now_us - key.row_time) as f64 / px_us).round() as usize;
+                if shift >= height {
+                    for row in &mut rows { row.hi = 0; }
+                    key.row_head = 0;
+                } else {
+                    key.row_head += shift;
+                    if key.row_head >= height { key.row_head -= height; }
                 }
             }
+            let (first, last) = rows.split_at_mut(key.row_head);
+            for (row, cached) in last.iter_mut().chain(first).enumerate() {
+                let time = now_us.saturating_add(((row as f64 + 0.5) * px_us) as u64);
+                cached.hi = cached.hi.min(key.added_start.saturating_sub(guard));
+                if cached.lo <= time && time < cached.hi && now_us < cached.expiry {
+                    self.row_counts[0] += 1;
+                } else {
+                    key.query_row(&self.window, now_us, window_end, time, guard, cached);
+                    self.row_counts[1] += 1;
+                }
+                if cached.first != usize::MAX {
+                    let i = cached.first;
+                    self.selected_bits[i / 64] |= 1 << (i % 64);
+                }
+                if cached.second != usize::MAX {
+                    let i = cached.second;
+                    self.selected_bits[i / 64] |= 1 << (i % 64);
+                }
+                for &i in &cached.rest { self.selected_bits[i / 64] |= 1 << (i % 64); }
+            }
+            key.rows = rows;
+            key.row_time = now_us;
+            key.row_view = view;
+            key.added_start = u64::MAX;
         }
+        self.build_profile[1] = t0.elapsed();
+        let t0 = Instant::now();
         // The bitset deduplicates row winners and emits them in the original draw
         // order without sorting or walking every NoteSegment again.
         for (block, &bits) in self.selected_bits.iter().enumerate() {
@@ -754,6 +874,7 @@ impl VisibleNotes {
                 bits &= bits - 1;
             }
         }
+        self.build_profile[2] = t0.elapsed();
     }
 
     fn dense(&self, height_time: f32, height_px: u32) -> bool {
@@ -2235,6 +2356,7 @@ fn build_note_instances(
         return (active_keys, active_colors);
     }
     // Keyboard state includes sounding notes too short to cover a raster sample.
+    let t0 = Instant::now();
     for (pitch, key) in visible.keys.iter().enumerate() {
         let mut before = key.starts.partition_point(|&start| start <= now_us);
         while let Some(p) = key.covering(before, now_us) {
@@ -2247,7 +2369,9 @@ fn build_note_instances(
             before = p;
         }
     }
+    visible.build_profile[0] = t0.elapsed();
     visible.select_pixels(now_us, window_end, height_time, height_px);
+    let t0 = Instant::now();
     if visible.instance_style != Some(style) || visible.selected != visible.selection {
         let buf = Arc::make_mut(instances);
         buf.clear();
@@ -2272,6 +2396,7 @@ fn build_note_instances(
         std::mem::swap(&mut visible.selection, &mut visible.selected);
         visible.instance_style = Some(style);
     }
+    visible.build_profile[3] = t0.elapsed();
     (active_keys, active_colors)
 }
 
@@ -2494,6 +2619,25 @@ mod tests {
         let mut visible = indexed(notes, false);
         for (now, speed) in [(0, 1.0), (333_333, 0.2), (777_777, 0.01)] {
             assert_raster_equal(&song, &mut visible, now, speed, 48);
+        }
+    }
+
+    #[test]
+    fn scrolling_row_cache_matches_the_painter_frame_after_frame() {
+        let song = test_song();
+        let mut seed = 99u64;
+        let notes = (0..7000).map(|i| {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            let start_us = seed % 3_000_000;
+            NoteSegment {
+                start_us, end_us: start_us + (seed >> 20) % 300_000,
+                track: i % 3, channel: (i % 3) as u8, pitch: 60 + (i % 2) as u8,
+            }
+        }).collect();
+        let mut visible = indexed(notes, false);
+        // Same zoom, small steps (the cache shifts), then a jump past the whole viewport.
+        for now in (0..40).map(|f| f * 16_667).chain([2_000_000, 2_016_667]) {
+            assert_raster_equal(&song, &mut visible, now, 1.0, 48);
         }
     }
 

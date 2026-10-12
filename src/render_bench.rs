@@ -116,6 +116,8 @@ pub fn run_from_args() -> bool {
     }
     let mut log = FrameLog::from_env();
     let mut sums = [Duration::ZERO; 8];
+    let mut build_parts = [Duration::ZERO; 4];
+    let mut row_counts = [0usize; 2];
     let mut budgets = Vec::new();
     let mut counts = (0usize, 0usize);
     let mut initial = Duration::ZERO;
@@ -150,6 +152,8 @@ pub fn run_from_args() -> bool {
         let a = visible.timing;
         let values = [a.retain, a.decode, a.sort, a.cull, build, upload, gpu, cpu + upload + gpu];
         for (sum, v) in sums.iter_mut().zip(values) { *sum += v; }
+        for (sum, v) in build_parts.iter_mut().zip(visible.build_profile) { *sum += v; }
+        for (sum, v) in row_counts.iter_mut().zip(visible.row_counts) { *sum += v; }
         budgets.push(values[7].as_secs_f64() * 1e3);
         counts.0 = counts.0.max(instances.len()); counts.1 += visible.last_batch;
     }
@@ -157,6 +161,9 @@ pub fn run_from_args() -> bool {
     let ms = |d: Duration| d.as_secs_f64() * 1e3 / frames as f64;
     budgets.sort_by(f64::total_cmp);
     println!("initial_decode_build_ms={:.3}, max_instances={}, new_per_frame={}", initial.as_secs_f64() * 1e3, counts.0, counts.1 / frames);
+    println!("build_parts_ms: keyboard={:.4}, rows={:.4}, bitset={:.4}, packing={:.4}",
+        ms(build_parts[0]), ms(build_parts[1]), ms(build_parts[2]), ms(build_parts[3]));
+    println!("rows_per_frame: reused={} queried={}", row_counts[0] / frames, row_counts[1] / frames);
     println!("retain_ms,decode_ms,sort_ms,cull_ms,build_ms,upload_ms,gpu_ms,frame_budget_ms,p95_ms");
     println!("{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}", ms(sums[0]), ms(sums[1]), ms(sums[2]), ms(sums[3]), ms(sums[4]), ms(sums[5]), ms(sums[6]), ms(sums[7]), budgets[frames * 95 / 100]);
     true
