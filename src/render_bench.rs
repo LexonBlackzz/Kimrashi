@@ -181,7 +181,7 @@ pub fn run_from_args() -> bool {
     visible.set_collapse(!args.iter().any(|a| a == "--no-collapse-overlaps"));
     let mut reference_readers = vec![crate::TrackReader::default(); visual.data.midi.tracks.len()];
     let mut reference_window = Vec::new();
-    let mut instances = Arc::new(Vec::new());
+    let mut instances = Arc::new(gpu::InstanceRing::default());
     let mut keys = [gpu::KeyPosition::zeroed(); 256];
     use bytemuck::Zeroable;
     let columns = crate::key_columns(true, visual.pitch_min, visual.pitch_max);
@@ -246,9 +246,9 @@ pub fn run_from_args() -> bool {
     true
 }
 
-fn reference_instances(song: &VisualSong, window: &[crate::NoteSegment], now: u64, end: u64) -> Arc<Vec<gpu::NoteInstance>> {
+fn reference_instances(song: &VisualSong, window: &[crate::NoteSegment], now: u64, end: u64) -> Arc<gpu::InstanceRing> {
     // Keep the original loop and byte layout independent of pixel selection.
-    Arc::new((0..2).flat_map(|pass| window.iter().rev()
+    Arc::new(gpu::InstanceRing::from_ordered((0..2).flat_map(|pass| window.iter().rev()
         .filter(move |n| crate::is_black_key(n.pitch) == (pass == 0)))
         .filter(|n| n.start_us < end && n.end_us + crate::NOTE_HOLD_MICROS > now)
         .map(|note| {
@@ -259,5 +259,5 @@ fn reference_instances(song: &VisualSong, window: &[crate::NoteSegment], now: u6
                     ((note.end_us - note.start_us) as f32 / 1e6).max(0.000_1).to_bits()],
                 len: f32::from_bits(packed), key_color: 1,
             }
-        }).collect())
+        })))
 }

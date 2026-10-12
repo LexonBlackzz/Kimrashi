@@ -1,4 +1,4 @@
-use std::{mem, sync::{Arc, Weak}};
+use std::{mem, sync::{Arc, Weak}, collections::{HashMap, BinaryHeap}, cmp::Reverse};
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
@@ -13,6 +13,74 @@ pub struct NoteInstance {
     pub start_us: [u32; 2],
     pub len: f32,
     pub key_color: u32,
+}
+
+/// Stable instance slots plus a small front-to-back draw list. Slots survive
+/// pixel-selection changes and are reused only after their note expires.
+#[derive(Clone, Default, Debug)]
+pub struct InstanceRing {
+    slots: Vec<NoteInstance>,
+    versions: Vec<u64>,
+    order: Vec<u32>,
+    lookup: HashMap<[u32; 4], u32>,
+    expiry: BinaryHeap<Reverse<(u64, u32)>>,
+    free: Vec<u32>,
+    revision: u64,
+}
+
+impl InstanceRing {
+    pub fn len(&self) -> usize { self.order.len() }
+    pub fn is_empty(&self) -> bool { self.order.is_empty() }
+    pub fn iter(&self) -> impl Iterator<Item = &NoteInstance> {
+        self.order.iter().map(|&slot| &self.slots[slot as usize])
+    }
+    fn key(note: &NoteInstance) -> [u32; 4] {
+        [note.start_us[0], note.start_us[1], note.len.to_bits(), note.key_color]
+    }
+    pub fn begin(&mut self, now: u64) {
+        self.order.clear();
+        while self.expiry.peek().is_some_and(|x| x.0.0 <= now) {
+            let Reverse((_, slot)) = self.expiry.pop().unwrap();
+            self.lookup.remove(&Self::key(&self.slots[slot as usize]));
+            self.free.push(slot);
+        }
+    }
+    pub fn push(&mut self, note: NoteInstance, expiry: u64) -> u32 {
+        let key = Self::key(&note);
+        let slot = if let Some(&slot) = self.lookup.get(&key) { slot } else {
+            static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            self.revision = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let slot = if let Some(slot) = self.free.pop() {
+                self.slots[slot as usize] = note;
+                self.versions[slot as usize] = self.revision;
+                slot
+            } else {
+                let slot = self.slots.len() as u32;
+                self.slots.push(note);
+                self.versions.push(self.revision);
+                slot
+            };
+            self.lookup.insert(key, slot);
+            self.expiry.push(Reverse((expiry, slot)));
+            slot
+        };
+        self.order.push(slot);
+        slot
+    }
+    pub fn push_slot(&mut self, slot: u32) { self.order.push(slot); }
+    pub fn from_ordered(notes: impl IntoIterator<Item = NoteInstance>) -> Self {
+        let mut ring = Self::default();
+        for note in notes { ring.push(note, u64::MAX); }
+        ring
+    }
+}
+
+impl std::ops::Index<usize> for InstanceRing {
+    type Output = NoteInstance;
+    fn index(&self, i: usize) -> &Self::Output { &self.slots[self.order[i] as usize] }
+}
+impl PartialEq for InstanceRing {
+    fn eq(&self, other: &Self) -> bool { self.iter().eq(other.iter()) }
 }
 
 #[repr(C, align(16))]
@@ -45,7 +113,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub struct NotesCallback {
     viewport: egui::Rect,
     target_format: wgpu::TextureFormat,
-    instances: Arc<Vec<NoteInstance>>,
+    instances: Arc<InstanceRing>,
     key_positions: [KeyPosition; 256],
     height_time: f32,
     now_us: u64,
@@ -57,7 +125,7 @@ impl NotesCallback {
     pub fn new(
         viewport: egui::Rect,
         target_format: wgpu::TextureFormat,
-        instances: Arc<Vec<NoteInstance>>,
+        instances: Arc<InstanceRing>,
         key_positions: [KeyPosition; 256],
         height_time: f32,
         now_us: u64,
@@ -138,8 +206,12 @@ struct NotePipeline {
     instance_capacity: usize,
     /// Instances uploaded this frame (may be fewer than requested, see `upload`).
     instance_count: u32,
-    uploaded: Option<Weak<Vec<NoteInstance>>>,
-    previous: Vec<NoteInstance>,
+    uploaded: Option<Weak<InstanceRing>>,
+    versions: Vec<u64>,
+    order: Vec<u32>,
+    order_buffer: wgpu::Buffer,
+    order_capacity: usize,
+    relative: bool,
     key_buffer: wgpu::Buffer,
     globals_buffer: wgpu::Buffer,
     target_format: wgpu::TextureFormat,
@@ -153,7 +225,7 @@ impl NotePipeline {
     fn with_shader(device: &wgpu::Device, target_format: wgpu::TextureFormat, source: &str, relative: bool) -> Self {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("notes.bind_group_layout"),
-            entries: &[
+            entries: &{ let mut entries = vec![
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -174,7 +246,14 @@ impl NotePipeline {
                     },
                     count: None,
                 },
-            ],
+            ];
+            if !relative { entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 2, visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false, min_binding_size: None }, count: None,
+            }); }
+            entries
+            },
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -195,25 +274,15 @@ impl NotePipeline {
                 module: &shader,
                 entry_point: Some("vs_notes"),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<NoteInstance>() as wgpu::BufferAddress,
+                    array_stride: if relative { mem::size_of::<NoteInstance>() as u64 } else { 4 },
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: if relative { wgpu::VertexFormat::Float32x2 } else { wgpu::VertexFormat::Uint32x2 },
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 8,
-                            shader_location: 1,
-                            format: if relative { wgpu::VertexFormat::Uint32 } else { wgpu::VertexFormat::Float32 },
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 12,
-                            shader_location: 2,
-                            format: wgpu::VertexFormat::Uint32,
-                        },
-                    ],
+                    attributes: &if relative { vec![
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
+                        wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Uint32 },
+                        wgpu::VertexAttribute { offset: 12, shader_location: 2, format: wgpu::VertexFormat::Uint32 },
+                    ] } else { vec![
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Uint32 },
+                    ] },
                 }],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
@@ -254,8 +323,13 @@ impl NotePipeline {
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("notes.instances"),
             size: 256,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+
+        let order_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("notes.order"), size: 256,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
         });
 
         let key_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -275,7 +349,7 @@ impl NotePipeline {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("notes.bind_group"),
             layout: &bind_group_layout,
-            entries: &[
+            entries: &{ let mut entries = vec![
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: key_buffer.as_entire_binding(),
@@ -284,7 +358,10 @@ impl NotePipeline {
                     binding: 1,
                     resource: globals_buffer.as_entire_binding(),
                 },
-            ],
+            ];
+            if !relative { entries.push(wgpu::BindGroupEntry { binding: 2, resource: instance_buffer.as_entire_binding() }); }
+            entries
+            },
         });
 
         Self {
@@ -294,7 +371,7 @@ impl NotePipeline {
             instance_capacity: 16,
             instance_count: 0,
             uploaded: None,
-            previous: Vec::new(),
+            versions: Vec::new(), order: Vec::new(), order_buffer, order_capacity: 64, relative,
             key_buffer,
             globals_buffer,
             target_format,
@@ -312,43 +389,55 @@ impl NotePipeline {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        data: &Arc<Vec<NoteInstance>>,
+        data: &Arc<InstanceRing>,
         keys: &[KeyPosition; 256],
         mut globals: GlobalsUniform,
     ) {
-        // Never exceed the device's buffer limit (wgpu panics if we do); draw what fits.
-        let max = (device.limits().max_buffer_size / mem::size_of::<NoteInstance>() as u64)
-            .min(u32::MAX as u64) as usize;
-        let instances = &data[..data.len().min(max)];
-        if instances.len() > self.instance_capacity {
-            self.grow_instances(device, instances.len(), max);
+        let max = (device.limits().max_buffer_size.min(device.limits().max_storage_buffer_binding_size as u64)
+            / mem::size_of::<NoteInstance>() as u64).min(u32::MAX as u64) as usize;
+        let needed = if self.relative { data.len() } else { data.slots.len() }.min(max);
+        if needed > self.instance_capacity { self.grow_instances(device, needed, max); }
+        if data.len() > self.order_capacity {
+            self.order_capacity = data.len().next_power_of_two();
+            self.order_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("notes.order.grow"), size: (self.order_capacity * 4) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            });
+            self.order.clear();
         }
-        self.instance_count = instances.len() as u32;
-        globals.instance_count = self.instance_count;
-
         let source = Arc::downgrade(data);
         if !self.uploaded.as_ref().is_some_and(|old| Weak::ptr_eq(old, &source)) {
-            // Small buffers are cheaper to copy than to compare and retain a second
-            // CPU copy. Large dense selections benefit from partial writes.
-            if instances.len() <= 65_536 {
-                queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
-                self.previous.clear();
+            if self.relative {
+                let notes: Vec<_> = data.iter().take(max).copied().collect();
+                queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&notes));
+                self.instance_count = notes.len() as u32;
             } else {
-                let old = &self.previous;
-                let first = old.iter().zip(instances).take_while(|(a, b)| a == b).count();
-                let mut end = instances.len();
-                if old.len() == instances.len() {
-                    while end > first && old[end - 1] == instances[end - 1] { end -= 1; }
-                }
-                if end > first {
+                // Coalesce adjacent newly allocated/reused slots into one write.
+                self.versions.resize(needed, 0);
+                let mut i = 0;
+                while i < needed {
+                    if self.versions[i] == data.versions[i] { i += 1; continue; }
+                    let first = i;
+                    while i < needed && self.versions[i] != data.versions[i] {
+                        self.versions[i] = data.versions[i];
+                        i += 1;
+                    }
                     queue.write_buffer(&self.instance_buffer, (first * mem::size_of::<NoteInstance>()) as u64,
-                        bytemuck::cast_slice(&instances[first..end]));
+                        bytemuck::cast_slice(&data.slots[first..i]));
                 }
-                self.previous.resize(instances.len(), NoteInstance::zeroed());
-                if end > first { self.previous[first..end].copy_from_slice(&instances[first..end]); }
+                let order: Vec<_> = data.order.iter().copied().filter(|&slot| (slot as usize) < max).collect();
+                if self.order != order {
+                    let first = self.order.iter().zip(&order).take_while(|(a,b)| a == b).count();
+                    if first < order.len() {
+                        queue.write_buffer(&self.order_buffer, (first * 4) as u64, bytemuck::cast_slice(&order[first..]));
+                    }
+                    self.order = order;
+                }
+                self.instance_count = self.order.len() as u32;
             }
             self.uploaded = Some(source);
         }
+        globals.instance_count = self.instance_count;
         queue.write_buffer(&self.key_buffer, 0, bytemuck::cast_slice(&keys[..]));
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
     }
@@ -358,13 +447,23 @@ impl NotePipeline {
         let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("notes.instances.grow"),
             size: (capacity * std::mem::size_of::<NoteInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.instance_buffer = new_buffer;
         self.instance_capacity = capacity;
         self.uploaded = None;
-        self.previous.clear();
+        self.versions.clear();
+        if !self.relative {
+            self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("notes.bind_group.grow"), layout: &self.pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.key_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.globals_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.instance_buffer.as_entire_binding() },
+                ],
+            });
+        }
     }
 
     fn draw(&self, render_pass: &mut wgpu::RenderPass<'static>) {
@@ -373,7 +472,7 @@ impl NotePipeline {
         }
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        let slice = self.instance_buffer.slice(..);
+        let slice = if self.relative { self.instance_buffer.slice(..) } else { self.order_buffer.slice(..) };
         let slice_static: wgpu::BufferSlice<'static> = unsafe { mem::transmute(slice) };
         render_pass.set_vertex_buffer(0, slice_static);
         render_pass.draw(0..6, 0..self.instance_count);
@@ -414,7 +513,7 @@ impl RenderBenchmark {
         let depth = texture(DEPTH_FORMAT, "bench.depth", wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         let pipeline = NotePipeline::new(&device, format);
         // The previous shader/vertex layout, for an actual GPU pixel comparison.
-        let mut source = include_str!("../shaders/notes.wgsl").replace("\r\n", "\n").replace(
+        let mut source = include_str!("../shaders/notes-reference.wgsl").replace("\r\n", "\n").replace(
             "@location(0) start_us: vec2<u32>,\n    @location(1) length: f32,\n    @location(2) key_color: u32,",
             "@location(0) start_length: vec2<f32>,\n    @location(1) key_color: u32,\n    @location(2) border_width: u32,",
         );
@@ -436,7 +535,7 @@ impl RenderBenchmark {
     }
 
     /// CPU upload time and GPU vertex/fragment time (timestamp queries, excluding readback).
-    pub fn frame(&mut self, instances: &Arc<Vec<NoteInstance>>, keys: &[KeyPosition; 256], height_time: f32, now_us: u64) -> (Duration, Duration) {
+    pub fn frame(&mut self, instances: &Arc<InstanceRing>, keys: &[KeyPosition; 256], height_time: f32, now_us: u64) -> (Duration, Duration) {
         let t0 = Instant::now();
         self.pipeline.upload(&self.device, &self.queue, instances, keys, GlobalsUniform {
             height_time, win_width: self.width as f32, win_height: self.height as f32,
@@ -479,7 +578,7 @@ impl RenderBenchmark {
         (upload, Duration::from_secs_f64(ns * 1e-9))
     }
 
-    pub fn reference_frame(&mut self, instances: &Arc<Vec<NoteInstance>>, keys: &[KeyPosition; 256], height_time: f32, now_us: u64) {
+    pub fn reference_frame(&mut self, instances: &Arc<InstanceRing>, keys: &[KeyPosition; 256], height_time: f32, now_us: u64) {
         mem::swap(&mut self.pipeline, &mut self.reference);
         self.frame(instances, keys, height_time, now_us);
         mem::swap(&mut self.pipeline, &mut self.reference);
@@ -509,6 +608,28 @@ impl RenderBenchmark {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    #[test]
+    fn instance_slots_survive_selection_changes_and_reuse_expired_space() {
+        let a = NoteInstance { start_us: [10, 0], len: 1.0, key_color: 60 };
+        let b = NoteInstance { start_us: [20, 0], len: 2.0, key_color: 61 };
+        let mut ring = InstanceRing::default();
+        ring.begin(0);
+        let slot_a = ring.push(a, 100);
+        let slot_b = ring.push(b, 200);
+        let version = ring.versions[slot_b as usize];
+        ring.begin(50);
+        assert_eq!(ring.push(b, 200), slot_b);
+        assert_eq!(ring.versions[slot_b as usize], version);
+        assert_eq!(ring.push(a, 100), slot_a);
+        ring.begin(100);
+        let c = NoteInstance { start_us: [30, 0], ..a };
+        assert_eq!(ring.push(c, 300), slot_a);
+        assert_eq!(ring.slots.len(), 2);
+        assert_ne!(ring.versions[slot_a as usize], version);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![c]);
+    }
+
     #[test]
     fn note_shader_is_valid() {
         use egui_wgpu::wgpu::naga;
@@ -518,3 +639,4 @@ mod tests {
             .unwrap();
     }
 }
+

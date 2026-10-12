@@ -780,6 +780,7 @@ struct VisibleNotes {
     selected: Vec<usize>,
     selection: Vec<usize>,
     selected_bits: Vec<u64>,
+    instance_slots: Vec<u32>,
     instance_style: Option<(bool, bool, bool)>,
     revision: u64,
     instance_revision: u64,
@@ -799,7 +800,7 @@ impl Default for VisibleNotes {
             last_scanned: 0, alive: 0, frames_since_sweep: 0,
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
-            instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
+            instance_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
             build_profile: [Duration::ZERO; 4],
             row_counts: [0; 2],
             timing: AdvanceTimes::default(),
@@ -1193,7 +1194,7 @@ struct AppState {
     flat_notes: bool,
     visible: VisibleNotes,
     /// Reused across frames; the GPU callback holds a clone until it renders.
-    instances: Arc<Vec<gpu::NoteInstance>>,
+    instances: Arc<gpu::InstanceRing>,
     /// Display refresh rate reported by the compositor (for the VSync label).
     refresh_rate_hz: Option<f32>,
     vblank: vsync::VBlank,
@@ -1905,7 +1906,7 @@ fn draw_piano_roll(
     piano_layout: bool,
     (detailed_stats, synth_stats): (bool, bool),
     visible: &mut VisibleNotes,
-    instances: &mut Arc<Vec<gpu::NoteInstance>>,
+    instances: &mut Arc<gpu::InstanceRing>,
     times: &mut FrameTimes,
 ) {
     let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
@@ -2476,7 +2477,7 @@ fn build_note_instances(
     height_px: u32,
     color_by_channel: bool,
     piano_layout: bool,
-    instances: &mut Arc<Vec<gpu::NoteInstance>>,
+    instances: &mut Arc<gpu::InstanceRing>,
 ) -> ([bool; 128], [Color32; 128]) {
     let mut active_keys = [false; 128];
     let mut active_colors = [Color32::TRANSPARENT; 128];
@@ -2488,24 +2489,28 @@ fn build_note_instances(
             || visible.instance_height_time != height_time.to_bits() || now_us >= visible.instance_expiry;
         if write {
             let buf = Arc::make_mut(instances);
-            buf.clear();
+            buf.begin(now_us);
+            if visible.instance_style != Some(style) { visible.instance_slots.clear(); }
+            visible.instance_slots.resize(visible.window.len(), u32::MAX);
             let mut expiry = u64::MAX;
             let passes = if piano_layout { 2 } else { 1 };
-            for note in (0..passes).flat_map(|pass| visible.window.iter().rev()
-                .filter(move |n| !piano_layout || is_black_key(n.pitch) == (pass == 0)))
-                .filter(|n| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us) {
+            for (i, note) in (0..passes).flat_map(|pass| visible.window.iter().enumerate().rev()
+                .filter(move |(_, n)| !piano_layout || is_black_key(n.pitch) == (pass == 0)))
+                .filter(|(_, n)| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us) {
                 let color = song.color_for(note, color_by_channel);
                 if note.start_us <= now_us && note.end_us > now_us && !active_keys[note.pitch as usize] {
                     active_keys[note.pitch as usize] = true;
                     active_colors[note.pitch as usize] = color;
                 }
                 expiry = expiry.min(note.end_us + NOTE_HOLD_MICROS);
-                buf.push(gpu::NoteInstance {
+                let slot = visible.instance_slots[i];
+                if slot != u32::MAX { buf.push_slot(slot); continue; }
+                visible.instance_slots[i] = buf.push(gpu::NoteInstance {
                     start_us: [note.start_us as u32, (note.start_us >> 32) as u32],
                     len: ((note.end_us - note.start_us) as f32 / 1e6).max(0.000_1),
                     key_color: note.pitch as u32 | ((color.r() as u32) << 24)
                         | ((color.g() as u32) << 16) | ((color.b() as u32) << 8),
-                });
+                }, note.end_us + NOTE_HOLD_MICROS);
             }
             visible.instance_expiry = expiry;
         } else {
@@ -2540,7 +2545,11 @@ fn build_note_instances(
     let t0 = Instant::now();
     if visible.instance_style != Some(style) || visible.selected != visible.selection {
         let buf = Arc::make_mut(instances);
-        buf.clear();
+        buf.begin(now_us);
+        if visible.instance_style != Some(style) {
+            visible.instance_slots.clear();
+        }
+        visible.instance_slots.resize(visible.window.len(), u32::MAX);
         // Newest first, with sharps in front of naturals in the piano layout.
         let passes = if piano_layout { 2 } else { 1 };
         let window = &visible.window;
@@ -2550,14 +2559,19 @@ fn build_note_instances(
                 !piano_layout || is_black_key(window[i].pitch) == (pass == 0)
             })
         }) {
+            let slot = visible.instance_slots[i];
+            if slot != u32::MAX {
+                buf.push_slot(slot);
+                continue;
+            }
             let note = &visible.window[i];
             let color = song.color_for(note, color_by_channel);
             let color_u32 = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | color.b() as u32;
-            buf.push(gpu::NoteInstance {
+            visible.instance_slots[i] = buf.push(gpu::NoteInstance {
                 start_us: [note.start_us as u32, (note.start_us >> 32) as u32],
                 len: ((note.end_us - note.start_us) as f32 / 1_000_000.0).max(0.000_1),
                 key_color: note.pitch as u32 | (color_u32 << 8),
-            });
+            }, note.end_us + NOTE_HOLD_MICROS);
         }
         std::mem::swap(&mut visible.selection, &mut visible.selected);
         visible.instance_style = Some(style);
@@ -2757,7 +2771,7 @@ mod tests {
         let surviving: Vec<_> = visible.selected.iter().map(|&i| visible.window[i]).filter(|n| n.pitch == 60).collect();
         assert_eq!(surviving.iter().map(|n| (n.start_us, n.end_us, n.track)).collect::<Vec<_>>(),
             [(20, 100_000, 1), (20, 40_000, 2), (50_500, 99_000, 0)]);
-        let mut instances = Arc::new(Vec::new());
+        let mut instances = Arc::new(gpu::InstanceRing::default());
         build_note_instances(&song, &mut visible, 0, 100_000, 0.1, 64, false, false, &mut instances);
         for instance in instances.iter().filter(|n| n.key_color & 255 == 60) {
             let start = instance.start_us[0] as u64;
@@ -2814,7 +2828,7 @@ mod tests {
             start_us: i * 100, end_us: i * 100 + 100, track: (i % 3) as u16,
             channel: (i % 3) as u8, pitch: 60,
         }).collect(), false);
-        let mut instances = Arc::new(Vec::new());
+        let mut instances = Arc::new(gpu::InstanceRing::default());
         build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, false, true, &mut instances);
         let coarse = instances.clone();
         build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, false, true, &mut instances);
@@ -2833,9 +2847,9 @@ mod tests {
         let mut fresh = VisibleNotes::default();
         fresh.advance(&song.data, 2_000_000, 5_000_000, 3000);
         assert_eq!(stepped.window, fresh.window);
-        let mut a = Arc::new(Vec::new());
-        let mut b = Arc::new(Vec::new());
-        let build = |visible: &mut VisibleNotes, buf: &mut Arc<Vec<gpu::NoteInstance>>, now| {
+        let mut a = Arc::new(gpu::InstanceRing::default());
+        let mut b = Arc::new(gpu::InstanceRing::default());
+        let build = |visible: &mut VisibleNotes, buf: &mut Arc<gpu::InstanceRing>, now| {
             build_note_instances(&song, visible, now, now + 3_000_000, 3.0, 900, false, true, buf);
         };
         build(&mut stepped, &mut a, 2_000_000);
@@ -2908,7 +2922,7 @@ mod tests {
             NoteSegment { start_us: 0, end_us: 2000, track: 1, channel: 2, pitch: 60 },
             NoteSegment { start_us: 5000, end_us: 10_000, track: 1, channel: 2, pitch: 60 },
         ], false);
-        let mut instances = Arc::new(Vec::new());
+        let mut instances = Arc::new(gpu::InstanceRing::default());
         build_note_instances(&song, &mut visible, 0, 10_000, 0.01, 100, false, false, &mut instances);
         assert_eq!(instances.len(), 2);
         build_note_instances(&song, &mut visible, 4000, 14_000, 0.01, 100, false, false, &mut instances);

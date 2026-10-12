@@ -27,10 +27,16 @@ var<uniform> key_positions: array<KeyPosition, 256u>;
 @group(0) @binding(1)
 var<uniform> globals: Globals;
 
+struct NoteInstance {
+    start_us: vec2<u32>,
+    length: f32,
+    key_color: u32,
+};
+@group(0) @binding(2)
+var<storage, read> instances: array<NoteInstance>;
+
 struct VertexInput {
-    @location(0) start_us: vec2<u32>,
-    @location(1) length: f32,
-    @location(2) key_color: u32,
+    @location(0) slot: u32,
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
 };
@@ -72,6 +78,7 @@ fn microseconds_as_float(lo: u32, hi: u32) -> f32 {
 
 @vertex
 fn vs_notes(input: VertexInput) -> VertexOutput {
+    let note = instances[input.slot];
     let corners = array<vec2<f32>, 6u>(
         vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 0.0),
@@ -84,8 +91,8 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     let vidx = input.vertex_index % 6u;
     let uv = corners[vidx];
 
-    let key = input.key_color & 0xFFu;
-    let color_packed = input.key_color >> 8u;
+    let key = note.key_color & 0xFFu;
+    let color_packed = note.key_color >> 8u;
     let key_pos = key_positions[key];
 
     let left = key_pos.left * 2.0 - 1.0;
@@ -94,10 +101,10 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     let safe_height = max(globals.height_time, 1e-6);
     // Subtract integer microseconds before converting, just as the CPU used to.
     // Absolute f32 seconds would lose visible detail in long songs at close zoom.
-    let negative = input.start_us.y < globals.now_hi ||
-        (input.start_us.y == globals.now_hi && input.start_us.x < globals.now_lo);
-    let later = select(input.start_us, vec2<u32>(globals.now_lo, globals.now_hi), negative);
-    let earlier = select(vec2<u32>(globals.now_lo, globals.now_hi), input.start_us, negative);
+    let negative = note.start_us.y < globals.now_hi ||
+        (note.start_us.y == globals.now_hi && note.start_us.x < globals.now_lo);
+    let later = select(note.start_us, vec2<u32>(globals.now_lo, globals.now_hi), negative);
+    let earlier = select(vec2<u32>(globals.now_lo, globals.now_hi), note.start_us, negative);
     let lo = later.x - earlier.x;
     let hi = later.y - earlier.y - select(0u, 1u, later.x < earlier.x);
     let delta = microseconds_as_float(lo, hi);
@@ -106,7 +113,7 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     let seconds = fma(delta, 0.000001, delta * 2.52475729e-15);
     let start = select(seconds, -seconds, negative);
     let start_norm = clamp(start / safe_height, 0.0, 2.0);
-    let end_norm = clamp((start + input.length) / safe_height, 0.0, 2.0);
+    let end_norm = clamp((start + note.length) / safe_height, 0.0, 2.0);
 
     var start_clip = 1.0 - start_norm * 2.0;
     var end_clip = 1.0 - end_norm * 2.0;
