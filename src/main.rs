@@ -284,6 +284,15 @@ impl FrameLog {
         self.update += update;
         self.worst = self.worst.max(update);
         let a = t.advance;
+        if update >= Duration::from_millis(30) {
+            // A hitch: the second's averages hide it, so say where this frame went.
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            let _ = writeln!(
+                self.file,
+                "spike,{:.1},retain {:.1},decode {:.1},sort {:.1},cull {:.1},build {:.1},instances {},decoded {}",
+                ms(update), ms(a.retain), ms(a.decode), ms(a.sort), ms(a.cull), ms(t.build), t.instances, t.decoded
+            );
+        }
         for (sum, d) in self.parts.iter_mut().zip([a.retain, a.decode, a.sort, a.cull, t.build]) {
             *sum += d;
         }
@@ -450,6 +459,9 @@ impl RowNotes {
     }
 }
 
+/// Track records one frame may decode before the rest waits for the next.
+const DECODE_BUDGET: usize = 500_000;
+
 const NOTE_BLOCK: usize = 64;
 
 fn rendered_end(note: &NoteSegment) -> u64 {
@@ -579,6 +591,11 @@ struct VisibleNotes {
     /// whether decoding is worth parallelizing.
     last_batch: usize,
     last_scanned: usize,
+    /// Song time decoded up to, and how far one frame may extend it: a burst of millions
+    /// of notes is taken over several frames (the far top of the screen fills in late)
+    /// instead of stalling one, which would only bring in even more notes the next.
+    frontier_us: u64,
+    step_us: u64,
     /// Notes in `window` after the last sweep of finished ones, and frames since.
     alive: usize,
     frames_since_sweep: u32,
@@ -605,7 +622,7 @@ impl Default for VisibleNotes {
     fn default() -> Self {
         Self {
             time_us: 0, readers: Vec::new(), window: Vec::new(), last_batch: 0,
-            last_scanned: 0, alive: 0, frames_since_sweep: 0,
+            last_scanned: 0, frontier_us: 0, step_us: u64::MAX, alive: 0, frames_since_sweep: 0,
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
             instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
@@ -655,7 +672,14 @@ impl VisibleNotes {
         let t0 = Instant::now();
         let tempo = &song.tempo;
         let now_tick = tempo.time_to_tick(now_us);
-        let end_tick = tempo.time_to_tick(window_end);
+        // A fresh start or a seek takes everything at once; otherwise spend about
+        // DECODE_BUDGET records a frame, but always reach notes about to sound.
+        let reach = if jumped || self.frontier_us == 0 {
+            window_end
+        } else {
+            window_end.min(self.frontier_us.saturating_add(self.step_us)).max((now_us + 100_000).min(window_end))
+        };
+        let end_tick = tempo.time_to_tick(reach);
         let decode = |track: usize, r: &mut TrackReader, acc: &mut Decoded| {
             let data = song.midi.track(track);
             if r.peek_tick(data).map_or(true, |t| t >= end_tick) {
@@ -714,6 +738,14 @@ impl VisibleNotes {
             self.window = acc.notes;
         }
         self.timing.decode = t0.elapsed();
+        let span = reach.saturating_sub(self.frontier_us.max(now_us)).max(1);
+        self.step_us = if self.last_scanned > DECODE_BUDGET {
+            // Over: the same span of song would cost this much too, so take less of it.
+            ((span as u128 * DECODE_BUDGET as u128 / self.last_scanned as u128) as u64).max(2_000)
+        } else {
+            self.step_us.min(1 << 40).saturating_mul(3) / 2 + 1_000
+        };
+        self.frontier_us = reach;
         let t0 = Instant::now();
         // Draw order = start time, so later notes cover earlier ones. New notes all start
         // after the existing ones, so sorting just the batch keeps each key in order.
