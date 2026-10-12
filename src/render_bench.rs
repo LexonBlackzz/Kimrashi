@@ -167,6 +167,8 @@ pub fn run_from_args() -> bool {
         "wall" => wall(), "polyphony" => generated(true), "nps" => generated(false), "held" => held(), "precision" => precision_song(from_us),
         path => SongData::load(path, 127, &Progress::default()).unwrap(),
     };
+    println!("packed_tracks={}, distinct_render_tracks={}", song.midi.tracks.len(),
+        crate::render_tracks(&song).iter().filter(|&&enabled| enabled).count());
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
     println!("Renderer benchmark: {input}, from {:.3}s, {frames} frames, 1920x900, piano, bordered, {speed}s window\nGPU: {}", from_us as f64 / 1e6, adapter.get_info().name);
@@ -178,6 +180,7 @@ pub fn run_from_args() -> bool {
     let mut renderer = gpu::RenderBenchmark::new(device, queue, 1920, 900);
     let visual = VisualSong::new(song);
     let mut visible = VisibleNotes::default();
+    visible.set_max_instances(value("--max-instances").map_or(262_144, |s| s.parse().unwrap()));
     visible.set_collapse(!args.iter().any(|a| a == "--no-collapse-overlaps"));
     let mut reference_readers = vec![crate::TrackReader::default(); visual.data.midi.tracks.len()];
     let mut reference_window = Vec::new();

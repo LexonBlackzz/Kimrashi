@@ -152,6 +152,7 @@ fn main() {
                 device_descriptor: Arc::new(|adapter| {
                     let mut desc = (egui_wgpu::WgpuSetupCreateNew::default().device_descriptor)(adapter);
                     desc.required_limits.max_buffer_size = adapter.limits().max_buffer_size;
+                    desc.required_limits.max_storage_buffer_binding_size = adapter.limits().max_storage_buffer_binding_size;
                     desc
                 }),
                 ..Default::default()
@@ -218,6 +219,7 @@ fn main() {
                 timer_guard,
                 color_by_channel: setting(&saved, "color_by_channel").unwrap_or(true),
                 color_auto: setting(&saved, "color_auto").unwrap_or(true),
+                max_instances: setting(&saved, "max_instances").unwrap_or(262_144),
                 collapse_overlaps: setting(&saved, "collapse_overlaps").unwrap_or(true),
                 piano_layout: setting(&saved, "piano_layout").unwrap_or(false),
                 frame_times: FrameTimes::default(),
@@ -378,6 +380,7 @@ impl VisualSong {
 struct NoteSegment {
     start_us: u64,
     end_us: u64,
+    source: u32,
     track: u16,
     channel: u8,
     pitch: u8,
@@ -413,12 +416,132 @@ struct Decoded {
     last: [usize; 128],
     /// Records looked at.
     scanned: usize,
+    updates: Vec<NoteSegment>,
 }
 
 impl Decoded {
     fn new(notes: Vec<NoteSegment>) -> Self {
-        Self { notes, last: [usize::MAX; 128], scanned: 0 }
+        Self { notes, last: [usize::MAX; 128], scanned: 0, updates: Vec::new() }
     }
+}
+
+const NOTE_PAGE: usize = 16_384;
+
+#[derive(Debug)]
+struct NotePage {
+    notes: Vec<NoteSegment>,
+    positions: Vec<u64>,
+    first: usize,
+    expiry: u64,
+    pitches: [u64; 2],
+}
+
+#[derive(Default, Debug)]
+struct NoteWindow {
+    pages: Vec<Option<NotePage>>,
+    len: usize,
+    live: usize,
+    retired: std::collections::VecDeque<(usize, std::vec::IntoIter<NoteSegment>)>,
+}
+
+impl NoteWindow {
+    fn len(&self) -> usize { self.len }
+    fn get(&self, i: usize) -> Option<&NoteSegment> {
+        let page = self.pages.get(i / NOTE_PAGE)?.as_ref()?;
+        let offset = i % NOTE_PAGE;
+        (offset >= page.first).then(|| page.notes.get(offset)).flatten()
+    }
+    fn entries_range(&self, first: usize, end: usize) -> impl DoubleEndedIterator<Item = (usize, &NoteSegment)> {
+        let base = first / NOTE_PAGE;
+        self.pages[base..end.div_ceil(NOTE_PAGE)].iter().enumerate()
+            .filter_map(move |(p, page)| page.as_ref().map(|page| ((base + p) * NOTE_PAGE, page)))
+            .flat_map(move |(base, page)| {
+                let lo = first.saturating_sub(base).max(page.first).min(page.notes.len());
+                let hi = end.saturating_sub(base).min(page.notes.len()).max(lo);
+                page.notes[lo..hi].iter().enumerate().map(move |(i, note)| (base + lo + i, note))
+            })
+    }
+    fn entries(&self) -> impl DoubleEndedIterator<Item = (usize, &NoteSegment)> { self.entries_range(0, self.len) }
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &NoteSegment> { self.entries().map(|(_, note)| note) }
+    fn extend(&mut self, notes: Vec<NoteSegment>) {
+        let mut notes = notes.into_iter();
+        while notes.len() > 0 {
+            let p = self.len / NOTE_PAGE;
+            let offset = self.len % NOTE_PAGE;
+            if p == self.pages.len() { self.pages.push(None); }
+            let page = self.pages[p].get_or_insert_with(|| NotePage {
+                notes: vec![NoteSegment { source: 0, start_us: 0, end_us: 0, track: 0, channel: 0, pitch: 0 }; offset],
+                positions: vec![0; offset], first: offset, expiry: 0, pitches: [0; 2],
+            });
+            let count = notes.len().min(NOTE_PAGE - offset);
+            page.notes.reserve(count);
+            page.positions.reserve(count);
+            for note in notes.by_ref().take(count) {
+                page.expiry = page.expiry.max(note.end_us + NOTE_HOLD_MICROS);
+                page.pitches[note.pitch as usize / 64] |= 1 << (note.pitch % 64);
+                page.notes.push(note);
+                page.positions.push(0);
+            }
+            self.len += count;
+            self.live += count;
+        }
+    }
+    fn position(&self, i: usize) -> u64 {
+        self.pages[i / NOTE_PAGE].as_ref().unwrap().positions[i % NOTE_PAGE]
+    }
+    fn set_position(&mut self, i: usize, epoch: u32, position: usize) {
+        self.pages[i / NOTE_PAGE].as_mut().unwrap().positions[i % NOTE_PAGE] =
+            (epoch as u64) << 32 | position as u64;
+    }
+    fn replace(&mut self, i: usize, note: NoteSegment) {
+        let page = self.pages[i / NOTE_PAGE].as_mut().unwrap();
+        page.notes[i % NOTE_PAGE] = note;
+        page.expiry = page.expiry.max(note.end_us + NOTE_HOLD_MICROS);
+    }
+    fn expire(&mut self, now: u64) -> [u64; 2] {
+        let mut pitches = [0; 2];
+        for (p, page) in self.pages.iter_mut().enumerate() {
+            if page.as_ref().is_some_and(|page| page.expiry <= now) {
+                let page = page.take().unwrap();
+                self.live -= page.notes.len() - page.first;
+                for k in 0..2 { pitches[k] |= page.pitches[k]; }
+                let mut notes = page.notes.into_iter();
+                for _ in 0..page.first { notes.next(); }
+                self.retired.push_back((p * NOTE_PAGE + page.first, notes));
+            }
+        }
+        pitches
+    }
+    fn retired_note(&mut self) -> Option<(usize, NoteSegment)> {
+        loop {
+            let (i, notes) = self.retired.front_mut()?;
+            if let Some(note) = notes.next() {
+                let result = (*i, note);
+                *i += 1;
+                return Some(result);
+            }
+            self.retired.pop_front();
+        }
+    }
+}
+
+impl From<Vec<NoteSegment>> for NoteWindow {
+    fn from(notes: Vec<NoteSegment>) -> Self { let mut window = Self::default(); window.extend(notes); window }
+}
+impl std::ops::Index<usize> for NoteWindow {
+    type Output = NoteSegment;
+    fn index(&self, i: usize) -> &NoteSegment { self.get(i).unwrap() }
+}
+impl PartialEq for NoteWindow {
+    fn eq(&self, other: &Self) -> bool { self.entries().eq(other.entries()) }
+}
+
+#[derive(Default)]
+struct KeyCompact {
+    indices: Vec<usize>,
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    cursor: usize,
 }
 
 /// A small max-end tree over runs of notes on one key. It finds the latest note
@@ -426,6 +549,9 @@ impl Decoded {
 #[derive(Default)]
 struct KeyNotes {
     indices: Vec<usize>,
+    compact: Option<KeyCompact>,
+    position_epoch: u32,
+    prune: bool,
     starts: Vec<u64>,
     end_times: Vec<u64>,
     ends: Vec<u64>,
@@ -462,7 +588,7 @@ impl RowNotes {
 
 /// Finished, globally ordered notes appended and indexed in one frame.
 const NOTE_BATCH: usize = 300_000;
-const DECODE_AHEAD_US: u64 = 2_000_000;
+const DECODE_AHEAD_US: u64 = 10_000_000;
 
 const NOTE_BLOCK: usize = 64;
 
@@ -536,7 +662,7 @@ impl KeyNotes {
         None
     }
 
-    fn query_row(&self, window: &[NoteSegment], now: u64, window_end: u64, time: u64, guard: u64, row: &mut RowNotes) {
+    fn query_row(&self, window: &NoteWindow, now: u64, window_end: u64, time: u64, guard: u64, row: &mut RowNotes) {
         let lo = time.saturating_sub(guard);
         let hi = time.saturating_add(guard);
         let mut before = self.starts.partition_point(|&start| start <= hi);
@@ -550,7 +676,7 @@ impl KeyNotes {
         let mut missed = 0;
         while let Some(p) = self.covering_cert(before, lo, &mut missed) {
             let i = self.indices[p];
-            let note = &window[i];
+            let Some(note) = window.get(i) else { before = p; continue; };
             let end = rendered_end(note);
             row.hi = row.hi.min(end.saturating_add(guard).saturating_add(1));
             if note.start_us < window_end && note.end_us + NOTE_HOLD_MICROS > now {
@@ -582,11 +708,26 @@ impl KeyNotes {
     }
 }
 
+fn render_tracks(song: &SongData) -> Vec<bool> {
+    let mut latest = HashMap::new();
+    for (i, refs) in song.midi.tracks.iter().enumerate() { latest.insert(refs.as_slice(), i); }
+    let mut enabled = vec![false; song.midi.tracks.len()];
+    for &i in latest.values() { enabled[i] = true; }
+    // Identical packed tracks have identical spans on every key. The last track
+    // covers every earlier copy, including equal-start track colours.
+    enabled
+}
+
 fn decode_notes(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64) -> Decoded {
+    decode_tracks(song, readers, now_us, reach, None)
+}
+
+fn decode_tracks(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> Decoded {
     let tempo = &song.tempo;
     let now_tick = tempo.time_to_tick(now_us);
     let end_tick = tempo.time_to_tick(reach);
     let decode = |track: usize, r: &mut TrackReader, acc: &mut Decoded| {
+        if enabled.is_some_and(|mask| !mask[track]) { return; }
         let data = song.midi.track(track);
         if r.peek_tick(data).map_or(true, |t| t >= end_tick) {
             return; // nothing new in this track (most of the 60,000 in some files)
@@ -605,7 +746,7 @@ fn decode_notes(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach
                 None => tempo.duration_us(),
             };
             if end_us + NOTE_HOLD_MICROS > now_us {
-                let note = NoteSegment {
+                let note = NoteSegment { source: track as u32,
                     start_us: tempo.tick_to_time_approx(tick, &mut tempo_cache),
                     end_us,
                     track: song.midi.track_origin[track] as u16,
@@ -642,6 +783,7 @@ fn decode_notes(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach
     out
 }
 
+#[cfg(test)]
 fn push_collapsed(notes: &mut Vec<NoteSegment>, open: &mut [usize; 2048], note: NoteSegment) {
     let k = note.channel as usize * 128 + note.pitch as usize;
     if let Some(prev) = notes.get_mut(open[k]) {
@@ -656,39 +798,136 @@ fn push_collapsed(notes: &mut Vec<NoteSegment>, open: &mut [usize; 2048], note: 
     notes.push(note);
 }
 
-fn collapsed_notes(song: &SongData) -> Arc<Vec<NoteSegment>> {
-    let parts: Vec<Vec<NoteSegment>> = (0..song.midi.tracks.len()).into_par_iter().map(|track| {
-        let mut reader = TrackReader::default();
-        let data = song.midi.track(track);
+type NoteId = (u64, u32, u8, u8);
+
+fn note_id(note: &NoteSegment) -> NoteId {
+    (note.start_us, note.source, note.channel, note.pitch)
+}
+
+#[derive(Clone, Copy)]
+struct OpenNote {
+    start_us: u64,
+    unreleased: bool,
+    start: u32,
+    end: u32,
+    epoch: u32,
+    index: u32,
+}
+
+impl Default for OpenNote {
+    fn default() -> Self { Self { start_us: u64::MAX, unreleased: false, start: 0, end: 0, epoch: 0, index: u32::MAX } }
+}
+
+#[derive(Default)]
+struct CollapseTrack {
+    reader: TrackReader,
+    disabled: bool,
+    channels: [Option<Box<[OpenNote; 128]>>; 16],
+    epoch: u32,
+}
+
+fn decode_collapsed(song: &SongData, tracks: &mut [CollapseTrack], now: u64, reach: u64) -> Decoded {
+    let end_tick = song.tempo.time_to_tick(reach);
+    let now_tick = song.tempo.time_to_tick(now);
+    let parts: Vec<_> = tracks.par_iter_mut().enumerate().map(|(track, state)| {
+        if state.disabled { return Decoded::new(Vec::new()); }
+        state.epoch = state.epoch.wrapping_add(1);
+        let mut out = Decoded::new(Vec::new());
+        let mut changed = [0u64; 32];
         let mut cache = 0;
-        let mut notes = Vec::new();
-        let mut open = [usize::MAX; 2048];
-        while let Some((tick, rec)) = reader.next_before(data, u32::MAX) {
+        let origin = song.midi.track_origin[track] as u16;
+        let make_note = |open: &mut OpenNote, ch: u8, key: u8, cache: &mut usize| {
+            let end_us = if open.unreleased { song.tempo.duration_us() }
+                else { song.tempo.tick_to_time_approx(open.end, cache) };
+            if open.start_us == u64::MAX { open.start_us = song.tempo.tick_to_time_approx(open.start, cache); }
+            NoteSegment { source: track as u32, start_us: open.start_us, end_us,
+                track: origin, channel: ch, pitch: key }
+        };
+        while let Some((tick, rec)) = state.reader.next_before(song.midi.track(track), end_tick) {
+            out.scanned += 1;
             let Record::Note { ch, key, dur, .. } = rec else { continue };
-            let start_us = song.tempo.tick_to_time_approx(tick, &mut cache);
-            let end_us = dur.map_or(song.tempo.duration_us(), |d|
-                song.tempo.tick_to_time_approx(tick + d, &mut cache));
-            push_collapsed(&mut notes, &mut open, NoteSegment {
-                start_us, end_us, track: song.midi.track_origin[track] as u16, channel: ch, pitch: key,
-            });
+            let end = dur.map_or(song.midi.end_tick, |d| tick + d);
+            let channel = state.channels[ch as usize].get_or_insert_with(|| Box::new([OpenNote::default(); 128]));
+            let open = &mut channel[key as usize];
+            if tick < open.end {
+                open.unreleased |= dur.is_none();
+                if end <= open.end { continue; }
+                open.end = end;
+                if end < now_tick { continue; }
+                if open.epoch == state.epoch {
+                    if open.index == u32::MAX {
+                        open.index = out.notes.len() as u32;
+                        out.notes.push(make_note(open, ch, key, &mut cache));
+                    } else {
+                        out.notes[open.index as usize].end_us = song.tempo.tick_to_time_approx(end, &mut cache);
+                    }
+                } else if open.index != u32::MAX {
+                    let k = ch as usize * 128 + key as usize;
+                    changed[k / 64] |= 1 << (k % 64);
+                } else {
+                    open.epoch = state.epoch;
+                    open.index = out.notes.len() as u32;
+                    out.notes.push(make_note(open, ch, key, &mut cache));
+                }
+            } else {
+                let k = ch as usize * 128 + key as usize;
+                if changed[k / 64] & (1 << (k % 64)) != 0 {
+                    out.updates.push(make_note(open, ch, key, &mut cache));
+                    changed[k / 64] &= !(1 << (k % 64));
+                }
+                *open = OpenNote { start_us: u64::MAX, unreleased: dur.is_none(), start: tick, end, epoch: state.epoch, index: u32::MAX };
+                if end >= now_tick {
+                    open.index = out.notes.len() as u32;
+                    out.notes.push(make_note(open, ch, key, &mut cache));
+                }
+            }
         }
-        // Collapse precedes the usual exact coverage cull.
-        let mut out = Vec::new();
-        let mut last = [usize::MAX; 128];
-        for note in notes { push_culled(&mut out, &mut last, 0, note); }
+        for (block, &bits) in changed.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let k = block * 64 + bits.trailing_zeros() as usize;
+                let ch = (k / 128) as u8;
+                let key = (k % 128) as u8;
+                let open = &mut state.channels[ch as usize].as_mut().unwrap()[key as usize];
+                if open.epoch != state.epoch {
+                    out.updates.push(make_note(open, ch, key, &mut cache));
+                }
+                bits &= bits - 1;
+            }
+        }
         out
     }).collect();
-    let mut notes: Vec<_> = parts.into_iter().flatten().collect();
-    notes.par_sort_by_key(|n| n.start_us);
-    let mut out = Vec::with_capacity(notes.len());
+    let mut out = Decoded::new(Vec::new());
+    for part in parts {
+        out.scanned += part.scanned;
+        out.notes.extend(part.notes);
+        out.updates.extend(part.updates);
+    }
+    out.notes.par_sort_by_key(|n| n.start_us);
+    // Only completed unions can be permanently covered: an open one may
+    // extend in a later batch and expose pixels again.
+    let closed_before = song.tempo.tick_to_time_approx(end_tick, &mut 0);
     let mut last = [usize::MAX; 128];
-    for note in notes { push_culled(&mut out, &mut last, 0, note); }
-    Arc::new(out)
+    let mut w = 0;
+    for r in 0..out.notes.len() {
+        let note = out.notes[r];
+        let k = note.pitch as usize;
+        let prev = last[k];
+        if prev == usize::MAX || out.notes[prev].end_us >= closed_before || !note.absorb(&mut out.notes[prev]) {
+            out.notes[w] = note;
+            last[k] = w;
+            w += 1;
+        }
+    }
+    out.notes.truncate(w);
+    out
 }
 
 struct NoteBatch {
     generation: u64,
     notes: Vec<NoteSegment>,
+    updates: Vec<NoteSegment>,
+    decoded_end: u64,
     through: u64,
 }
 
@@ -699,7 +938,6 @@ struct DecodeWorker {
     receiver: std::sync::mpsc::Receiver<NoteBatch>,
     pending: Option<NoteBatch>,
     song: Arc<SongData>,
-    collapsed: Option<Arc<Vec<NoteSegment>>>,
     thread: std::thread::Thread,
 }
 
@@ -712,48 +950,67 @@ impl Drop for DecodeWorker {
 }
 
 impl DecodeWorker {
-    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64, collapsed: Option<Arc<Vec<NoteSegment>>>) -> Self {
+    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64, mut collapsed: Option<Vec<CollapseTrack>>, prepared: Vec<NoteSegment>) -> Self {
         let now = Arc::new(AtomicU64::new(0));
         let target = Arc::new(AtomicU64::new(through));
         let stop = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = std::sync::mpsc::sync_channel(8);
         let (worker_now, worker_target, worker_stop, worker_song) =
             (now.clone(), target.clone(), stop.clone(), song.clone());
-        let worker_collapsed = collapsed.clone();
+        let enabled = render_tracks(&song);
         let handle = std::thread::Builder::new().name("note-decode".into()).spawn(move || {
             let mut through = through;
-            let mut position = worker_collapsed.as_ref().map_or(0, |notes|
-                notes.partition_point(|n| n.start_us < through));
+            let mut prepared = prepared.into_iter().peekable();
+            loop {
+                let notes = prepared.by_ref().take(NOTE_BATCH).collect();
+                let watermark = prepared.peek().map_or(through, |n| n.start_us);
+                if sender.send(NoteBatch { generation, notes, updates: Vec::new(), decoded_end: through, through: watermark }).is_err() { return; }
+                if prepared.peek().is_none() { break; }
+                if worker_stop.load(Ordering::Acquire) { return; }
+            }
+            let decode_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
+                .thread_name(|i| format!("note-decode-{i}"))
+                .build().expect("note decode pool");
             while !worker_stop.load(Ordering::Acquire) {
                 let reach = worker_target.load(Ordering::Acquire);
                 if reach <= through {
                     std::thread::park_timeout(Duration::from_millis(2));
                     continue;
                 }
-                let decoded = if let Some(notes) = &worker_collapsed {
-                    let end = notes.partition_point(|n| n.start_us < reach);
-                    let now = worker_now.load(Ordering::Acquire);
-                    let batch = notes[position..end].iter().copied()
-                        .filter(|n| n.end_us + NOTE_HOLD_MICROS > now).collect();
-                    position = end;
-                    Decoded::new(batch)
-                } else {
-                    decode_notes(&worker_song, &mut readers, worker_now.load(Ordering::Acquire), reach)
-                };
+                let decoded = decode_pool.install(|| if let Some(tracks) = &mut collapsed {
+                    decode_collapsed(&worker_song, tracks, worker_now.load(Ordering::Acquire), reach)
+                } else { decode_tracks(&worker_song, &mut readers, worker_now.load(Ordering::Acquire), reach, Some(&enabled)) });
                 if worker_stop.load(Ordering::Acquire) { break; }
+                let mut updates = decoded.updates.into_iter().peekable();
+                while updates.peek().is_some() {
+                    let batch = updates.by_ref().take(NOTE_BATCH).collect();
+                    if sender.send(NoteBatch { generation, notes: Vec::new(), updates: batch, decoded_end: reach, through }).is_err() { return; }
+                }
                 let mut notes = decoded.notes.into_iter().peekable();
                 loop {
                     let batch: Vec<_> = notes.by_ref().take(NOTE_BATCH).collect();
                     let watermark = notes.peek().map_or(reach, |n| n.start_us);
-                    if sender.send(NoteBatch { generation, notes: batch, through: watermark }).is_err() { return; }
+                    if sender.send(NoteBatch { generation, notes: batch, updates: Vec::new(), decoded_end: reach, through: watermark }).is_err() { return; }
                     if notes.peek().is_none() { break; }
                     if worker_stop.load(Ordering::Acquire) { return; }
                 }
                 through = reach;
             }
         }).expect("note decode worker");
-        Self { now, target, stop, receiver, pending: None, song, collapsed, thread: handle.thread().clone() }
+        Self { now, target, stop, receiver, pending: None, song, thread: handle.thread().clone() }
     }
+}
+
+#[derive(Clone, Copy)]
+struct InstanceSlot {
+    id: u32,
+    pitch: u8,
+    version: u64,
+}
+
+impl InstanceSlot {
+    const EMPTY: Self = Self { id: u32::MAX, pitch: 255, version: 0 };
 }
 
 /// Notes on screen. Each note is decoded from the packed tracks once, when it enters
@@ -761,11 +1018,12 @@ impl DecodeWorker {
 struct VisibleNotes {
     time_us: u64,
     collapse_overlaps: bool,
-    collapsed: Option<Arc<Vec<NoteSegment>>>,
+    max_instances: usize,
+    note_indices: HashMap<NoteId, usize>,
     worker: Option<DecodeWorker>,
     generation: u64,
     through: u64,
-    window: Vec<NoteSegment>,
+    window: NoteWindow,
     /// Notes decoded last frame (after culling), and records looked at, to decide
     /// whether decoding is worth parallelizing.
     last_batch: usize,
@@ -780,7 +1038,11 @@ struct VisibleNotes {
     selected: Vec<usize>,
     selection: Vec<usize>,
     selected_bits: Vec<u64>,
-    instance_slots: Vec<u32>,
+    instance_dirty: bool,
+    instance_ring_id: u64,
+    instance_slots: Vec<InstanceSlot>,
+    slot_users: HashMap<(u32, u64), usize>,
+    retired_slots: Vec<InstanceSlot>,
     instance_style: Option<(bool, bool, bool)>,
     revision: u64,
     instance_revision: u64,
@@ -796,11 +1058,11 @@ struct VisibleNotes {
 impl Default for VisibleNotes {
     fn default() -> Self {
         Self {
-            time_us: 0, collapse_overlaps: true, collapsed: None, worker: None, generation: 0, through: 0, window: Vec::new(), last_batch: 0,
+            time_us: 0, collapse_overlaps: true, max_instances: 262_144, note_indices: HashMap::new(), worker: None, generation: 0, through: 0, window: NoteWindow::default(), last_batch: 0,
             last_scanned: 0, alive: 0, frames_since_sweep: 0,
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
-            instance_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
+            instance_dirty: false, instance_ring_id: 0, instance_slots: Vec::new(), slot_users: HashMap::new(), retired_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
             build_profile: [Duration::ZERO; 4],
             row_counts: [0; 2],
             timing: AdvanceTimes::default(),
@@ -817,9 +1079,34 @@ struct AdvanceTimes {
 }
 
 impl VisibleNotes {
+    fn release_slot(&mut self, slot: InstanceSlot) {
+        if slot.id == u32::MAX { return; }
+        let key = (slot.id, slot.version);
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.slot_users.entry(key) {
+            if *entry.get() == 1 {
+                entry.remove();
+                self.retired_slots.push(slot);
+            } else { *entry.get_mut() -= 1; }
+        }
+    }
+
+    fn cache_instance(&mut self, i: usize, ring: &mut gpu::InstanceRing, note: gpu::NoteInstance, expiry: u64) {
+        let id = ring.push(note, expiry);
+        let version = ring.version(id);
+        self.instance_slots[i] = InstanceSlot { id, pitch: (note.key_color & 255) as u8, version };
+        *self.slot_users.entry((id, version)).or_default() += 1;
+    }
+
     fn set_collapse(&mut self, enabled: bool) {
         if self.collapse_overlaps != enabled {
-            *self = Self { collapse_overlaps: enabled, generation: self.generation.wrapping_add(1), ..Default::default() };
+            *self = Self { collapse_overlaps: enabled, max_instances: self.max_instances, generation: self.generation.wrapping_add(1), ..Default::default() };
+        }
+    }
+
+    fn set_max_instances(&mut self, max: usize) {
+        if self.max_instances != max {
+            *self = Self { max_instances: max, collapse_overlaps: self.collapse_overlaps,
+                generation: self.generation.wrapping_add(1), ..Default::default() };
         }
     }
 
@@ -828,73 +1115,197 @@ impl VisibleNotes {
             || self.worker.as_ref().is_some_and(|w| !Arc::ptr_eq(&w.song, song));
         if reset {
             let generation = self.generation.wrapping_add(1);
-            let collapsed = self.worker.as_ref().filter(|w| Arc::ptr_eq(&w.song, song))
-                .and_then(|w| w.collapsed.clone());
-            *self = Self { generation, collapse_overlaps: self.collapse_overlaps, collapsed, ..Default::default() };
+            *self = Self { generation, collapse_overlaps: self.collapse_overlaps,
+                max_instances: self.max_instances, ..Default::default() };
         }
         self.time_us = now_us;
         for key in &mut self.keys { key.added_start = u64::MAX; }
-        // Finished notes are skipped when drawing, and swept out now and then (a sweep
-        // visits every note on screen).
-        let t0 = Instant::now();
-        self.frames_since_sweep += 1;
-        if self.window.len() >= self.alive.max(4096) * 2 || self.frames_since_sweep >= 240 {
-            self.window.retain(|n| n.end_us + NOTE_HOLD_MICROS > now_us);
-            self.alive = self.window.len();
-            self.frames_since_sweep = 0;
-            self.keys = std::array::from_fn(|_| KeyNotes::default());
-            self.indexed = 0;
-            self.max_len_us = 0;
-            self.total_len_us = 0;
-            self.instance_style = None; // indices changed during compaction
-        }
-        self.timing.retain = t0.elapsed();
+        self.timing.retain = Duration::ZERO;
+        self.frames_since_sweep = self.frames_since_sweep.wrapping_add(1);
         let t0 = Instant::now();
         self.timing.decode = Duration::ZERO;
         self.timing.sort = Duration::ZERO;
         self.last_batch = 0;
         if self.worker.is_none() {
             let mut readers = vec![TrackReader::default(); song.midi.tracks.len()];
-            let decoded = if self.collapse_overlaps {
-                let notes = self.collapsed.get_or_insert_with(|| collapsed_notes(song));
-                Decoded::new(notes.iter().take_while(|n| n.start_us < window_end).copied()
-                    .filter(|n| n.end_us + NOTE_HOLD_MICROS > now_us).collect())
-            } else { decode_notes(song, &mut readers, now_us, window_end) };
+            let enabled = render_tracks(song);
+            let mut collapsed = self.collapse_overlaps.then(|| enabled.iter()
+                .map(|&enabled| CollapseTrack { disabled: !enabled, ..Default::default() }).collect::<Vec<_>>());
+            let reach = window_end.saturating_add(DECODE_AHEAD_US);
+            let mut decoded = if let Some(tracks) = &mut collapsed {
+                decode_collapsed(song, tracks, now_us, reach)
+            } else { decode_tracks(song, &mut readers, now_us, reach, Some(&enabled)) };
+            let cutoff = song.tempo.tick_to_time_approx(song.tempo.time_to_tick(window_end), &mut 0);
+            let first_future = decoded.notes.partition_point(|n| n.start_us < cutoff);
+            let prepared = decoded.notes.split_off(first_future);
+            let mut sizes = [0usize; 128];
+            for note in decoded.notes.iter().chain(&prepared) { sizes[note.pitch as usize] += 1; }
+            for (key, size) in self.keys.iter_mut().zip(sizes) {
+                let size = size.saturating_mul(2);
+                key.indices.reserve(size.saturating_sub(key.indices.len()));
+                key.starts.reserve(size.saturating_sub(key.starts.len()));
+                key.end_times.reserve(size.saturating_sub(key.end_times.len()));
+            }
+            let expected = (decoded.notes.len() + prepared.len()).saturating_mul(2);
+            if self.collapse_overlaps {
+                let open = decoded.notes.iter().chain(&prepared).filter(|n| n.end_us.saturating_add(1) >= reach).count();
+                self.note_indices.reserve(open.saturating_mul(2));
+            }
+            self.instance_slots.reserve(expected.saturating_sub(self.instance_slots.len()));
+            self.selected_bits.reserve(expected.div_ceil(64).saturating_sub(self.selected_bits.len()));
+
             self.last_scanned = decoded.scanned;
             self.last_batch = decoded.notes.len();
+            if self.collapse_overlaps {
+                for (i, n) in decoded.notes.iter().enumerate() {
+                    if n.end_us.saturating_add(1) >= reach { self.note_indices.insert(note_id(n), self.window.len() + i); }
+                }
+            }
             self.window.extend(decoded.notes);
             self.through = window_end;
-            self.worker = Some(DecodeWorker::new(song.clone(), readers, window_end, self.generation, self.collapsed.clone()));
+            self.worker = Some(DecodeWorker::new(song.clone(), readers, reach, self.generation, collapsed, prepared));
         }
-        let worker = self.worker.as_mut().unwrap();
+        let mut worker = self.worker.take().unwrap();
         worker.now.store(now_us, Ordering::Release);
         worker.target.store(window_end.saturating_add(DECODE_AHEAD_US), Ordering::Release);
         worker.thread.unpark();
-        while self.last_batch < NOTE_BATCH || self.through < now_us.saturating_add(100_000).min(window_end) {
+        while self.last_batch == 0 || self.through < now_us.saturating_add(100_000).min(window_end) {
             let urgent = self.through < now_us.saturating_add(100_000).min(window_end);
             let batch = worker.pending.take().or_else(|| {
                 if urgent { worker.receiver.recv().ok() } else { worker.receiver.try_recv().ok() }
             });
-            let Some(batch) = batch else { break };
+            let Some(mut batch) = batch else { break };
             if batch.generation != self.generation { continue; }
             if !urgent && batch.notes.first().is_some_and(|n| n.start_us >= window_end) {
                 worker.pending = Some(batch);
                 break;
             }
-            if !urgent && self.last_batch + batch.notes.len() > NOTE_BATCH {
+            let cutoff = song.tempo.tick_to_time_approx(song.tempo.time_to_tick(window_end), &mut 0);
+            let entered = batch.notes.partition_point(|n| n.start_us < cutoff);
+            if entered < batch.notes.len() {
+                let tail = batch.notes.split_off(entered);
+                let through = tail[0].start_us;
+                worker.pending = Some(NoteBatch { generation: batch.generation,
+                    notes: tail, updates: Vec::new(), decoded_end: batch.decoded_end, through: batch.through });
+                batch.through = through;
+                if batch.notes.is_empty() && batch.updates.is_empty() { break; }
+            }
+            if !urgent && self.last_batch + batch.notes.len() + batch.updates.len() > NOTE_BATCH {
                 worker.pending = Some(batch);
                 break;
             }
-            self.last_batch += batch.notes.len();
+            self.last_batch += batch.notes.len() + batch.updates.len();
+            for note in batch.updates {
+                if let Some(&i) = self.note_indices.get(&note_id(&note)) {
+                    let Some(old) = self.window.get(i).copied() else { continue; };
+                    let key = &mut self.keys[note.pitch as usize];
+                    let position = self.window.position(i);
+                    let p = position as u32 as usize;
+                    let p = if (position >> 32) as u32 == key.position_epoch && key.indices.get(p) == Some(&i) {
+                        Some(p)
+                    } else { key.indices.binary_search(&i).ok() };
+                    if let Some(p) = p {
+                        key.end_times[p] = rendered_end(&note);
+                        let block = p / NOTE_BLOCK;
+                        key.ends[block] = key.end_times[block * NOTE_BLOCK..((block + 1) * NOTE_BLOCK).min(key.end_times.len())]
+                            .iter().copied().max().unwrap_or(0);
+                        let mut node = key.tree.len() / 2 + block;
+                        key.tree[node] = key.ends[block];
+                        while node > 1 {
+                            node /= 2;
+                            key.tree[node] = key.tree[node * 2].max(key.tree[node * 2 + 1]);
+                        }
+                    }
+                    key.added_start = key.added_start.min(note.start_us);
+                    self.total_len_us = self.total_len_us.saturating_add(note.end_us.saturating_sub(old.end_us));
+                    self.max_len_us = self.max_len_us.max(note.end_us - note.start_us);
+                    self.window.replace(i, note);
+                    if let Some(compact) = &mut key.compact {
+                        if let Ok(p) = compact.indices.binary_search(&i) { compact.ends[p] = rendered_end(&note); }
+                    }
+                    if let Some(slot) = self.instance_slots.get(i).copied() {
+                        self.release_slot(slot);
+                        self.instance_slots[i] = InstanceSlot { pitch: slot.pitch, ..InstanceSlot::EMPTY };
+                    }
+                    self.instance_dirty = true;
+                    self.instance_expiry = 0;
+                }
+            }
+            if self.collapse_overlaps {
+                for (i, n) in batch.notes.iter().enumerate() {
+                    if n.end_us.saturating_add(1) >= batch.decoded_end { self.note_indices.insert(note_id(n), self.window.len() + i); }
+                }
+            }
             self.window.extend(batch.notes);
             self.through = batch.through;
         }
+        self.worker = Some(worker);
         self.timing.decode = t0.elapsed();
         let t0 = Instant::now();
         if self.last_batch > 0 { self.revision = self.revision.wrapping_add(1); }
+        let retain = Instant::now();
+        let pitches = self.window.expire(now_us);
+        for (k, key) in self.keys.iter_mut().enumerate() {
+            if pitches[k / 64] & (1 << (k % 64)) != 0 { key.prune = true; }
+        }
+        for _ in 0..4096 {
+            let Some((i, note)) = self.window.retired_note() else { break };
+            if self.note_indices.get(&note_id(&note)) == Some(&i) { self.note_indices.remove(&note_id(&note)); }
+            if let Some(slot) = self.instance_slots.get(i).copied() {
+                self.release_slot(slot);
+                self.instance_slots[i] = InstanceSlot::EMPTY;
+            }
+        }
+        self.alive = self.window.live;
+        self.timing.retain = retain.elapsed();
         // Fully index the received batch so the exact pixel selector stays cheap.
         self.index_notes(self.indexed);
+        self.compact_keys(50_000);
         self.timing.cull = t0.elapsed();
+    }
+
+    fn compact_keys(&mut self, mut budget: usize) {
+        let window = &mut self.window;
+        for key in &mut self.keys {
+            if budget == 0 { break; }
+            if key.compact.is_none() && key.prune {
+                key.prune = false;
+                key.compact = Some(KeyCompact {
+                    indices: Vec::with_capacity(key.indices.len()), starts: Vec::with_capacity(key.starts.len()),
+                    ends: Vec::with_capacity(key.end_times.len()), cursor: 0,
+                });
+            }
+            let Some(compact) = &mut key.compact else { continue };
+            let end = key.indices.len().min(compact.cursor + budget);
+            budget -= end - compact.cursor;
+            for p in compact.cursor..end {
+                let i = key.indices[p];
+                if let Some(note) = window.get(i).copied() {
+                    window.set_position(i, key.position_epoch.wrapping_add(1), compact.indices.len());
+                    compact.indices.push(i);
+                    compact.starts.push(note.start_us);
+                    compact.ends.push(rendered_end(&note));
+                }
+            }
+            compact.cursor = end;
+            if end == key.indices.len() {
+                let compact = key.compact.take().unwrap();
+                key.position_epoch = key.position_epoch.wrapping_add(1);
+                key.indices = compact.indices;
+                key.starts = compact.starts;
+                key.end_times = compact.ends;
+                key.ends.clear();
+                key.ends.extend(key.end_times.chunks(NOTE_BLOCK).map(|block| *block.iter().max().unwrap()));
+                key.tree.clear();
+                key.update_tree(0);
+            }
+        }
+    }
+
+    fn index_positions(&mut self, counts: &[usize; 128]) {
+        for (key, &first) in self.keys.iter().zip(counts) {
+            for p in first..key.indices.len() { self.window.set_position(key.indices[p], key.position_epoch, p); }
+        }
     }
 
     fn index_notes(&mut self, first: usize) {
@@ -907,12 +1318,12 @@ impl VisibleNotes {
             self.max_len_us = 0;
             self.total_len_us = 0;
             let mut sizes = [0usize; 128];
-            for note in &self.window[..end] { sizes[note.pitch as usize & 127] += 1; }
+            for (_, note) in self.window.entries_range(0, end) { sizes[note.pitch as usize & 127] += 1; }
             for (key, size) in self.keys.iter_mut().zip(sizes) {
                 key.indices.reserve(size);
             }
             if end > 50_000 {
-                for (i, note) in self.window[..end].iter().enumerate() {
+                for (i, note) in self.window.entries_range(0, end) {
                     self.keys[note.pitch as usize & 127].indices.push(i);
                     self.max_len_us = self.max_len_us.max(note.end_us - note.start_us);
                     self.total_len_us = self.total_len_us.saturating_add(note.end_us - note.start_us);
@@ -926,6 +1337,7 @@ impl VisibleNotes {
                     for p in 0..size { key.push_time(&window[key.indices[p]]); }
                     key.update_tree(0);
                 });
+                self.index_positions(&counts);
                 self.indexed = end;
                 return;
             }
@@ -933,7 +1345,7 @@ impl VisibleNotes {
         if end - first > 20_000 {
             // A dense passage: bucket the new notes by key, then each key takes its own.
             let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); 128];
-            for (i, note) in self.window[..end].iter().enumerate().skip(first) {
+            for (i, note) in self.window.entries_range(first, end) {
                 buckets[note.pitch as usize & 127].push(i);
                 self.max_len_us = self.max_len_us.max(note.end_us - note.start_us);
                 self.total_len_us = self.total_len_us.saturating_add(note.end_us - note.start_us);
@@ -943,15 +1355,17 @@ impl VisibleNotes {
                 for &i in new { key.push(i, &window[i]); }
                 key.update_tree(count);
             });
+            self.index_positions(&counts);
             self.indexed = end;
             return;
         }
-        for (i, note) in self.window[..end].iter().enumerate().skip(first) {
+        for (i, note) in self.window.entries_range(first, end) {
             self.keys[note.pitch as usize & 127].push(i, note);
             self.max_len_us = self.max_len_us.max(note.end_us - note.start_us);
             self.total_len_us = self.total_len_us.saturating_add(note.end_us - note.start_us);
         }
         for (key, count) in self.keys.iter_mut().zip(counts) { key.update_tree(count); }
+        self.index_positions(&counts);
         self.indexed = end;
     }
 
@@ -959,7 +1373,7 @@ impl VisibleNotes {
         let t0 = Instant::now();
         self.selected.clear();
         if !self.dense(height_time, height_px) {
-            self.selected.extend(self.window.iter().enumerate()
+            self.selected.extend(self.window.entries()
                 .filter(|(_, n)| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us)
                 .map(|(i, _)| i));
             return;
@@ -972,11 +1386,13 @@ impl VisibleNotes {
         let guard = 2 + (((height_time as f64 * 1e6) as u64).saturating_add(self.max_len_us) >> 21)
             + (px_us / 256.0).ceil() as u64;
         let height = height_px.max(1) as usize;
+        let times: Vec<_> = (0..height).map(|row|
+            now_us.saturating_add(((row as f64 + 0.5) * px_us) as u64)).collect();
         self.row_counts = [0; 2];
         for key in &mut self.keys {
             if key.indices.is_empty() { continue; }
             let last = *key.indices.last().unwrap();
-            if self.window[last].start_us <= now_us && self.window[last].end_us >= window_end.saturating_add(guard) {
+            if self.window.get(last).is_some_and(|n| n.start_us <= now_us && n.end_us >= window_end.saturating_add(guard)) {
                 self.selected_bits[last / 64] |= 1 << (last % 64);
                 key.rows.clear();
                 continue; // top note covers the whole viewport, including its borders
@@ -999,7 +1415,7 @@ impl VisibleNotes {
             }
             let (first, last) = rows.split_at_mut(key.row_head);
             for (row, cached) in last.iter_mut().chain(first).enumerate() {
-                let time = now_us.saturating_add(((row as f64 + 0.5) * px_us) as u64);
+                let time = times[row];
                 cached.hi = cached.hi.min(key.added_start.saturating_sub(guard));
                 if cached.lo <= time && time < cached.hi && now_us < cached.expiry {
                     self.row_counts[0] += 1;
@@ -1042,7 +1458,7 @@ impl VisibleNotes {
         // overdraw. An isolated long note must not slow a sparse window down.
         let overlap = ((height_time as f64 * 1e6) as u64).saturating_mul(key_count as u64)
             .saturating_mul(height_px.max(1) as u64) / 4;
-        self.indexed == self.window.len() && self.window.len() > 4096 && (self.window.len() > height_px as usize * key_count * 2
+        self.indexed == self.window.len() && self.window.live > 4096 && (self.window.live > height_px as usize * key_count * 2
             || self.total_len_us > overlap)
     }
 }
@@ -1209,6 +1625,7 @@ struct AppState {
     /// Notes laid out like the keys (see `key_columns`) rather than an even grid.
     piano_layout: bool,
     collapse_overlaps: bool,
+    max_instances: usize,
     frame_times: FrameTimes,
     frame_log: Option<FrameLog>,
     /// Where to seek once the file given on the command line has loaded.
@@ -1378,6 +1795,7 @@ impl eframe::App for AppState {
         });
 
         self.visible.set_collapse(self.collapse_overlaps);
+        self.visible.set_max_instances(self.max_instances);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -1586,6 +2004,11 @@ impl AppState {
                             "Like the keys: sharps narrower, drawn over the naturals",
                         );
                     });
+                    ui.end_row();
+
+                    ui.label("Instance limit");
+                    ui.add(egui::DragValue::new(&mut self.max_instances).range(0..=10_000_000).speed(1024))
+                        .on_hover_text("0 disables the limit. Drops oldest sounding notes first; protects sharps in piano layout.");
                     ui.end_row();
 
                     ui.label("Overlaps");
@@ -1804,7 +2227,8 @@ impl AppState {
             self.verify_repeats,
         );
         if let Some(path) = settings_path() {
-            text.push_str(&format!("collapse_overlaps={}\n", self.collapse_overlaps));
+            text.push_str(&format!("max_instances={}\n", self.max_instances));
+        text.push_str(&format!("collapse_overlaps={}\n", self.collapse_overlaps));
         let _ = std::fs::write(path, text);
         }
     }
@@ -2479,33 +2903,55 @@ fn build_note_instances(
     piano_layout: bool,
     instances: &mut Arc<gpu::InstanceRing>,
 ) -> ([bool; 128], [Color32; 128]) {
+    if visible.instance_ring_id != instances.id()
+        || visible.instance_style.is_some_and(|style| style.0 != color_by_channel) {
+        *instances = Arc::new(gpu::InstanceRing::default());
+        visible.instance_ring_id = instances.id();
+        visible.retired_slots.clear();
+        visible.slot_users.clear();
+        visible.instance_style = None;
+        visible.selection.clear();
+    }
+    if !visible.retired_slots.is_empty() {
+        let ring = Arc::make_mut(instances);
+        for slot in visible.retired_slots.drain(..) {
+            if !visible.slot_users.contains_key(&(slot.id, slot.version)) && ring.version(slot.id) == slot.version {
+                ring.retire(slot.id);
+            }
+        }
+    }
     let mut active_keys = [false; 128];
     let mut active_colors = [Color32::TRANSPARENT; 128];
     let dense = visible.dense(height_time, height_px);
     let style = (color_by_channel, piano_layout, dense);
     if !dense {
         // Sparse windows are cheaper to visit directly than to query every row.
-        let write = visible.instance_style != Some(style) || visible.instance_revision != visible.revision
+        let write = visible.instance_dirty || visible.instance_style != Some(style) || visible.instance_revision != visible.revision
             || visible.instance_height_time != height_time.to_bits() || now_us >= visible.instance_expiry;
         if write {
             let buf = Arc::make_mut(instances);
             buf.begin(now_us);
-            if visible.instance_style != Some(style) { visible.instance_slots.clear(); }
-            visible.instance_slots.resize(visible.window.len(), u32::MAX);
+            for key in buf.take_freed() { visible.slot_users.remove(&key); }
+            visible.instance_slots.resize(visible.window.len(), InstanceSlot::EMPTY);
             let mut expiry = u64::MAX;
             let passes = if piano_layout { 2 } else { 1 };
-            for (i, note) in (0..passes).flat_map(|pass| visible.window.iter().enumerate().rev()
+            let indices: Vec<_> = (0..passes).flat_map(|pass| visible.window.entries().rev()
                 .filter(move |(_, n)| !piano_layout || is_black_key(n.pitch) == (pass == 0)))
-                .filter(|(_, n)| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us) {
-                let color = song.color_for(note, color_by_channel);
+                .filter(|(_, n)| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us)
+                .map(|(i, _)| i).collect();
+            if visible.slot_users.is_empty() { visible.slot_users.reserve(indices.len().saturating_mul(4)); }
+            for i in indices {
+                let note = visible.window[i];
+                let color = song.color_for(&note, color_by_channel);
                 if note.start_us <= now_us && note.end_us > now_us && !active_keys[note.pitch as usize] {
                     active_keys[note.pitch as usize] = true;
                     active_colors[note.pitch as usize] = color;
                 }
                 expiry = expiry.min(note.end_us + NOTE_HOLD_MICROS);
                 let slot = visible.instance_slots[i];
-                if slot != u32::MAX { buf.push_slot(slot); continue; }
-                visible.instance_slots[i] = buf.push(gpu::NoteInstance {
+                if slot.id != u32::MAX && buf.version(slot.id) == slot.version { buf.push_slot(slot.id); continue; }
+                visible.release_slot(slot);
+                visible.cache_instance(i, buf, gpu::NoteInstance {
                     start_us: [note.start_us as u32, (note.start_us >> 32) as u32],
                     len: ((note.end_us - note.start_us) as f32 / 1e6).max(0.000_1),
                     key_color: note.pitch as u32 | ((color.r() as u32) << 24)
@@ -2524,6 +2970,10 @@ fn build_note_instances(
         visible.instance_style = Some(style);
         visible.instance_revision = visible.revision;
         visible.instance_height_time = height_time.to_bits();
+        if instances.len() > visible.max_instances && visible.max_instances > 0 {
+            Arc::make_mut(instances).cap(visible.max_instances, now_us, piano_layout);
+        }
+        visible.instance_dirty = false;
         return (active_keys, active_colors);
     }
     // Keyboard state includes sounding notes too short to cover a raster sample.
@@ -2531,7 +2981,7 @@ fn build_note_instances(
     for (pitch, key) in visible.keys.iter().enumerate() {
         let mut before = key.starts.partition_point(|&start| start <= now_us);
         while let Some(p) = key.covering(before, now_us) {
-            let note = &visible.window[key.indices[p]];
+            let Some(note) = visible.window.get(key.indices[p]) else { before = p; continue; };
             if note.end_us > now_us {
                 active_keys[pitch] = true;
                 active_colors[pitch] = song.color_for(note, color_by_channel);
@@ -2543,40 +2993,44 @@ fn build_note_instances(
     visible.build_profile[0] = t0.elapsed();
     visible.select_pixels(now_us, window_end, height_time, height_px);
     let t0 = Instant::now();
-    if visible.instance_style != Some(style) || visible.selected != visible.selection {
+    if visible.instance_dirty || visible.instance_style != Some(style) || visible.selected != visible.selection {
         let buf = Arc::make_mut(instances);
         buf.begin(now_us);
-        if visible.instance_style != Some(style) {
-            visible.instance_slots.clear();
-        }
-        visible.instance_slots.resize(visible.window.len(), u32::MAX);
+        for key in buf.take_freed() { visible.slot_users.remove(&key); }
+        if visible.slot_users.is_empty() { visible.slot_users.reserve(visible.selected.len().saturating_mul(4)); }
+        visible.instance_slots.resize(visible.window.len(), InstanceSlot::EMPTY);
         // Newest first, with sharps in front of naturals in the piano layout.
         let passes = if piano_layout { 2 } else { 1 };
-        let window = &visible.window;
-        let selected = &visible.selected;
-        for &i in (0..passes).flat_map(|pass| {
-            selected.iter().rev().filter(move |&&i| {
-                !piano_layout || is_black_key(window[i].pitch) == (pass == 0)
-            })
-        }) {
-            let slot = visible.instance_slots[i];
-            if slot != u32::MAX {
-                buf.push_slot(slot);
+        let selected = std::mem::take(&mut visible.selected);
+        for pass in 0..passes {
+            for &i in selected.iter().rev() {
+                let slot = visible.instance_slots[i];
+                let pitch = if slot.pitch == 255 { visible.window[i].pitch } else { slot.pitch };
+                if piano_layout && is_black_key(pitch) != (pass == 0) { continue; }
+            if slot.id != u32::MAX && buf.version(slot.id) == slot.version {
+                buf.push_slot(slot.id);
                 continue;
             }
-            let note = &visible.window[i];
-            let color = song.color_for(note, color_by_channel);
+            visible.release_slot(slot);
+            let note = visible.window[i];
+            let color = song.color_for(&note, color_by_channel);
             let color_u32 = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | color.b() as u32;
-            visible.instance_slots[i] = buf.push(gpu::NoteInstance {
+            visible.cache_instance(i, buf, gpu::NoteInstance {
                 start_us: [note.start_us as u32, (note.start_us >> 32) as u32],
                 len: ((note.end_us - note.start_us) as f32 / 1_000_000.0).max(0.000_1),
                 key_color: note.pitch as u32 | (color_u32 << 8),
             }, note.end_us + NOTE_HOLD_MICROS);
+            }
         }
+        visible.selected = selected;
         std::mem::swap(&mut visible.selection, &mut visible.selected);
         visible.instance_style = Some(style);
     }
+    visible.instance_dirty = false;
     visible.build_profile[3] = t0.elapsed();
+    if instances.len() > visible.max_instances && visible.max_instances > 0 {
+        Arc::make_mut(instances).cap(visible.max_instances, now_us, piano_layout);
+    }
     (active_keys, active_colors)
 }
 
@@ -2636,7 +3090,7 @@ mod tests {
 
     #[test]
     fn exact_culling_only_drops_what_is_hidden() {
-        let n = |start_us, end_us| NoteSegment { start_us, end_us, track: 0, channel: 0, pitch: 60 };
+        let n = |start_us, end_us| NoteSegment { source: 0, start_us, end_us, track: 0, channel: 0, pitch: 60 };
         let mut prev = n(100, 500);
         assert!(!n(101, 500).absorb(&mut prev)); // starts a µs later: prev shows above it
         assert!(!n(100, 499).absorb(&mut prev)); // ends sooner: prev shows below it
@@ -2647,7 +3101,7 @@ mod tests {
 
     #[test]
     fn culls_only_fully_hidden_notes() {
-        let n = |start_us, end_us, pitch| NoteSegment { start_us, end_us, track: 0, channel: 0, pitch };
+        let n = |start_us, end_us, pitch| NoteSegment { source: 0, start_us, end_us, track: 0, channel: 0, pitch };
         let mut out = vec![];
         let mut last = [usize::MAX; 128];
         push_culled(&mut out, &mut last, 0, n(0, 500, 60));
@@ -2678,12 +3132,12 @@ mod tests {
     fn indexed(mut notes: Vec<NoteSegment>, force_pixels: bool) -> VisibleNotes {
         if force_pixels {
             // Outside this test's view; enough notes to exercise the dense path.
-            notes.extend((0..4500).map(|_| NoteSegment {
+            notes.extend((0..4500).map(|_| NoteSegment { source: 0,
                 start_us: 9_000_000, end_us: 10_000_000, track: 0, channel: 0, pitch: 59,
             }));
         }
         notes.sort_by_key(|n| (n.start_us, n.track));
-        let mut visible = VisibleNotes { window: notes, ..Default::default() };
+        let mut visible = VisibleNotes { window: notes.into(), ..Default::default() };
         visible.index_notes(0);
         visible
     }
@@ -2746,7 +3200,7 @@ mod tests {
                     for upwards in [false, true] {
                         assert_eq!(
                             raster(song, &selected, now, speed, height, by_channel, piano, flat, upwards),
-                            raster(song, &visible.window, now, speed, height, by_channel, piano, flat, upwards),
+                            raster(song, &visible.window.iter().copied().collect::<Vec<_>>(), now, speed, height, by_channel, piano, flat, upwards),
                             "now={now}, speed={speed}, height={height}, channel={by_channel}, piano={piano}, flat={flat}, up={upwards}",
                         );
                     }
@@ -2758,7 +3212,7 @@ mod tests {
     #[test]
     fn pixel_culling_preserves_three_track_layers_and_colours() {
         let song = test_song();
-        let n = |start_us, end_us, track, pitch| NoteSegment { start_us, end_us, track, channel: track as u8, pitch };
+        let n = |start_us, end_us, track, pitch| NoteSegment { source: 0, start_us, end_us, track, channel: track as u8, pitch };
         let notes = vec![
             n(0, 100_000, 0, 60), n(20, 100_000, 1, 60), n(20, 40_000, 2, 60),
             n(50_500, 99_000, 0, 60), n(1000, 90_000, 1, 61), n(1000, 20_000, 2, 61),
@@ -2791,7 +3245,7 @@ mod tests {
         let notes = (0..7000).map(|i| {
             seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
             let start_us = seed % 1_000_000;
-            NoteSegment {
+            NoteSegment { source: 0,
                 start_us, end_us: start_us + (seed >> 20) % 100_000,
                 track: i % 3, channel: (i % 3) as u8, pitch: 60 + (i % 3) as u8,
             }
@@ -2809,7 +3263,7 @@ mod tests {
         let notes = (0..7000).map(|i| {
             seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
             let start_us = seed % 3_000_000;
-            NoteSegment {
+            NoteSegment { source: 0,
                 start_us, end_us: start_us + (seed >> 20) % 300_000,
                 track: i % 3, channel: (i % 3) as u8, pitch: 60 + (i % 2) as u8,
             }
@@ -2824,7 +3278,7 @@ mod tests {
     #[test]
     fn zoom_restores_subpixel_notes_and_unchanged_instances_are_reused() {
         let song = test_song();
-        let mut visible = indexed((0..5000).map(|i| NoteSegment {
+        let mut visible = indexed((0..5000).map(|i| NoteSegment { source: 0,
             start_us: i * 100, end_us: i * 100 + 100, track: (i % 3) as u16,
             channel: (i % 3) as u8, pitch: 60,
         }).collect(), false);
@@ -2872,7 +3326,7 @@ mod tests {
         visible.advance(&song.data, 2_000_000, 3_000_000, 1000);
         let generation = visible.generation;
         visible.worker.as_mut().unwrap().pending = Some(NoteBatch {
-            generation, notes: vec![NoteSegment { start_us: 2_500_000, end_us: 9_000_000,
+            generation, decoded_end: 9_000_000, updates: Vec::new(), notes: vec![NoteSegment { source: 0, start_us: 2_500_000, end_us: 9_000_000,
                 track: 99, channel: 0, pitch: 60 }], through: 9_000_000,
         });
         visible.advance(&song.data, 0, 1_000_000, 1000);
@@ -2884,10 +3338,31 @@ mod tests {
     }
 
     #[test]
+    fn identical_packed_tracks_only_drop_fully_hidden_earlier_copies() {
+        let mut file = b"MThd\0\0\0\x06\0\x01\0\x03\x01\xe0".to_vec();
+        for delta in [0, 0, 1] {
+            let body = [delta, 0x90, 60, 100, 0x9e, 0, 0x80, 60, 0, 0, 0xff, 0x2f, 0];
+            file.extend_from_slice(b"MTrk");
+            file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            file.extend(body);
+        }
+        let midi = Arc::new(parser::MidiFile::parse_stream(Box::new(parser::Plain(std::io::Cursor::new(file))),
+            127, &parser::Progress::default()).unwrap());
+        let tempo = Arc::new(song::TempoMap::from_midi(&midi));
+        let data = SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO };
+        let enabled = render_tracks(&data);
+        assert_eq!(enabled, [false, true, true]);
+        let readers = vec![TrackReader::default(); data.midi.tracks.len()];
+        let exact = decode_notes(&data, &mut readers.clone(), 0, 20_000_000);
+        let culled = decode_tracks(&data, &mut readers.clone(), 0, 20_000_000, Some(&enabled));
+        assert_eq!(exact.notes, culled.notes);
+    }
+
+    #[test]
     fn overlap_union_keeps_channels_and_touching_notes_separate() {
         let mut notes = Vec::new();
         let mut open = [usize::MAX; 2048];
-        let n = |start_us, end_us, channel| NoteSegment { start_us, end_us, channel, pitch: 60, track: 0 };
+        let n = |start_us, end_us, channel| NoteSegment { source: 0, start_us, end_us, channel, pitch: 60, track: 0 };
         for note in [n(0, 100, 0), n(10, 50, 0), n(30, 200, 0), n(40, 80, 1), n(200, 300, 0)] {
             push_collapsed(&mut notes, &mut open, note);
         }
@@ -2895,11 +3370,34 @@ mod tests {
     }
 
     #[test]
+    fn overlap_union_extends_a_published_note_across_batches() {
+        let mut file = b"MThd\0\0\0\x06\0\0\0\x01\x13\x88".to_vec();
+        let body = [0, 0x90, 60, 100, 60, 0x90, 60, 100, 0x81, 12, 0x80, 60, 0,
+            0x81, 72, 0x80, 60, 0, 0, 0xff, 0x2f, 0];
+        file.extend_from_slice(b"MTrk");
+        file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        file.extend(body);
+        let midi = Arc::new(parser::MidiFile::parse_stream(Box::new(parser::Plain(std::io::Cursor::new(file))),
+            127, &parser::Progress::default()).unwrap());
+        let tempo = Arc::new(song::TempoMap::from_midi(&midi));
+        let data = SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO };
+        let mut tracks = [CollapseTrack::default()];
+        let first = decode_collapsed(&data, &mut tracks, 0, 5000);
+        assert_eq!(first.notes.len(), 1);
+        let next = decode_collapsed(&data, &mut tracks, 0, 10_000);
+        assert!(next.notes.is_empty());
+        assert_eq!(next.updates.len(), 1);
+        assert_eq!(note_id(&next.updates[0]), note_id(&first.notes[0]));
+        assert!(next.updates[0].end_us > first.notes[0].end_us);
+    }
+
+    #[test]
     fn no_overlap_collapse_matches_exact_notes_and_pixels() {
         let song = test_song();
         let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
         let exact = decode_notes(&song.data, &mut readers, 0, 20_000_000).notes;
-        assert_eq!(*collapsed_notes(&song.data), exact);
+        let mut tracks: Vec<_> = (0..song.data.midi.tracks.len()).map(|_| CollapseTrack::default()).collect();
+        assert_eq!(decode_collapsed(&song.data, &mut tracks, 0, 20_000_000).notes, exact);
         let mut visible = indexed(exact, false);
         assert_raster_equal(&song, &mut visible, 123_456, 3.0, 900);
     }
@@ -2916,11 +3414,58 @@ mod tests {
     }
 
     #[test]
+    fn expired_pages_preserve_note_ids_and_partial_tail_reuse() {
+        let count = NOTE_PAGE * 2 + 37;
+        let note = |i: usize| NoteSegment { source: 0,
+            start_us: i as u64, end_us: if i < NOTE_PAGE { i as u64 + 10 } else { 1_000_000 },
+            track: 0, channel: 0, pitch: 60,
+        };
+        let mut window = NoteWindow::from((0..count).map(note).collect::<Vec<_>>());
+        window.expire(20_000);
+        assert!(window.get(0).is_none());
+        assert_eq!(window[NOTE_PAGE], note(NOTE_PAGE));
+        assert_eq!(window.iter().count(), NOTE_PAGE + 37);
+        window.expire(1_100_000);
+        let fresh = NoteSegment { start_us: 2_000_000, end_us: 2_100_000, ..note(0) };
+        window.extend(vec![fresh]);
+        assert_eq!(window.len(), count + 1);
+        assert_eq!(window[count], fresh);
+        assert_eq!(window.iter().count(), 1);
+        assert_eq!(window.entries_range(0, count - 1).count(), 0);
+        let mut retired = Vec::new();
+        while let Some((i, _)) = window.retired_note() { retired.push(i); }
+        assert_eq!(retired, (0..count).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn page_expiration_and_index_cleanup_keep_cached_pixels_equal() {
+        let song = test_song();
+        let notes = (0..20_000u64).map(|i| NoteSegment { source: 0,
+            start_us: i * 10, end_us: i * 10 + 100_000 + i % 1000,
+            track: (i % 3) as u16, channel: (i % 3) as u8, pitch: 60 + (i % 12) as u8,
+        }).collect();
+        let mut visible = indexed(notes, false);
+        let mut instances = Arc::new(gpu::InstanceRing::default());
+        build_note_instances(&song, &mut visible, 260_000, 760_000, 0.5, 100, false, true, &mut instances);
+        let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
+        decode_notes(&song.data, &mut readers, 0, 20_000_000);
+        visible.worker = Some(DecodeWorker::new(song.data.clone(), readers, 20_000_000, visible.generation, None, Vec::new()));
+        visible.through = 20_000_000;
+        visible.time_us = 260_000;
+        visible.advance(&song.data, 280_000, 780_000, 5000);
+        assert!(visible.window.get(0).is_none());
+        assert!(visible.window.live < visible.window.len());
+        for frame in 0..20 {
+            assert_raster_equal(&song, &mut visible, 280_000 + frame * 1000, 0.5, 100);
+        }
+    }
+
+    #[test]
     fn sparse_cache_expires_notes_and_updates_colour_mode() {
         let song = test_song();
         let mut visible = indexed(vec![
-            NoteSegment { start_us: 0, end_us: 2000, track: 1, channel: 2, pitch: 60 },
-            NoteSegment { start_us: 5000, end_us: 10_000, track: 1, channel: 2, pitch: 60 },
+            NoteSegment { source: 0, start_us: 0, end_us: 2000, track: 1, channel: 2, pitch: 60 },
+            NoteSegment { source: 0, start_us: 5000, end_us: 10_000, track: 1, channel: 2, pitch: 60 },
         ], false);
         let mut instances = Arc::new(gpu::InstanceRing::default());
         build_note_instances(&song, &mut visible, 0, 10_000, 0.01, 100, false, false, &mut instances);

@@ -1,4 +1,4 @@
-use std::{mem, sync::{Arc, Weak}, collections::{HashMap, BinaryHeap}, cmp::Reverse};
+use std::{mem, sync::{Arc, Weak}, collections::{HashMap, BTreeMap}};
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
@@ -17,18 +17,40 @@ pub struct NoteInstance {
 
 /// Stable instance slots plus a small front-to-back draw list. Slots survive
 /// pixel-selection changes and are reused only after their note expires.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct InstanceRing {
+    id: u64,
+    now: u64,
+    draw_epoch: u64,
+    drawn: Vec<u64>,
+    freed: Vec<(u32, u64)>,
     slots: Vec<NoteInstance>,
     versions: Vec<u64>,
+    ends: Vec<u64>,
+    dropped: Vec<bool>,
     order: Vec<u32>,
     lookup: HashMap<[u32; 4], u32>,
-    expiry: BinaryHeap<Reverse<(u64, u32)>>,
+    expiry: BTreeMap<u64, Vec<u32>>,
+    expiry_records: usize,
     free: Vec<u32>,
     revision: u64,
 }
 
+impl Default for InstanceRing {
+    fn default() -> Self {
+        static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self { id: ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), now: 0, draw_epoch: 0, drawn: Vec::new(), freed: Vec::new(), slots: Vec::new(),
+            versions: Vec::new(), ends: Vec::new(), dropped: Vec::new(), order: Vec::new(), lookup: HashMap::new(),
+            expiry: BTreeMap::new(), expiry_records: 0, free: Vec::new(), revision: 0 }
+    }
+}
+
 impl InstanceRing {
+    pub fn id(&self) -> u64 { self.id }
+    pub fn version(&self, slot: u32) -> u64 {
+        if self.ends.get(slot as usize).is_none_or(|&end| end <= self.now) { 0 }
+        else { self.versions[slot as usize] }
+    }
     pub fn len(&self) -> usize { self.order.len() }
     pub fn is_empty(&self) -> bool { self.order.is_empty() }
     pub fn iter(&self) -> impl Iterator<Item = &NoteInstance> {
@@ -39,35 +61,108 @@ impl InstanceRing {
     }
     pub fn begin(&mut self, now: u64) {
         self.order.clear();
-        while self.expiry.peek().is_some_and(|x| x.0.0 <= now) {
-            let Reverse((_, slot)) = self.expiry.pop().unwrap();
+        self.now = now;
+        self.draw_epoch = self.draw_epoch.wrapping_add(1);
+        let mut budget = 4096;
+        while budget > 0 {
+            let Some(mut entry) = self.expiry.first_entry() else { break };
+            let expiry = *entry.key();
+            if expiry > now { break; }
+            let slot = entry.get_mut().pop().unwrap();
+            if entry.get().is_empty() { entry.remove(); }
+            self.expiry_records -= 1;
+            budget -= 1;
+            if self.ends[slot as usize] != expiry { continue; }
             self.lookup.remove(&Self::key(&self.slots[slot as usize]));
+            self.ends[slot as usize] = 0;
+            self.freed.push((slot, self.versions[slot as usize]));
             self.free.push(slot);
         }
+        if self.expiry_records > self.lookup.len().max(4096) * 2 {
+            let ends = &self.ends;
+            let mut records = 0;
+            self.expiry.retain(|&time, slots| {
+                slots.retain(|&slot| ends[slot as usize] == time);
+                records += slots.len();
+                !slots.is_empty()
+            });
+            self.expiry_records = records;
+        }
+    }
+    pub fn take_freed(&mut self) -> Vec<(u32, u64)> { std::mem::take(&mut self.freed) }
+    pub fn retire(&mut self, slot: u32) {
+        if self.ends.get(slot as usize).is_none_or(|&end| end == 0) { return; }
+        self.lookup.remove(&Self::key(&self.slots[slot as usize]));
+        self.ends[slot as usize] = 0;
+        self.free.push(slot);
     }
     pub fn push(&mut self, note: NoteInstance, expiry: u64) -> u32 {
         let key = Self::key(&note);
-        let slot = if let Some(&slot) = self.lookup.get(&key) { slot } else {
+        let slot = if let Some(&slot) = self.lookup.get(&key) {
+            if expiry > self.ends[slot as usize] {
+                self.ends[slot as usize] = expiry;
+                self.expiry.entry(expiry).or_default().push(slot);
+                self.expiry_records += 1;
+            }
+            slot
+        } else {
             static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             self.revision = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let slot = if let Some(slot) = self.free.pop() {
                 self.slots[slot as usize] = note;
                 self.versions[slot as usize] = self.revision;
+                self.ends[slot as usize] = expiry;
+                self.dropped[slot as usize] = false;
+                self.drawn[slot as usize] = u64::MAX;
                 slot
             } else {
                 let slot = self.slots.len() as u32;
                 self.slots.push(note);
                 self.versions.push(self.revision);
+                self.ends.push(expiry);
+                self.dropped.push(false);
+                self.drawn.push(u64::MAX);
                 slot
             };
             self.lookup.insert(key, slot);
-            self.expiry.push(Reverse((expiry, slot)));
+            self.expiry.entry(expiry).or_default().push(slot);
+            self.expiry_records += 1;
             slot
         };
-        self.order.push(slot);
+        self.push_slot(slot);
         slot
     }
-    pub fn push_slot(&mut self, slot: u32) { self.order.push(slot); }
+    pub fn push_slot(&mut self, slot: u32) {
+        if !self.dropped[slot as usize] && self.ends[slot as usize] > self.now
+            && self.drawn[slot as usize] != self.draw_epoch {
+            self.order.push(slot);
+            self.drawn[slot as usize] = self.draw_epoch;
+        }
+    }
+    pub fn cap(&mut self, max: usize, now: u64, piano: bool) {
+        if max == 0 || self.order.len() <= max { return; }
+        let mut drop = self.order.len() - max;
+        // Within each piano pass the draw list is newest-first. Reversing it
+        // gives oldest-start order without sorting a second copy of the list.
+        for class in 0..4 {
+            for &slot in self.order.iter().rev() {
+                if self.dropped[slot as usize] { continue; }
+                let note = &self.slots[slot as usize];
+                let start = note.start_us[0] as u64 | ((note.start_us[1] as u64) << 32);
+                let open = start <= now && self.ends[slot as usize].saturating_sub(crate::NOTE_HOLD_MICROS) > now;
+                let priority = (!open as usize) * 2
+                    + (piano && crate::is_black_key((note.key_color & 255) as u8)) as usize;
+                if priority == class {
+                    self.dropped[slot as usize] = true;
+                    drop -= 1;
+                    if drop == 0 { break; }
+                }
+            }
+            if drop == 0 { break; }
+        }
+        let dropped = &self.dropped;
+        self.order.retain(|&slot| !dropped[slot as usize]);
+    }
     pub fn from_ordered(notes: impl IntoIterator<Item = NoteInstance>) -> Self {
         let mut ring = Self::default();
         for note in notes { ring.push(note, u64::MAX); }
@@ -393,8 +488,9 @@ impl NotePipeline {
         keys: &[KeyPosition; 256],
         mut globals: GlobalsUniform,
     ) {
-        let max = (device.limits().max_buffer_size.min(device.limits().max_storage_buffer_binding_size as u64)
-            / mem::size_of::<NoteInstance>() as u64).min(u32::MAX as u64) as usize;
+        let limit = if self.relative { device.limits().max_buffer_size }
+            else { device.limits().max_buffer_size.min(device.limits().max_storage_buffer_binding_size as u64) };
+        let max = (limit / mem::size_of::<NoteInstance>() as u64).min(u32::MAX as u64) as usize;
         let needed = if self.relative { data.len() } else { data.slots.len() }.min(max);
         if needed > self.instance_capacity { self.grow_instances(device, needed, max); }
         if data.len() > self.order_capacity {
@@ -425,7 +521,7 @@ impl NotePipeline {
                     queue.write_buffer(&self.instance_buffer, (first * mem::size_of::<NoteInstance>()) as u64,
                         bytemuck::cast_slice(&data.slots[first..i]));
                 }
-                let order: Vec<_> = data.order.iter().copied().filter(|&slot| (slot as usize) < max).collect();
+                let order: Vec<_> = data.order.iter().copied().filter(|&slot| (slot as usize) < needed).collect();
                 if self.order != order {
                     let first = self.order.iter().zip(&order).take_while(|(a,b)| a == b).count();
                     if first < order.len() {
@@ -628,6 +724,52 @@ mod tests {
         assert_eq!(ring.slots.len(), 2);
         assert_ne!(ring.versions[slot_a as usize], version);
         assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![c]);
+    }
+
+    #[test]
+    fn equal_packed_spans_retain_the_latest_integer_expiry() {
+        let note = NoteInstance { start_us: [0, 0], len: 10_800.0, key_color: 60 };
+        let mut ring = InstanceRing::default();
+        let slot = ring.push(note, 200);
+        assert_eq!(ring.push(note, 201), slot);
+        ring.begin(200);
+        let next = NoteInstance { start_us: [1, 0], ..note };
+        assert_ne!(ring.push(next, 300), slot);
+        ring.push_slot(slot);
+        assert_eq!(ring[1], note);
+        ring.begin(201);
+        assert_eq!(ring.push(NoteInstance { start_us: [2, 0], ..note }, 400), slot);
+    }
+
+    #[test]
+    fn force_culled_slots_stay_hidden_until_expiry_and_can_then_be_reused() {
+        let n = |start, pitch| NoteInstance { start_us: [start, 0], len: 1.0, key_color: pitch };
+        let mut ring = InstanceRing::default();
+        let white = ring.push(n(0, 60), 100);
+        ring.push(n(10, 61), 200);
+        ring.cap(1, 50, true);
+        ring.begin(75);
+        ring.push(n(0, 60), 100);
+        ring.push(n(10, 61), 200);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring[0], n(10, 61));
+        ring.begin(100);
+        assert_eq!(ring.push(n(100, 60), 300), white);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring[0], n(100, 60));
+    }
+
+    #[test]
+    fn cap_drops_old_open_naturals_before_sharps_and_future_notes() {
+        let n = |start: u32, pitch| NoteInstance { start_us: [start, 0], len: 1.0, key_color: pitch };
+        let mut ring = InstanceRing::from_ordered([n(150, 60), n(20, 61), n(10, 60), n(0, 62)]);
+        ring.cap(2, 100, true);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![n(150, 60), n(20, 61)]);
+        let original = ring.clone();
+        ring.cap(0, 100, true);
+        assert_eq!(ring, original);
+        ring.cap(1, 100, true);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![n(150, 60)]);
     }
 
     #[test]
