@@ -199,6 +199,9 @@ pub fn run_from_args() -> bool {
     let mut budgets = Vec::new();
     let mut counts = (0usize, 0usize);
     let mut initial = Duration::ZERO;
+    // --paced: wall-clock 60 Hz like the app, so the decode worker gets real time to run ahead.
+    let paced = args.iter().any(|a| a == "--paced");
+    let mut paced_since = Instant::now();
     for f in 0..frames + 20 {
         let now = from_us + f as u64 * 1_000_000 / 60;
         let end = now + future_us;
@@ -227,6 +230,10 @@ pub fn run_from_args() -> bool {
             println!("initial_parts_ms: retain={:.3}, decode={:.3}, sort={:.3}, cull={:.3}, build={:.3}",
                 times.advance.retain.as_secs_f64() * 1e3, times.advance.decode.as_secs_f64() * 1e3,
                 times.advance.sort.as_secs_f64() * 1e3, times.advance.cull.as_secs_f64() * 1e3, build.as_secs_f64() * 1e3);
+        }
+        if paced {
+            if f == 0 { paced_since = Instant::now(); }
+            else if let Some(wait) = Duration::from_micros(f as u64 * 1_000_000 / 60).checked_sub(paced_since.elapsed()) { std::thread::sleep(wait); }
         }
         if f < 20 { continue; }
         let a = visible.timing;

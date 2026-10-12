@@ -589,6 +589,10 @@ impl RowNotes {
 /// Finished, globally ordered notes appended and indexed in one frame.
 const NOTE_BATCH: usize = 300_000;
 const DECODE_AHEAD_US: u64 = 10_000_000;
+/// A seek decodes only this far past the window itself; the worker fills in the rest,
+/// at most `WORKER_CHUNK_US` of song at a time (it all sits in memory until sent).
+const SYNC_AHEAD_US: u64 = 250_000;
+const WORKER_CHUNK_US: u64 = 1_000_000;
 
 const NOTE_BLOCK: usize = 64;
 
@@ -973,7 +977,7 @@ impl DecodeWorker {
                 .thread_name(|i| format!("note-decode-{i}"))
                 .build().expect("note decode pool");
             while !worker_stop.load(Ordering::Acquire) {
-                let reach = worker_target.load(Ordering::Acquire);
+                let reach = worker_target.load(Ordering::Acquire).min(through.saturating_add(WORKER_CHUNK_US));
                 if reach <= through {
                     std::thread::park_timeout(Duration::from_millis(2));
                     continue;
@@ -1131,7 +1135,7 @@ impl VisibleNotes {
             let enabled = render_tracks(song);
             let mut collapsed = self.collapse_overlaps.then(|| enabled.iter()
                 .map(|&enabled| CollapseTrack { disabled: !enabled, ..Default::default() }).collect::<Vec<_>>());
-            let reach = window_end.saturating_add(DECODE_AHEAD_US);
+            let reach = window_end.saturating_add(SYNC_AHEAD_US);
             let mut decoded = if let Some(tracks) = &mut collapsed {
                 decode_collapsed(song, tracks, now_us, reach)
             } else { decode_tracks(song, &mut readers, now_us, reach, Some(&enabled)) };
