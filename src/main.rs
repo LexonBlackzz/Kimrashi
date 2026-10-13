@@ -441,7 +441,8 @@ struct NoteWindow {
     pages: Vec<Option<NotePage>>,
     len: usize,
     live: usize,
-    retired: std::collections::VecDeque<(usize, std::vec::IntoIter<NoteSegment>)>,
+    /// Index ranges of expired pages (the note data is dropped on expiry).
+    retired: std::collections::VecDeque<(usize, usize)>,
 }
 
 impl NoteWindow {
@@ -505,25 +506,12 @@ impl NoteWindow {
                 let page = page.take().unwrap();
                 self.live -= page.notes.len() - page.first;
                 for k in 0..2 { pitches[k] |= page.pitches[k]; }
-                let mut notes = page.notes.into_iter();
-                for _ in 0..page.first { notes.next(); }
-                self.retired.push_back((p * NOTE_PAGE + page.first, notes));
+                self.retired.push_back((p * NOTE_PAGE + page.first, p * NOTE_PAGE + page.notes.len()));
             }
         }
         pitches
     }
-    fn retired_len(&self) -> usize { self.retired.iter().map(|(_, n)| n.len()).sum() }
-    fn retired_note(&mut self) -> Option<(usize, NoteSegment)> {
-        loop {
-            let (i, notes) = self.retired.front_mut()?;
-            if let Some(note) = notes.next() {
-                let result = (*i, note);
-                *i += 1;
-                return Some(result);
-            }
-            self.retired.pop_front();
-        }
-    }
+    fn retired_range(&mut self) -> Option<(usize, usize)> { self.retired.pop_front() }
 }
 
 impl From<Vec<NoteSegment>> for NoteWindow {
@@ -1025,6 +1013,7 @@ struct SlotStore(Vec<Option<Box<[InstanceSlot; NOTE_PAGE]>>>);
 
 impl SlotStore {
     fn get(&self, i: usize) -> Option<InstanceSlot> { self.0.get(i / NOTE_PAGE)?.as_ref().map(|c| c[i % NOTE_PAGE]) }
+    fn has_chunk(&self, i: usize) -> bool { self.0.get(i / NOTE_PAGE).is_some_and(|c| c.is_some()) }
     fn free_chunk(&mut self, i: usize) { if let Some(c) = self.0.get_mut(i / NOTE_PAGE) { *c = None; } }
 }
 impl std::ops::Index<usize> for SlotStore {
@@ -1069,7 +1058,7 @@ struct VisibleNotes {
     instance_dirty: bool,
     instance_ring_id: u64,
     instance_slots: SlotStore,
-    slot_users: HashMap<(u32, u64), usize>,
+    slot_users: gpu::HashMap<(u32, u64), usize>,
     retired_slots: Vec<InstanceSlot>,
     instance_style: Option<(bool, bool, bool)>,
     revision: u64,
@@ -1090,7 +1079,7 @@ impl Default for VisibleNotes {
             last_scanned: 0, alive: 0, frames_since_sweep: 0,
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, compact_from: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
-            instance_dirty: false, instance_ring_id: 0, instance_slots: SlotStore::default(), slot_users: HashMap::new(), retired_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
+            instance_dirty: false, instance_ring_id: 0, instance_slots: SlotStore::default(), slot_users: Default::default(), retired_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
             build_profile: [Duration::ZERO; 6],
             row_counts: [0; 2],
             timing: AdvanceTimes::default(),
@@ -1277,15 +1266,26 @@ impl VisibleNotes {
         for (k, key) in self.keys.iter_mut().enumerate() {
             if pitches[k / 64] & (1 << (k % 64)) != 0 { key.prune = true; }
         }
-        // Keep pace with expiry: a fixed budget let the queue (32 B/note) grow without bound.
-        for _ in 0..4096.max(self.window.retired_len() / 8) {
-            let Some((i, note)) = self.window.retired_note() else { break };
-            if self.note_indices.get(&note_id(&note)) == Some(&i) { self.note_indices.remove(&note_id(&note)); }
-            if let Some(slot) = self.instance_slots.get(i).filter(|s| s.id != u32::MAX) {
-                self.release_slot(slot);
-                self.instance_slots[i] = InstanceSlot::EMPTY;
+        while let Some((first, end)) = self.window.retired_range() {
+            let mut i = first;
+            while i < end {
+                let chunk_end = (i / NOTE_PAGE + 1) * NOTE_PAGE;
+                if self.instance_slots.has_chunk(i) {
+                    for j in i..chunk_end.min(end) {
+                        if let Some(slot) = self.instance_slots.get(j).filter(|s| s.id != u32::MAX) {
+                            self.release_slot(slot);
+                            self.instance_slots[j] = InstanceSlot::EMPTY;
+                        }
+                    }
+                }
+                i = chunk_end;
             }
-            if i % NOTE_PAGE == NOTE_PAGE - 1 { self.instance_slots.free_chunk(i); } // page fully retired
+            if end % NOTE_PAGE == 0 { self.instance_slots.free_chunk(end - 1); } // page fully retired
+        }
+        // The open-note map is looked up only by id; drop entries of expired pages in bulk.
+        if self.frames_since_sweep % 60 == 0 {
+            let window = &self.window;
+            self.note_indices.retain(|_, &mut i| window.get(i).is_some());
         }
         self.alive = self.window.live;
         self.timing.retain = retain.elapsed();
@@ -3483,7 +3483,7 @@ mod tests {
         assert_eq!(window.iter().count(), 1);
         assert_eq!(window.entries_range(0, count - 1).count(), 0);
         let mut retired = Vec::new();
-        while let Some((i, _)) = window.retired_note() { retired.push(i); }
+        while let Some((first, end)) = window.retired_range() { retired.extend(first..end); }
         assert_eq!(retired, (0..count).collect::<Vec<_>>());
     }
 

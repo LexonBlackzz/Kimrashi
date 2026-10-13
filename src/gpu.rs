@@ -1,4 +1,16 @@
-use std::{mem, sync::{Arc, Weak}, collections::{HashMap, BTreeMap}};
+use std::{mem, sync::{Arc, Weak}, collections::{HashMap as StdHashMap, BTreeMap}, hash::{BuildHasherDefault, Hasher}};
+
+/// Multiply-mix hasher for the per-instance tables (SipHash was a visible share of packing).
+#[derive(Default)]
+pub struct FastHasher(u64);
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) { for &b in bytes { self.write_u64(b as u64); } }
+    fn write_u32(&mut self, n: u32) { self.write_u64(n as u64); }
+    fn write_usize(&mut self, n: usize) { self.write_u64(n as u64); }
+    fn write_u64(&mut self, n: u64) { self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95); }
+    fn finish(&self) -> u64 { self.0 ^ (self.0 >> 32) }
+}
+pub type HashMap<K, V> = StdHashMap<K, V, BuildHasherDefault<FastHasher>>;
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
@@ -32,6 +44,8 @@ pub struct InstanceRing {
     lookup: HashMap<[u32; 4], u32>,
     expiry: BTreeMap<u64, Vec<u32>>,
     expiry_records: usize,
+    /// Slots created this frame and last: sizes the expiry budget.
+    created: [usize; 2],
     free: Vec<u32>,
     revision: u64,
 }
@@ -40,8 +54,8 @@ impl Default for InstanceRing {
     fn default() -> Self {
         static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self { id: ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), now: 0, draw_epoch: 0, drawn: Vec::new(), freed: Vec::new(), slots: Vec::new(),
-            versions: Vec::new(), ends: Vec::new(), dropped: Vec::new(), order: Vec::new(), lookup: HashMap::new(),
-            expiry: BTreeMap::new(), expiry_records: 0, free: Vec::new(), revision: 0 }
+            versions: Vec::new(), ends: Vec::new(), dropped: Vec::new(), order: Vec::new(), lookup: HashMap::default(),
+            expiry: BTreeMap::new(), expiry_records: 0, created: [0; 2], free: Vec::new(), revision: 0 }
     }
 }
 
@@ -63,7 +77,10 @@ impl InstanceRing {
         self.order.clear();
         self.now = now;
         self.draw_epoch = self.draw_epoch.wrapping_add(1);
-        let mut budget = 4096;
+        // Reclaim as fast as slots are made: a fixed 4096 let the backlog (and the hash
+        // tables holding it) grow to millions at high note density, rehashing for 100+ ms.
+        self.created = [0, self.created[0]];
+        let mut budget = 4096.max(self.created[1].saturating_mul(2));
         while budget > 0 {
             let Some(mut entry) = self.expiry.first_entry() else { break };
             let expiry = *entry.key();
@@ -124,6 +141,7 @@ impl InstanceRing {
                 self.drawn.push(u64::MAX);
                 slot
             };
+            self.created[0] += 1;
             self.lookup.insert(key, slot);
             self.expiry.entry(expiry).or_default().push(slot);
             self.expiry_records += 1;
@@ -512,18 +530,26 @@ impl NotePipeline {
                 queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&notes));
                 self.instance_count = notes.len() as u32;
             } else {
-                // Coalesce adjacent newly allocated/reused slots into one write.
+                // Coalesce changed slots into few writes: reused slots are scattered, so runs
+                // separated by up to 64 unchanged slots go out together (the gap is rewritten
+                // with the data already there).
                 self.versions.resize(needed, 0);
                 let mut i = 0;
                 while i < needed {
                     if self.versions[i] == data.versions[i] { i += 1; continue; }
                     let first = i;
-                    while i < needed && self.versions[i] != data.versions[i] {
-                        self.versions[i] = data.versions[i];
-                        i += 1;
+                    let mut end;
+                    loop {
+                        while i < needed && self.versions[i] != data.versions[i] {
+                            self.versions[i] = data.versions[i];
+                            i += 1;
+                        }
+                        end = i;
+                        let next = (i..needed.min(i + 64)).find(|&j| self.versions[j] != data.versions[j]);
+                        match next { Some(j) => i = j, None => break }
                     }
                     queue.write_buffer(&self.instance_buffer, (first * mem::size_of::<NoteInstance>()) as u64,
-                        bytemuck::cast_slice(&data.slots[first..i]));
+                        bytemuck::cast_slice(&data.slots[first..end]));
                 }
                 let order: Vec<_> = data.order.iter().copied().filter(|&slot| (slot as usize) < needed).collect();
                 if self.order != order {
