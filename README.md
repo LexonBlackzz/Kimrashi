@@ -53,6 +53,12 @@ checks every frame. `precision --window 0.01 --verify` checks a long song near t
 32-bit timestamp wrap. See [renderer-performance.md](renderer-performance.md)
 for the measurements and culling guarantees.
 
+## Updates
+
+Kimrashi asks GitHub for the latest release once a day when it starts; turn that off under Settings > Updates. When a newer release exists, a button in the toolbar shows its notes. "Update now" downloads the new `kimrashi.exe`, checks it against the SHA-256 GitHub publishes for it and against a signature made with the release key built into the program, replaces itself and restarts. `settings.txt` stays as it is.
+
+A release is built and signed with `release.ps1` (private key in `%USERPROFILE%\.kimrashi\signing.key`, made once with `kimrashi-sign keygen`). Upload `kimrashi.exe` and `kimrashi.exe.sig`; a release without the signature only offers the release page.
+
 ## License
 
 GPL-3, see [LICENSE](LICENSE). The note shader (`shaders/notes.wgsl`) is based on

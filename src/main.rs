@@ -10,6 +10,8 @@ mod parser;
 mod player;
 mod song;
 mod svms;
+mod sig;
+mod update;
 mod vsync;
 
 use clock::PlaybackClock;
@@ -82,9 +84,10 @@ const NOTE_HOLD_MICROS: u64 = 1_000; // keep notes visible 1ms after Note Off to
 
 fn main() {
     let _timer = create_timer_guard();
-    if bench::run_from_args() || render_bench::run_from_args() || benchmark::run_from_args() {
+    if bench::run_from_args() || render_bench::run_from_args() || benchmark::run_from_args() || update::run_from_args() {
         return;
     }
+    update::cleanup_old();
     let omni_opt: Option<Arc<OmniMIDI>> = unsafe {
         match OmniMIDI::load::<&str>(None) {
             Ok(om) => Some(Arc::new(om)),
@@ -221,6 +224,11 @@ fn main() {
                 color_auto: setting(&saved, "color_auto").unwrap_or(true),
                 max_instances: setting(&saved, "max_instances").unwrap_or(1_048_576),
                 collapse_overlaps: setting(&saved, "collapse_overlaps").unwrap_or(true),
+                updater: {
+                    let mut updater = update::Updater::new(setting(&saved, "check_updates").unwrap_or(true), setting(&saved, "last_update_check").unwrap_or(0));
+                    updater.start_if_due();
+                    updater
+                },
                 piano_layout: setting(&saved, "piano_layout").unwrap_or(false),
                 frame_times: FrameTimes::default(),
                 frame_log: FrameLog::from_env(),
@@ -1646,6 +1654,7 @@ struct AppState {
     /// Notes laid out like the keys (see `key_columns`) rather than an even grid.
     piano_layout: bool,
     collapse_overlaps: bool,
+    updater: update::Updater,
     max_instances: usize,
     frame_times: FrameTimes,
     frame_log: Option<FrameLog>,
@@ -1655,6 +1664,15 @@ struct AppState {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        match self.updater.poll() {
+            update::Outcome::Restart => {
+                self.save_settings();
+                update::relaunch();
+            }
+            update::Outcome::Checked => self.save_settings(),
+            update::Outcome::Nothing => {}
+        }
+        self.updater.window(ctx);
         if self.vsync_enabled {
             let (rect, ppp) = ctx.input(|i| {
                 let v = i.viewport();
@@ -1729,6 +1747,7 @@ impl eframe::App for AppState {
                 .on_hover_text("Seconds a note takes to reach the keyboard");
                 ui.separator();
                 ui.toggle_value(&mut self.show_settings, "Settings");
+                self.updater.toolbar(ui);
             });
             let mut cancel = false;
             if let Some(l) = &self.loading {
@@ -2202,6 +2221,9 @@ impl AppState {
                     ui.end_row();
                 });
                 ui.add_space(8.0);
+                ui.heading("Updates");
+                egui::Grid::new("updates").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| self.updater.settings(ui));
+                ui.add_space(8.0);
                 ui.heading("Benchmark");
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(self.benchmark.is_none(), |ui| {
@@ -2250,6 +2272,7 @@ impl AppState {
         if let Some(path) = settings_path() {
             text.push_str(&format!("max_instances={}\n", self.max_instances));
         text.push_str(&format!("collapse_overlaps={}\n", self.collapse_overlaps));
+        text.push_str(&format!("check_updates={}\nlast_update_check={}\n", self.updater.enabled, self.updater.last_check));
         let _ = std::fs::write(path, text);
         }
     }

@@ -1,2 +1,4 @@
 /target
 frames.csv
+# Release signing keys never belong here
+*.key
