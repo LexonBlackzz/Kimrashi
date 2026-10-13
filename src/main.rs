@@ -425,12 +425,11 @@ impl Decoded {
     }
 }
 
-const NOTE_PAGE: usize = 16_384;
+const NOTE_PAGE: usize = 2_048;
 
 #[derive(Debug)]
 struct NotePage {
     notes: Vec<NoteSegment>,
-    positions: Vec<u64>,
     first: usize,
     expiry: u64,
     pitches: [u64; 2],
@@ -472,27 +471,18 @@ impl NoteWindow {
             if p == self.pages.len() { self.pages.push(None); }
             let page = self.pages[p].get_or_insert_with(|| NotePage {
                 notes: vec![NoteSegment { source: 0, start_us: 0, end_us: 0, track: 0, channel: 0, pitch: 0 }; offset],
-                positions: vec![0; offset], first: offset, expiry: 0, pitches: [0; 2],
+                first: offset, expiry: 0, pitches: [0; 2],
             });
             let count = notes.len().min(NOTE_PAGE - offset);
             page.notes.reserve(count);
-            page.positions.reserve(count);
             for note in notes.by_ref().take(count) {
                 page.expiry = page.expiry.max(note.end_us + NOTE_HOLD_MICROS);
                 page.pitches[note.pitch as usize / 64] |= 1 << (note.pitch % 64);
                 page.notes.push(note);
-                page.positions.push(0);
             }
             self.len += count;
             self.live += count;
         }
-    }
-    fn position(&self, i: usize) -> u64 {
-        self.pages[i / NOTE_PAGE].as_ref().unwrap().positions[i % NOTE_PAGE]
-    }
-    fn set_position(&mut self, i: usize, epoch: u32, position: usize) {
-        self.pages[i / NOTE_PAGE].as_mut().unwrap().positions[i % NOTE_PAGE] =
-            (epoch as u64) << 32 | position as u64;
     }
     fn replace(&mut self, i: usize, note: NoteSegment) {
         let page = self.pages[i / NOTE_PAGE].as_mut().unwrap();
@@ -539,7 +529,6 @@ struct KeyCompact {
 struct KeyNotes {
     indices: Vec<usize>,
     compact: Option<KeyCompact>,
-    position_epoch: u32,
     prune: bool,
     starts: Vec<u64>,
     end_times: Vec<u64>,
@@ -998,12 +987,11 @@ impl DecodeWorker {
 #[derive(Clone, Copy)]
 struct InstanceSlot {
     id: u32,
-    pitch: u8,
-    version: u64,
+    version: u32,
 }
 
 impl InstanceSlot {
-    const EMPTY: Self = Self { id: u32::MAX, pitch: 255, version: 0 };
+    const EMPTY: Self = Self { id: u32::MAX, version: 0 };
 }
 
 /// Slots by note ID, in page-sized chunks allocated on first write: most notes are never
@@ -1058,7 +1046,6 @@ struct VisibleNotes {
     instance_dirty: bool,
     instance_ring_id: u64,
     instance_slots: SlotStore,
-    slot_users: gpu::HashMap<(u32, u64), usize>,
     retired_slots: Vec<InstanceSlot>,
     instance_style: Option<(bool, bool, bool)>,
     revision: u64,
@@ -1079,7 +1066,7 @@ impl Default for VisibleNotes {
             last_scanned: 0, alive: 0, frames_since_sweep: 0,
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, compact_from: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
-            instance_dirty: false, instance_ring_id: 0, instance_slots: SlotStore::default(), slot_users: Default::default(), retired_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
+            instance_dirty: false, instance_ring_id: 0, instance_slots: SlotStore::default(), retired_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
             build_profile: [Duration::ZERO; 6],
             row_counts: [0; 2],
             timing: AdvanceTimes::default(),
@@ -1096,22 +1083,15 @@ struct AdvanceTimes {
 }
 
 impl VisibleNotes {
+    /// Hand the slot back; applied to the ring at the start of the next build.
     fn release_slot(&mut self, slot: InstanceSlot) {
-        if slot.id == u32::MAX { return; }
-        let key = (slot.id, slot.version);
-        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.slot_users.entry(key) {
-            if *entry.get() == 1 {
-                entry.remove();
-                self.retired_slots.push(slot);
-            } else { *entry.get_mut() -= 1; }
-        }
+        if slot.id != u32::MAX { self.retired_slots.push(slot); }
     }
 
     fn cache_instance(&mut self, i: usize, ring: &mut gpu::InstanceRing, note: gpu::NoteInstance, expiry: u64) {
         let id = ring.push(note, expiry);
-        let version = ring.version(id);
-        self.instance_slots[i] = InstanceSlot { id, pitch: (note.key_color & 255) as u8, version };
-        *self.slot_users.entry((id, version)).or_default() += 1;
+        ring.add_user(id);
+        self.instance_slots[i] = InstanceSlot { id, version: ring.version(id) };
     }
 
     fn set_collapse(&mut self, enabled: bool) {
@@ -1185,7 +1165,9 @@ impl VisibleNotes {
         worker.now.store(now_us, Ordering::Release);
         worker.target.store(window_end.saturating_add(DECODE_AHEAD_US), Ordering::Release);
         worker.thread.unpark();
-        while self.last_batch == 0 || self.through < now_us.saturating_add(100_000).min(window_end) {
+        // Keep taking batches until the window is covered (bounded by NOTE_BATCH below):
+        // stopping after one left whole batches of in-window notes for the next frame.
+        while self.last_batch == 0 || self.through < window_end {
             let urgent = self.through < now_us.saturating_add(100_000).min(window_end);
             let batch = worker.pending.take().or_else(|| {
                 if urgent { worker.receiver.recv().ok() } else { worker.receiver.try_recv().ok() }
@@ -1215,11 +1197,8 @@ impl VisibleNotes {
                 if let Some(&i) = self.note_indices.get(&note_id(&note)) {
                     let Some(old) = self.window.get(i).copied() else { continue; };
                     let key = &mut self.keys[note.pitch as usize];
-                    let position = self.window.position(i);
-                    let p = position as u32 as usize;
-                    let p = if (position >> 32) as u32 == key.position_epoch && key.indices.get(p) == Some(&i) {
-                        Some(p)
-                    } else { key.indices.binary_search(&i).ok() };
+                    // Updates are rare; a binary search over the key's ascending indices finds it.
+                    let p = key.indices.binary_search(&i).ok();
                     if let Some(p) = p {
                         key.end_times[p] = rendered_end(&note);
                         let block = p / NOTE_BLOCK;
@@ -1243,7 +1222,7 @@ impl VisibleNotes {
                     }
                     if let Some(slot) = self.instance_slots.get(i).filter(|s| s.id != u32::MAX) {
                         self.release_slot(slot);
-                        self.instance_slots[i] = InstanceSlot { pitch: slot.pitch, ..InstanceSlot::EMPTY };
+                        self.instance_slots[i] = InstanceSlot::EMPTY;
                     }
                     self.instance_dirty = true;
                     self.instance_expiry = 0;
@@ -1322,7 +1301,6 @@ impl VisibleNotes {
             for p in compact.cursor..end {
                 let i = key.indices[p];
                 if let Some(note) = window.get(i).copied() {
-                    window.set_position(i, key.position_epoch.wrapping_add(1), compact.indices.len());
                     compact.indices.push(i);
                     compact.starts.push(note.start_us);
                     compact.ends.push(rendered_end(&note));
@@ -1331,7 +1309,6 @@ impl VisibleNotes {
             compact.cursor = end;
             if end == key.indices.len() {
                 let compact = key.compact.take().unwrap();
-                key.position_epoch = key.position_epoch.wrapping_add(1);
                 key.indices = compact.indices;
                 key.starts = compact.starts;
                 key.end_times = compact.ends;
@@ -1344,12 +1321,6 @@ impl VisibleNotes {
                 key.tree.clear();
                 key.update_tree(0);
             }
-        }
-    }
-
-    fn index_positions(&mut self, counts: &[usize; 128]) {
-        for (key, &first) in self.keys.iter().zip(counts) {
-            for p in first..key.indices.len() { self.window.set_position(key.indices[p], key.position_epoch, p); }
         }
     }
 
@@ -1382,7 +1353,6 @@ impl VisibleNotes {
                     for p in 0..size { key.push_time(&window[key.indices[p]]); }
                     key.update_tree(0);
                 });
-                self.index_positions(&counts);
                 self.indexed = end;
                 return;
             }
@@ -1400,7 +1370,6 @@ impl VisibleNotes {
                 for &i in new { key.push(i, &window[i]); }
                 key.update_tree(count);
             });
-            self.index_positions(&counts);
             self.indexed = end;
             return;
         }
@@ -1410,7 +1379,6 @@ impl VisibleNotes {
             self.total_len_us = self.total_len_us.saturating_add(note.end_us - note.start_us);
         }
         for (key, count) in self.keys.iter_mut().zip(counts) { key.update_tree(count); }
-        self.index_positions(&counts);
         self.indexed = end;
     }
 
@@ -2955,7 +2923,6 @@ fn build_note_instances(
         *instances = Arc::new(gpu::InstanceRing::default());
         visible.instance_ring_id = instances.id();
         visible.retired_slots.clear();
-        visible.slot_users.clear();
         visible.instance_style = None;
         visible.selection.clear();
     }
@@ -2963,11 +2930,7 @@ fn build_note_instances(
     visible.build_profile = [Duration::ZERO; 6];
     if !visible.retired_slots.is_empty() {
         let ring = Arc::make_mut(instances);
-        for slot in visible.retired_slots.drain(..) {
-            if !visible.slot_users.contains_key(&(slot.id, slot.version)) && ring.version(slot.id) == slot.version {
-                ring.retire(slot.id);
-            }
-        }
+        for slot in visible.retired_slots.drain(..) { ring.release(slot.id, slot.version); }
     }
     visible.build_profile[4] = t_retire.elapsed();
     let mut active_keys = [false; 128];
@@ -2981,14 +2944,12 @@ fn build_note_instances(
         if write {
             let buf = Arc::make_mut(instances);
             buf.begin(now_us);
-            for key in buf.take_freed() { visible.slot_users.remove(&key); }
                 let mut expiry = u64::MAX;
             let passes = if piano_layout { 2 } else { 1 };
             let indices: Vec<_> = (0..passes).flat_map(|pass| visible.window.entries().rev()
                 .filter(move |(_, n)| !piano_layout || is_black_key(n.pitch) == (pass == 0)))
                 .filter(|(_, n)| n.start_us < window_end && n.end_us + NOTE_HOLD_MICROS > now_us)
                 .map(|(i, _)| i).collect();
-            if visible.slot_users.is_empty() { visible.slot_users.reserve(indices.len().saturating_mul(4)); }
             for i in indices {
                 let note = visible.window[i];
                 let color = song.color_for(&note, color_by_channel);
@@ -3045,16 +3006,11 @@ fn build_note_instances(
     if visible.instance_dirty || visible.instance_style != Some(style) || visible.selected != visible.selection {
         let buf = Arc::make_mut(instances);
         buf.begin(now_us);
-        for key in buf.take_freed() { visible.slot_users.remove(&key); }
-        if visible.slot_users.is_empty() { visible.slot_users.reserve(visible.selected.len().saturating_mul(4)); }
-        // Newest first, with sharps in front of naturals in the piano layout.
-        let passes = if piano_layout { 2 } else { 1 };
+        // Newest first; in the piano layout one pass routes naturals behind the sharps.
         let selected = std::mem::take(&mut visible.selected);
-        for pass in 0..passes {
-            for &i in selected.iter().rev() {
-                let slot = visible.instance_slots[i];
-                let pitch = if slot.pitch == 255 { visible.window[i].pitch } else { slot.pitch };
-                if piano_layout && is_black_key(pitch) != (pass == 0) { continue; }
+        for &i in selected.iter().rev() {
+            let slot = visible.instance_slots[i];
+            if piano_layout { buf.route_naturals(!is_black_key(visible.window[i].pitch)); }
             if slot.id != u32::MAX && buf.version(slot.id) == slot.version {
                 buf.push_slot(slot.id);
                 continue;
@@ -3068,8 +3024,8 @@ fn build_note_instances(
                 len: ((note.end_us - note.start_us) as f32 / 1_000_000.0).max(0.000_1),
                 key_color: note.pitch as u32 | (color_u32 << 8),
             }, note.end_us + NOTE_HOLD_MICROS);
-            }
         }
+        buf.finish();
         visible.selected = selected;
         std::mem::swap(&mut visible.selection, &mut visible.selected);
         visible.instance_style = Some(style);

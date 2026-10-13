@@ -29,18 +29,21 @@ pub struct NoteInstance {
 
 /// Stable instance slots plus a small front-to-back draw list. Slots survive
 /// pixel-selection changes and are reused only after their note expires.
+#[derive(Clone, Copy, Debug)]
+struct SlotMeta { end: u64, version: u64, drawn: u64, users: u32 }
+
 #[derive(Clone, Debug)]
 pub struct InstanceRing {
     id: u64,
     now: u64,
     draw_epoch: u64,
-    drawn: Vec<u64>,
-    freed: Vec<(u32, u64)>,
     slots: Vec<NoteInstance>,
-    versions: Vec<u64>,
-    ends: Vec<u64>,
-    dropped: Vec<bool>,
+    /// End, version and last-drawn epoch of a slot side by side: one cache line per push.
+    meta: Vec<SlotMeta>,
     order: Vec<u32>,
+    /// Naturals collected during a single packing pass; `finish` appends them after the sharps.
+    tail: Vec<u32>,
+    tail_mode: bool,
     lookup: HashMap<[u32; 4], u32>,
     expiry: BTreeMap<u64, Vec<u32>>,
     expiry_records: usize,
@@ -53,17 +56,23 @@ pub struct InstanceRing {
 impl Default for InstanceRing {
     fn default() -> Self {
         static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self { id: ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), now: 0, draw_epoch: 0, drawn: Vec::new(), freed: Vec::new(), slots: Vec::new(),
-            versions: Vec::new(), ends: Vec::new(), dropped: Vec::new(), order: Vec::new(), lookup: HashMap::default(),
+        Self { id: ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), now: 0, draw_epoch: 0, slots: Vec::new(),
+            meta: Vec::new(), order: Vec::new(), tail: Vec::new(), tail_mode: false, lookup: HashMap::default(),
             expiry: BTreeMap::new(), expiry_records: 0, created: [0; 2], free: Vec::new(), revision: 0 }
     }
 }
 
+const EXPIRY_SHIFT: u32 = 14;
+
 impl InstanceRing {
     pub fn id(&self) -> u64 { self.id }
-    pub fn version(&self, slot: u32) -> u64 {
-        if self.ends.get(slot as usize).is_none_or(|&end| end <= self.now) { 0 }
-        else { self.versions[slot as usize] }
+    /// 0 = the slot is free or expired. Truncated to 32 bits (never 0): a reference is
+    /// checked within seconds of being made, far fewer than 2^32 allocations later.
+    pub fn version(&self, slot: u32) -> u32 {
+        match self.meta.get(slot as usize) {
+            Some(m) if m.end > self.now => (m.version as u32).max(1),
+            _ => 0,
+        }
     }
     pub fn len(&self) -> usize { self.order.len() }
     pub fn is_empty(&self) -> bool { self.order.is_empty() }
@@ -75,51 +84,71 @@ impl InstanceRing {
     }
     pub fn begin(&mut self, now: u64) {
         self.order.clear();
+        self.tail.clear();
+        self.tail_mode = false;
         self.now = now;
         self.draw_epoch = self.draw_epoch.wrapping_add(1);
         // Reclaim as fast as slots are made: a fixed 4096 let the backlog (and the hash
         // tables holding it) grow to millions at high note density, rehashing for 100+ ms.
         self.created = [0, self.created[0]];
         let mut budget = 4096.max(self.created[1].saturating_mul(2));
+        // Expiry is bucketed (~16 ms): one Vec per distinct end time made every new
+        // instance allocate. A bucket is reclaimed once all of it has passed.
         while budget > 0 {
             let Some(mut entry) = self.expiry.first_entry() else { break };
-            let expiry = *entry.key();
-            if expiry > now { break; }
+            let bucket_end = (*entry.key() + 1) << EXPIRY_SHIFT;
+            if bucket_end > now { break; }
             let slot = entry.get_mut().pop().unwrap();
             if entry.get().is_empty() { entry.remove(); }
             self.expiry_records -= 1;
             budget -= 1;
-            if self.ends[slot as usize] != expiry { continue; }
+            let m = self.meta[slot as usize];
+            // 0 = already freed; later than this bucket = extended, a newer record covers it.
+            if m.end == 0 || m.end > bucket_end { continue; }
             self.lookup.remove(&Self::key(&self.slots[slot as usize]));
-            self.ends[slot as usize] = 0;
-            self.freed.push((slot, self.versions[slot as usize]));
+            self.meta[slot as usize].end = 0;
             self.free.push(slot);
         }
         if self.expiry_records > self.lookup.len().max(4096) * 2 {
-            let ends = &self.ends;
+            let meta = &self.meta;
             let mut records = 0;
-            self.expiry.retain(|&time, slots| {
-                slots.retain(|&slot| ends[slot as usize] == time);
+            self.expiry.retain(|&bucket, slots| {
+                slots.retain(|&slot| { let end = meta[slot as usize].end; end != 0 && (end >> EXPIRY_SHIFT) == bucket });
                 records += slots.len();
                 !slots.is_empty()
             });
             self.expiry_records = records;
         }
     }
-    pub fn take_freed(&mut self) -> Vec<(u32, u64)> { std::mem::take(&mut self.freed) }
+    /// Route following pushes to the naturals list (or back to the main one).
+    pub fn route_naturals(&mut self, on: bool) { self.tail_mode = on; }
+    /// End a single-pass pack: naturals go behind the sharps.
+    pub fn finish(&mut self) { self.order.append(&mut self.tail); self.tail_mode = false; }
+    /// A note now draws through this slot (shared slots count each note).
+    pub fn add_user(&mut self, slot: u32) { self.meta[slot as usize].users += 1; }
+    /// A note stopped using the slot it saw at `version`; the last one frees it.
+    pub fn release(&mut self, slot: u32, version: u32) {
+        let Some(m) = self.meta.get_mut(slot as usize) else { return };
+        if m.end == 0 || (m.version as u32).max(1) != version { return; }
+        m.users = m.users.saturating_sub(1);
+        if m.users == 0 { self.retire(slot); }
+    }
     pub fn retire(&mut self, slot: u32) {
-        if self.ends.get(slot as usize).is_none_or(|&end| end == 0) { return; }
+        if self.meta.get(slot as usize).is_none_or(|m| m.end == 0) { return; }
         self.lookup.remove(&Self::key(&self.slots[slot as usize]));
-        self.ends[slot as usize] = 0;
+        self.meta[slot as usize].end = 0;
         self.free.push(slot);
     }
     pub fn push(&mut self, note: NoteInstance, expiry: u64) -> u32 {
         let key = Self::key(&note);
         let slot = if let Some(&slot) = self.lookup.get(&key) {
-            if expiry > self.ends[slot as usize] {
-                self.ends[slot as usize] = expiry;
-                self.expiry.entry(expiry).or_default().push(slot);
-                self.expiry_records += 1;
+            let old = self.meta[slot as usize].end;
+            if expiry > old {
+                self.meta[slot as usize].end = expiry;
+                if expiry >> EXPIRY_SHIFT != old >> EXPIRY_SHIFT {
+                    self.expiry.entry(expiry >> EXPIRY_SHIFT).or_default().push(slot);
+                    self.expiry_records += 1;
+                }
             }
             slot
         } else {
@@ -127,23 +156,17 @@ impl InstanceRing {
             self.revision = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let slot = if let Some(slot) = self.free.pop() {
                 self.slots[slot as usize] = note;
-                self.versions[slot as usize] = self.revision;
-                self.ends[slot as usize] = expiry;
-                self.dropped[slot as usize] = false;
-                self.drawn[slot as usize] = u64::MAX;
+                self.meta[slot as usize] = SlotMeta { end: expiry, version: self.revision, drawn: u64::MAX, users: 0 };
                 slot
             } else {
                 let slot = self.slots.len() as u32;
                 self.slots.push(note);
-                self.versions.push(self.revision);
-                self.ends.push(expiry);
-                self.dropped.push(false);
-                self.drawn.push(u64::MAX);
+                self.meta.push(SlotMeta { end: expiry, version: self.revision, drawn: u64::MAX, users: 0 });
                 slot
             };
             self.created[0] += 1;
             self.lookup.insert(key, slot);
-            self.expiry.entry(expiry).or_default().push(slot);
+            self.expiry.entry(expiry >> EXPIRY_SHIFT).or_default().push(slot);
             self.expiry_records += 1;
             slot
         };
@@ -151,10 +174,10 @@ impl InstanceRing {
         slot
     }
     pub fn push_slot(&mut self, slot: u32) {
-        if !self.dropped[slot as usize] && self.ends[slot as usize] > self.now
-            && self.drawn[slot as usize] != self.draw_epoch {
-            self.order.push(slot);
-            self.drawn[slot as usize] = self.draw_epoch;
+        let m = &mut self.meta[slot as usize];
+        if m.end > self.now && m.drawn != self.draw_epoch {
+            if self.tail_mode { self.tail.push(slot); } else { self.order.push(slot); }
+            m.drawn = self.draw_epoch;
         }
     }
     pub fn cap(&mut self, max: usize, _now: u64, piano: bool) {
@@ -177,13 +200,13 @@ impl InstanceRing {
         let mut left = want;
         for class in found {
             for pos in class.into_iter().take(left) {
-                self.dropped[self.order[pos] as usize] = true;
+                self.meta[self.order[pos] as usize].drawn = u64::MAX; // marks it shed
                 left -= 1;
             }
             if left == 0 { break; }
         }
-        let dropped = &mut self.dropped;
-        self.order.retain(|&slot| !std::mem::take(&mut dropped[slot as usize]));
+        let (meta, epoch) = (&self.meta, self.draw_epoch);
+        self.order.retain(|&slot| meta[slot as usize].drawn == epoch);
     }
     pub fn from_ordered(notes: impl IntoIterator<Item = NoteInstance>) -> Self {
         let mut ring = Self::default();
@@ -536,16 +559,16 @@ impl NotePipeline {
                 self.versions.resize(needed, 0);
                 let mut i = 0;
                 while i < needed {
-                    if self.versions[i] == data.versions[i] { i += 1; continue; }
+                    if self.versions[i] == data.meta[i].version { i += 1; continue; }
                     let first = i;
                     let mut end;
                     loop {
-                        while i < needed && self.versions[i] != data.versions[i] {
-                            self.versions[i] = data.versions[i];
+                        while i < needed && self.versions[i] != data.meta[i].version {
+                            self.versions[i] = data.meta[i].version;
                             i += 1;
                         }
                         end = i;
-                        let next = (i..needed.min(i + 64)).find(|&j| self.versions[j] != data.versions[j]);
+                        let next = (i..needed.min(i + 64)).find(|&j| self.versions[j] != data.meta[j].version);
                         match next { Some(j) => i = j, None => break }
                     }
                     queue.write_buffer(&self.instance_buffer, (first * mem::size_of::<NoteInstance>()) as u64,
@@ -737,38 +760,40 @@ mod tests {
     use super::*;
     #[test]
     fn instance_slots_survive_selection_changes_and_reuse_expired_space() {
+        const B: u64 = 1 << EXPIRY_SHIFT; // expiry is reclaimed per bucket
         let a = NoteInstance { start_us: [10, 0], len: 1.0, key_color: 60 };
         let b = NoteInstance { start_us: [20, 0], len: 2.0, key_color: 61 };
         let mut ring = InstanceRing::default();
         ring.begin(0);
-        let slot_a = ring.push(a, 100);
-        let slot_b = ring.push(b, 200);
-        let version = ring.versions[slot_b as usize];
-        ring.begin(50);
-        assert_eq!(ring.push(b, 200), slot_b);
-        assert_eq!(ring.versions[slot_b as usize], version);
-        assert_eq!(ring.push(a, 100), slot_a);
-        ring.begin(100);
+        let slot_a = ring.push(a, 100 * B);
+        let slot_b = ring.push(b, 200 * B);
+        let version = ring.meta[slot_b as usize].version;
+        ring.begin(50 * B);
+        assert_eq!(ring.push(b, 200 * B), slot_b);
+        assert_eq!(ring.meta[slot_b as usize].version, version);
+        assert_eq!(ring.push(a, 100 * B), slot_a);
+        ring.begin(101 * B);
         let c = NoteInstance { start_us: [30, 0], ..a };
-        assert_eq!(ring.push(c, 300), slot_a);
+        assert_eq!(ring.push(c, 300 * B), slot_a);
         assert_eq!(ring.slots.len(), 2);
-        assert_ne!(ring.versions[slot_a as usize], version);
+        assert_ne!(ring.meta[slot_a as usize].version, version);
         assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![c]);
     }
 
     #[test]
     fn equal_packed_spans_retain_the_latest_integer_expiry() {
+        const B: u64 = 1 << EXPIRY_SHIFT;
         let note = NoteInstance { start_us: [0, 0], len: 10_800.0, key_color: 60 };
         let mut ring = InstanceRing::default();
-        let slot = ring.push(note, 200);
-        assert_eq!(ring.push(note, 201), slot);
-        ring.begin(200);
+        let slot = ring.push(note, 200 * B);
+        assert_eq!(ring.push(note, 201 * B), slot);
+        ring.begin(200 * B);
         let next = NoteInstance { start_us: [1, 0], ..note };
-        assert_ne!(ring.push(next, 300), slot);
+        assert_ne!(ring.push(next, 300 * B), slot);
         ring.push_slot(slot);
         assert_eq!(ring[1], note);
-        ring.begin(201);
-        assert_eq!(ring.push(NoteInstance { start_us: [2, 0], ..note }, 400), slot);
+        ring.begin(201 * B);
+        assert_eq!(ring.push(NoteInstance { start_us: [2, 0], ..note }, 400 * B), slot);
     }
 
     #[test]
