@@ -37,6 +37,22 @@ cargo build --release
 
 The binary is `target/release/kimrashi.exe`. To use KDMAPI, install OmniMIDI (or SVMS) so `OmniMIDI.dll` is on the loader path.
 
+To measure rendering without the synth or vsync, use `--benchmark-render` with a
+MIDI path, `polyphony`, or `nps`. It reports advance/build/upload CPU times and a
+GPU timestamp for the real note pipeline. `KIM_FRAMELOG` also writes the usual CSV.
+
+```powershell
+$env:KIM_FRAMELOG = 'frames.csv'
+.\target\release\kimrashi.exe --benchmark-render 'song.mid' --from 104 --frames 180
+.\target\release\kimrashi.exe --benchmark-render polyphony --verify
+```
+
+`--window` changes the visible seconds. `--verify` compares GPU pixels against the
+previous unculled relative-time renderer at three checkpoints; `--verify-every 1`
+checks every frame. `precision --window 0.01 --verify` checks a long song near the
+32-bit timestamp wrap. See [renderer-performance.md](renderer-performance.md)
+for the measurements and culling guarantees.
+
 ## License
 
 GPL-3, see [LICENSE](LICENSE). The note shader (`shaders/notes.wgsl`) is based on
