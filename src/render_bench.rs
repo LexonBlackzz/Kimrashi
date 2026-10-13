@@ -223,6 +223,14 @@ pub fn run_from_args() -> bool {
             renderer.reference_frame(&reference, &keys, speed, now);
             let expected = renderer.pixels();
             let different = pixels.chunks_exact(4).zip(expected.chunks_exact(4)).filter(|(a, b)| a != b).count();
+            if std::env::var_os("VERIFY_REPORT").is_some() {
+                // Flattened pieces differ from the painter in the 8 rows at either window edge (clamped
+                // quads outline and darken there) and where a very short note covers a border.
+                let inside = pixels.chunks_exact(4).zip(expected.chunks_exact(4)).enumerate()
+                    .filter(|(i, (a, b))| a != b && (8..892).contains(&(i / 1920))).count();
+                println!("frame {f}: {different} pixels differ, {inside} away from the window edges");
+                continue;
+            }
             assert_eq!(different, 0, "GPU pixels differ from the original unculled relative-time renderer at frame {f}");
             println!("frame {f}: GPU pixels equal ({}, reference {} instances)", instances.len(), reference.len());
         }

@@ -363,7 +363,7 @@ impl VisualSong {
             if self.channel_colors.is_empty() {
                 Color32::from_rgb(120, 180, 255)
             } else {
-                let idx = (note.channel as usize) % self.channel_colors.len();
+                let idx = (note.channel() as usize) % self.channel_colors.len();
                 self.channel_colors[idx]
             }
         } else if self.track_colors.is_empty() {
@@ -386,7 +386,13 @@ struct NoteSegment {
     pitch: u8,
 }
 
+/// Border suppression, kept in the spare high bits of `channel` (a segment is a piece of
+/// a note when a newer note cut it or a newer note's end exposed it again).
+const NO_START_BORDER: u8 = 0x10;
+const NO_END_BORDER: u8 = 0x20;
+
 impl NoteSegment {
+    fn channel(&self) -> u8 { self.channel & 15 }
     /// Decode only removes notes completely covered by a later note. Pixel culling
     /// happens when drawing, without extending spans across track/colour boundaries.
     fn absorb(&self, prev: &mut NoteSegment) -> bool {
@@ -785,143 +791,110 @@ fn decode_tracks(song: &SongData, readers: &mut [TrackReader], now_us: u64, reac
     out
 }
 
-#[cfg(test)]
-fn push_collapsed(notes: &mut Vec<NoteSegment>, open: &mut [usize; 2048], note: NoteSegment) {
-    let k = note.channel as usize * 128 + note.pitch as usize;
-    if let Some(prev) = notes.get_mut(open[k]) {
-        // Packed notes already contain their matching off. The active count is
-        // nonzero exactly while these intervals overlap; only its union is needed.
-        if note.start_us < prev.end_us {
-            prev.end_us = prev.end_us.max(note.end_us);
-            return;
-        }
-    }
-    open[k] = notes.len();
-    notes.push(note);
-}
-
 type NoteId = (u64, u32, u8, u8);
 
 fn note_id(note: &NoteSegment) -> NoteId {
-    (note.start_us, note.source, note.channel, note.pitch)
+    (note.start_us, note.source, note.channel(), note.pitch)
 }
 
+/// A note sounding on a key. `Ord` is what is drawn on top: later start, then later track.
 #[derive(Clone, Copy)]
-struct OpenNote {
-    start_us: u64,
-    unreleased: bool,
-    start: u32,
-    end: u32,
-    epoch: u32,
-    index: u32,
+struct Layer {
+    note: NoteSegment,
+    seq: u32,
 }
 
-impl Default for OpenNote {
-    fn default() -> Self { Self { start_us: u64::MAX, unreleased: false, start: 0, end: 0, epoch: 0, index: u32::MAX } }
+impl Layer {
+    fn rank(&self) -> (u64, u32, u32) { (self.note.start_us, self.note.source, self.seq) }
+}
+impl PartialEq for Layer { fn eq(&self, other: &Self) -> bool { self.rank() == other.rank() } }
+impl Eq for Layer {}
+impl PartialOrd for Layer { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
+impl Ord for Layer { fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.rank().cmp(&other.rank()) } }
+
+/// The part of a key's timeline currently on top, begun at `start`.
+struct OpenSegment {
+    start: u64,
+    top: Layer,
+    /// Already sent (with a provisional end), so later changes are updates.
+    emitted: bool,
 }
 
+/// One key's sounding notes and visible segment, carried from chunk to chunk.
 #[derive(Default)]
-struct CollapseTrack {
-    reader: TrackReader,
-    disabled: bool,
-    channels: [Option<Box<[OpenNote; 128]>>; 16],
-    epoch: u32,
+struct FlattenKey {
+    active: std::collections::BinaryHeap<Layer>,
+    open: Option<OpenSegment>,
 }
 
-fn decode_collapsed(song: &SongData, tracks: &mut [CollapseTrack], now: u64, reach: u64) -> Decoded {
-    let end_tick = song.tempo.time_to_tick(reach);
-    let now_tick = song.tempo.time_to_tick(now);
-    let parts: Vec<_> = tracks.par_iter_mut().enumerate().map(|(track, state)| {
-        if state.disabled { return Decoded::new(Vec::new()); }
-        state.epoch = state.epoch.wrapping_add(1);
-        let mut out = Decoded::new(Vec::new());
-        let mut changed = [0u64; 32];
-        let mut cache = 0;
-        let origin = song.midi.track_origin[track] as u16;
-        let make_note = |open: &mut OpenNote, ch: u8, key: u8, cache: &mut usize| {
-            let end_us = if open.unreleased { song.tempo.duration_us() }
-                else { song.tempo.tick_to_time_approx(open.end, cache) };
-            if open.start_us == u64::MAX { open.start_us = song.tempo.tick_to_time_approx(open.start, cache); }
-            NoteSegment { source: track as u32, start_us: open.start_us, end_us,
-                track: origin, channel: ch, pitch: key }
-        };
-        while let Some((tick, rec)) = state.reader.next_before(song.midi.track(track), end_tick) {
-            out.scanned += 1;
-            let Record::Note { ch, key, dur, .. } = rec else { continue };
-            let end = dur.map_or(song.midi.end_tick, |d| tick + d);
-            let channel = state.channels[ch as usize].get_or_insert_with(|| Box::new([OpenNote::default(); 128]));
-            let open = &mut channel[key as usize];
-            if tick < open.end {
-                open.unreleased |= dur.is_none();
-                if end <= open.end { continue; }
-                open.end = end;
-                if end < now_tick { continue; }
-                if open.epoch == state.epoch {
-                    if open.index == u32::MAX {
-                        open.index = out.notes.len() as u32;
-                        out.notes.push(make_note(open, ch, key, &mut cache));
-                    } else {
-                        out.notes[open.index as usize].end_us = song.tempo.tick_to_time_approx(end, &mut cache);
-                    }
-                } else if open.index != u32::MAX {
-                    let k = ch as usize * 128 + key as usize;
-                    changed[k / 64] |= 1 << (k % 64);
-                } else {
-                    open.epoch = state.epoch;
-                    open.index = out.notes.len() as u32;
-                    out.notes.push(make_note(open, ch, key, &mut cache));
-                }
-            } else {
-                let k = ch as usize * 128 + key as usize;
-                if changed[k / 64] & (1 << (k % 64)) != 0 {
-                    out.updates.push(make_note(open, ch, key, &mut cache));
-                    changed[k / 64] &= !(1 << (k % 64));
-                }
-                *open = OpenNote { start_us: u64::MAX, unreleased: dur.is_none(), start: tick, end, epoch: state.epoch, index: u32::MAX };
-                if end >= now_tick {
-                    open.index = out.notes.len() as u32;
-                    out.notes.push(make_note(open, ch, key, &mut cache));
+impl OpenSegment {
+    fn segment(&self, end: u64, key: u8) -> NoteSegment {
+        let note = self.top.note;
+        let mut flags = 0;
+        if self.start != note.start_us { flags |= NO_START_BORDER; }
+        if end != note.end_us { flags |= NO_END_BORDER; }
+        // `source` is the track while decoding; a flattened segment has no use for it (it
+        // is unique by start on its key) and carries the whole note's length instead, so
+        // the shader can still darken the pieces of a note that is thin.
+        let whole = (note.end_us - note.start_us).min(u32::MAX as u64) as u32;
+        NoteSegment { start_us: self.start, end_us: end, channel: note.channel() | flags, pitch: key, source: whole, ..note }
+    }
+}
+
+impl FlattenKey {
+    /// Sweep this key through every event before `horizon`. `starts` are the notes that
+    /// begin in the chunk, in drawing order. Whatever is on top of the key at any moment
+    /// is a segment; the rest is hidden and never leaves the worker. A segment still open
+    /// at `horizon` is sent ending there and extended by later chunks.
+    fn sweep(&mut self, key: u8, starts: &[NoteSegment], seq: u32, horizon: u64, now: u64,
+             notes: &mut Vec<NoteSegment>, updates: &mut Vec<NoteSegment>) {
+        let mut i = 0;
+        loop {
+            let ends = self.open.as_ref().map(|open| open.top.note.end_us);
+            let begins = starts.get(i).map(|n| n.start_us);
+            let t = match (ends, begins) {
+                (Some(e), Some(b)) => e.min(b),
+                (Some(t), None) | (None, Some(t)) => t,
+                (None, None) => break,
+            };
+            if t >= horizon { break; }
+            while let Some(n) = starts.get(i).filter(|n| n.start_us == t) {
+                // A note of no length is still drawn, at the shader's minimum length.
+                self.active.push(Layer { note: NoteSegment { end_us: rendered_end(n), ..*n }, seq: seq + i as u32 });
+                i += 1;
+            }
+            while self.active.peek().is_some_and(|l| l.note.end_us <= t) { self.active.pop(); }
+            if let Some(open) = self.open.take() {
+                if t > open.start {
+                    let segment = open.segment(t, key);
+                    if open.emitted { updates.push(segment); }
+                    else if t + NOTE_HOLD_MICROS > now { notes.push(segment); }
                 }
             }
+            self.open = self.active.peek().map(|&top| OpenSegment { start: t, top, emitted: false });
         }
-        for (block, &bits) in changed.iter().enumerate() {
-            let mut bits = bits;
-            while bits != 0 {
-                let k = block * 64 + bits.trailing_zeros() as usize;
-                let ch = (k / 128) as u8;
-                let key = (k % 128) as u8;
-                let open = &mut state.channels[ch as usize].as_mut().unwrap()[key as usize];
-                if open.epoch != state.epoch {
-                    out.updates.push(make_note(open, ch, key, &mut cache));
-                }
-                bits &= bits - 1;
-            }
+        if let Some(open) = &mut self.open {
+            let segment = open.segment(horizon, key);
+            if open.emitted { updates.push(segment); }
+            else if horizon + NOTE_HOLD_MICROS > now { notes.push(segment); open.emitted = true; }
         }
-        out
+    }
+}
+
+/// Turn a chunk of decoded notes (sorted by start) into the visible segments of every key.
+fn flatten_chunk(keys: &mut [FlattenKey], decoded: Decoded, horizon: u64, now: u64) -> Decoded {
+    let mut buckets: Vec<Vec<NoteSegment>> = vec![Vec::new(); keys.len()];
+    let first = decoded.notes.len();
+    for note in decoded.notes { buckets[note.pitch as usize & 127].push(note); }
+    let parts: Vec<_> = keys.par_iter_mut().zip(buckets.par_iter()).enumerate().map(|(key, (state, starts))| {
+        let (mut notes, mut updates) = (Vec::new(), Vec::new());
+        state.sweep(key as u8, starts, 0, horizon, now, &mut notes, &mut updates);
+        (notes, updates)
     }).collect();
-    let mut out = Decoded::new(Vec::new());
-    for part in parts {
-        out.scanned += part.scanned;
-        out.notes.extend(part.notes);
-        out.updates.extend(part.updates);
-    }
+    let mut out = Decoded::new(Vec::with_capacity(first));
+    out.scanned = decoded.scanned;
+    for (notes, updates) in parts { out.notes.extend(notes); out.updates.extend(updates); }
     out.notes.par_sort_by_key(|n| n.start_us);
-    // Only completed unions can be permanently covered: an open one may
-    // extend in a later batch and expose pixels again.
-    let closed_before = song.tempo.tick_to_time_approx(end_tick, &mut 0);
-    let mut last = [usize::MAX; 128];
-    let mut w = 0;
-    for r in 0..out.notes.len() {
-        let note = out.notes[r];
-        let k = note.pitch as usize;
-        let prev = last[k];
-        if prev == usize::MAX || out.notes[prev].end_us >= closed_before || !note.absorb(&mut out.notes[prev]) {
-            out.notes[w] = note;
-            last[k] = w;
-            w += 1;
-        }
-    }
-    out.notes.truncate(w);
     out
 }
 
@@ -952,7 +925,7 @@ impl Drop for DecodeWorker {
 }
 
 impl DecodeWorker {
-    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64, mut collapsed: Option<Vec<CollapseTrack>>, prepared: Vec<NoteSegment>) -> Self {
+    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64, mut flatten: Option<Vec<FlattenKey>>, prepared: Vec<NoteSegment>) -> Self {
         let now = Arc::new(AtomicU64::new(0));
         let target = Arc::new(AtomicU64::new(through));
         let stop = Arc::new(AtomicBool::new(false));
@@ -980,9 +953,11 @@ impl DecodeWorker {
                     std::thread::park_timeout(Duration::from_millis(2));
                     continue;
                 }
-                let decoded = decode_pool.install(|| if let Some(tracks) = &mut collapsed {
-                    decode_collapsed(&worker_song, tracks, worker_now.load(Ordering::Acquire), reach)
-                } else { decode_tracks(&worker_song, &mut readers, worker_now.load(Ordering::Acquire), reach, Some(&enabled)) });
+                let decoded = decode_pool.install(|| {
+                    let now = worker_now.load(Ordering::Acquire);
+                    let decoded = decode_tracks(&worker_song, &mut readers, now, reach, Some(&enabled));
+                    match &mut flatten { Some(keys) => flatten_chunk(keys, decoded, reach, now), None => decoded }
+                });
                 if worker_stop.load(Ordering::Acquire) { break; }
                 let mut updates = decoded.updates.into_iter().peekable();
                 while updates.peek().is_some() {
@@ -1114,6 +1089,11 @@ impl VisibleNotes {
         self.instance_slots[i] = InstanceSlot { id, version: ring.version(id) };
     }
 
+    /// Length of the note a window entry belongs to (see `OpenSegment::segment`), or 0 when not flattened.
+    fn whole_us(&self, note: &NoteSegment) -> u64 {
+        if self.collapse_overlaps { note.source as u64 } else { 0 } // 0: measure the clamped quad
+    }
+
     fn set_collapse(&mut self, enabled: bool) {
         if self.collapse_overlaps != enabled {
             *self = Self { collapse_overlaps: enabled, max_instances: self.max_instances, generation: self.generation.wrapping_add(1), ..Default::default() };
@@ -1146,12 +1126,10 @@ impl VisibleNotes {
         if self.worker.is_none() {
             let mut readers = vec![TrackReader::default(); song.midi.tracks.len()];
             let enabled = render_tracks(song);
-            let mut collapsed = self.collapse_overlaps.then(|| enabled.iter()
-                .map(|&enabled| CollapseTrack { disabled: !enabled, ..Default::default() }).collect::<Vec<_>>());
+            let mut flatten = self.collapse_overlaps.then(|| (0..128).map(|_| FlattenKey::default()).collect::<Vec<_>>());
             let reach = window_end.saturating_add(SYNC_AHEAD_US);
-            let mut decoded = if let Some(tracks) = &mut collapsed {
-                decode_collapsed(song, tracks, now_us, reach)
-            } else { decode_tracks(song, &mut readers, now_us, reach, Some(&enabled)) };
+            let mut decoded = decode_tracks(song, &mut readers, now_us, reach, Some(&enabled));
+            if let Some(keys) = &mut flatten { decoded = flatten_chunk(keys, decoded, reach, now_us); }
             let cutoff = song.tempo.tick_to_time_approx(song.tempo.time_to_tick(window_end), &mut 0);
             let first_future = decoded.notes.partition_point(|n| n.start_us < cutoff);
             let prepared = decoded.notes.split_off(first_future);
@@ -1179,7 +1157,7 @@ impl VisibleNotes {
             }
             self.window.extend(decoded.notes);
             self.through = window_end;
-            self.worker = Some(DecodeWorker::new(song.clone(), readers, reach, self.generation, collapsed, prepared));
+            self.worker = Some(DecodeWorker::new(song.clone(), readers, reach, self.generation, flatten, prepared));
         }
         let mut worker = self.worker.take().unwrap();
         worker.now.store(now_us, Ordering::Release);
@@ -2055,8 +2033,8 @@ impl AppState {
                     ui.end_row();
 
                     ui.label("Overlaps");
-                    ui.checkbox(&mut self.collapse_overlaps, "Collapse same channel/key")
-                        .on_hover_text("Joins overlapping notes within a track. Off keeps every original span.");
+                    ui.checkbox(&mut self.collapse_overlaps, "Hide covered notes")
+                        .on_hover_text("Keeps only what is visible on each key: the newest note on top, an older one showing again when it ends, hidden notes dropped. Borders only mark real starts and ends. Off draws every original note.");
                     ui.end_row();
 
                     ui.label("Shading");
@@ -2989,12 +2967,7 @@ fn build_note_instances(
                 let slot = visible.instance_slots[i];
                 if slot.id != u32::MAX && buf.version(slot.id) == slot.version { buf.push_slot(slot.id); continue; }
                 visible.release_slot(slot);
-                visible.cache_instance(i, buf, gpu::NoteInstance {
-                    start_us: [note.start_us as u32, (note.start_us >> 32) as u32],
-                    len: ((note.end_us - note.start_us) as f32 / 1e6).max(0.000_1),
-                    key_color: note.pitch as u32 | ((color.r() as u32) << 24)
-                        | ((color.g() as u32) << 16) | ((color.b() as u32) << 8),
-                }, note.end_us + NOTE_HOLD_MICROS);
+                visible.cache_instance(i, buf, gpu::NoteInstance::new(&note, color, visible.whole_us(&note)), note.end_us + NOTE_HOLD_MICROS);
             }
             visible.instance_expiry = expiry;
         } else {
@@ -3046,12 +3019,7 @@ fn build_note_instances(
             visible.release_slot(slot);
             let note = visible.window[i];
             let color = song.color_for(&note, color_by_channel);
-            let color_u32 = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | color.b() as u32;
-            visible.cache_instance(i, buf, gpu::NoteInstance {
-                start_us: [note.start_us as u32, (note.start_us >> 32) as u32],
-                len: ((note.end_us - note.start_us) as f32 / 1_000_000.0).max(0.000_1),
-                key_color: note.pitch as u32 | (color_u32 << 8),
-            }, note.end_us + NOTE_HOLD_MICROS);
+            visible.cache_instance(i, buf, gpu::NoteInstance::new(&note, color, visible.whole_us(&note)), note.end_us + NOTE_HOLD_MICROS);
         }
         buf.finish();
         visible.selected = selected;
@@ -3182,6 +3150,15 @@ mod tests {
         song: &VisualSong, notes: &[NoteSegment], now: u64, speed: f32,
         height: u32, by_channel: bool, piano: bool, flat: bool, upwards: bool,
     ) -> Vec<[u8; 3]> {
+        raster_with(song, notes, now, speed, height, by_channel, piano, flat, upwards, false)
+    }
+
+    /// `flattened`: segments carry their whole note's length in `source` (thin notes darken
+    /// by that, not by the visible piece).
+    fn raster_with(
+        song: &VisualSong, notes: &[NoteSegment], now: u64, speed: f32,
+        height: u32, by_channel: bool, piano: bool, flat: bool, upwards: bool, flattened: bool,
+    ) -> Vec<[u8; 3]> {
         let width = 48;
         let columns = key_columns(piano, 59, 62);
         let mut pixels = vec![[0; 3]; width * height as usize];
@@ -3211,8 +3188,10 @@ mod tests {
                     let u = (cx - x0) / (x1 - x0);
                     let hx = 1.0 / (x1 - x0).max(1.0);
                     let hy = 1.0 / (y1 - y0).max(1.0);
-                    let border = u < hx || u > 1.0 - hx || v < hy || v > 1.0 - hy;
-                    let dark = border || (c0 - c1).abs() * (height as f32) < 7.0;
+                    let (start_border, end_border) = (note.channel & NO_START_BORDER == 0, note.channel & NO_END_BORDER == 0);
+                    let border = u < hx || u > 1.0 - hx || (start_border && v < hy) || (end_border && v > 1.0 - hy);
+                    let measured = if flattened { note.source as f32 / 1e6 / speed * height as f32 * 2.0 } else { (c0 - c1).abs() * height as f32 };
+                    let dark = border || measured < 7.0;
                     let shade = |c: u8| if flat { c } else {
                         let c = c as f32 / 255.0;
                         (c * c * if dark { 0.4 } else { 1.0 } * 255.0).round() as u8
@@ -3392,46 +3371,233 @@ mod tests {
         assert_eq!(exact.notes, culled.notes);
     }
 
-    #[test]
-    fn overlap_union_keeps_channels_and_touching_notes_separate() {
-        let mut notes = Vec::new();
-        let mut open = [usize::MAX; 2048];
-        let n = |start_us, end_us, channel| NoteSegment { source: 0, start_us, end_us, channel, pitch: 60, track: 0 };
-        for note in [n(0, 100, 0), n(10, 50, 0), n(30, 200, 0), n(40, 80, 1), n(200, 300, 0)] {
-            push_collapsed(&mut notes, &mut open, note);
-        }
-        assert_eq!(notes, [n(0, 200, 0), n(40, 80, 1), n(200, 300, 0)]);
+    fn flatten_all(notes: &[NoteSegment], horizon: u64) -> Vec<NoteSegment> {
+        let mut keys: Vec<_> = (0..128).map(|_| FlattenKey::default()).collect();
+        let mut sorted = notes.to_vec();
+        sorted.sort_by_key(|n| n.start_us); // stable: ties keep track order
+        flatten_chunk(&mut keys, Decoded::new(sorted), horizon, 0).notes
     }
 
     #[test]
-    fn overlap_union_extends_a_published_note_across_batches() {
-        let mut file = b"MThd\0\0\0\x06\0\0\0\x01\x13\x88".to_vec();
-        let body = [0, 0x90, 60, 100, 60, 0x90, 60, 100, 0x81, 12, 0x80, 60, 0,
-            0x81, 72, 0x80, 60, 0, 0, 0xff, 0x2f, 0];
-        file.extend_from_slice(b"MTrk");
-        file.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        file.extend(body);
-        let midi = Arc::new(parser::MidiFile::parse_stream(Box::new(parser::Plain(std::io::Cursor::new(file))),
-            127, &parser::Progress::default()).unwrap());
-        let tempo = Arc::new(song::TempoMap::from_midi(&midi));
-        let data = SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO };
-        let mut tracks = [CollapseTrack::default()];
-        let first = decode_collapsed(&data, &mut tracks, 0, 5000);
+    fn flatten_hides_covered_notes_and_exposes_the_older_tail() {
+        let n = |start_us, end_us, source| NoteSegment { source, start_us, end_us, track: source as u16, channel: 0, pitch: 60 };
+        // A 0..100, B 20..50 on top, C 30..40 on top of B, D 10..20 fully hidden by B? (no: D ends before B).
+        let notes = [n(0, 100_000, 0), n(20_000, 50_000, 1), n(30_000, 40_000, 2), n(60_000, 70_000, 3), n(65_000, 66_000, 4)];
+        let flat = flatten_all(&notes, 1_000_000);
+        let view: Vec<_> = flat.iter().map(|s| (s.start_us, s.end_us, s.track as u32, s.channel)).collect();
+        // A until B starts (cut: no end border), B until C (cut), C whole, B resumes (no start border),
+        // A resumes (no start border), D over A, E over D inside it, D resumes, A resumes.
+        assert_eq!(view, [
+            (0, 20_000, 0, NO_END_BORDER), (20_000, 30_000, 1, NO_END_BORDER), (30_000, 40_000, 2, 0),
+            (40_000, 50_000, 1, NO_START_BORDER), (50_000, 60_000, 0, NO_START_BORDER | NO_END_BORDER),
+            (60_000, 65_000, 3, NO_END_BORDER), (65_000, 66_000, 4, 0), (66_000, 70_000, 3, NO_START_BORDER),
+            (70_000, 100_000, 0, NO_START_BORDER),
+        ]);
+    }
+
+    #[test]
+    fn flatten_drops_a_note_covered_from_its_start() {
+        let n = |start_us, end_us, source| NoteSegment { source, start_us, end_us, track: source as u16, channel: 0, pitch: 60 };
+        // The later track wins an equal start; the earlier note is never visible.
+        let flat = flatten_all(&[n(0, 10_000, 0), n(0, 20_000, 1)], 1_000_000);
+        assert_eq!(flat.iter().map(|s| (s.start_us, s.end_us, s.track)).collect::<Vec<_>>(), [(0, 20_000, 1)]);
+    }
+
+    #[test]
+    fn flatten_extends_an_open_segment_across_chunks() {
+        let n = |start_us, end_us| NoteSegment { source: 0, start_us, end_us, track: 0, channel: 0, pitch: 60 };
+        let mut keys: Vec<_> = (0..128).map(|_| FlattenKey::default()).collect();
+        let first = flatten_chunk(&mut keys, Decoded::new(vec![n(10, 300)]), 100, 0);
         assert_eq!(first.notes.len(), 1);
-        let next = decode_collapsed(&data, &mut tracks, 0, 10_000);
-        assert!(next.notes.is_empty());
-        assert_eq!(next.updates.len(), 1);
-        assert_eq!(note_id(&next.updates[0]), note_id(&first.notes[0]));
-        assert!(next.updates[0].end_us > first.notes[0].end_us);
+        assert_eq!((first.notes[0].start_us, first.notes[0].end_us), (10, 100));
+        assert_eq!(first.notes[0].channel, NO_END_BORDER);
+        let second = flatten_chunk(&mut keys, Decoded::new(Vec::new()), 200, 0);
+        assert!(second.notes.is_empty());
+        assert_eq!(second.updates.len(), 1);
+        assert_eq!(note_id(&second.updates[0]), note_id(&first.notes[0]));
+        assert_eq!(second.updates[0].end_us, 200);
+        // The note's real end closes the segment with an end border.
+        let third = flatten_chunk(&mut keys, Decoded::new(Vec::new()), 400, 0);
+        assert_eq!(third.updates.len(), 1);
+        assert_eq!((third.updates[0].end_us, third.updates[0].channel), (300, 0));
+        assert!(flatten_chunk(&mut keys, Decoded::new(Vec::new()), 500, 0).updates.is_empty());
     }
 
     #[test]
-    fn no_overlap_collapse_matches_exact_notes_and_pixels() {
+    fn flatten_matches_the_unflattened_painter() {
+        let song = test_song();
+        let mut seed = 7u64;
+        let mut rand = move |m: u64| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed % m };
+        // Overlapping notes on four keys and three tracks. Every note is taller than the
+        // 7 px "thin note" threshold at the heights below: pieces of a thin note do not darken.
+        let notes: Vec<_> = (0..400).map(|_| {
+            let start = rand(90_000);
+            let track = rand(3);
+            NoteSegment { source: track as u32, start_us: start, end_us: start + 20_000 + rand(40_000),
+                track: track as u16, channel: track as u8, pitch: 59 + rand(4) as u8 }
+        }).collect();
+        let mut sorted = notes.clone();
+        sorted.sort_by_key(|n| (n.start_us, n.source));
+        let flat = flatten_all(&sorted, 1_000_000);
+        for key in 59..63 {
+            let mut on_key: Vec<_> = flat.iter().filter(|s| s.pitch == key).collect();
+            on_key.sort_by_key(|s| s.start_us);
+            assert!(on_key.windows(2).all(|w| w[0].end_us <= w[1].start_us), "segments overlap on key {key}");
+        }
+        for height in [64, 300] {
+            for now in [0, 5_000, 23_456] {
+                for by_channel in [false, true] {
+                    for piano in [false, true] {
+                        let a = raster_with(&song, &flat, now, 0.1, height, by_channel, piano, false, false, true);
+                        let b = raster(&song, &sorted, now, 0.1, height, by_channel, piano, false, false);
+                        let differing: Vec<_> = a.iter().zip(&b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| (i / 48, i % 48)).take(5).collect();
+                        assert!(differing.is_empty(), "height={height} now={now} channel={by_channel} piano={piano}: first differing (row, col) {differing:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flatten_matches_the_painter_for_stacked_restrikes() {
+        let song = test_song();
+        // Ten-second notes restruck every 8.8 ms on one key: the newest one is cut after a few rows.
+        let notes: Vec<_> = (0..400u64).map(|i| NoteSegment { source: 0, start_us: i * 8_800, end_us: i * 8_800 + 10_000_000,
+            track: 0, channel: 0, pitch: 60 }).collect();
+        let flat = flatten_all(&notes, 100_000_000);
+        for height in [64, 300, 900] {
+            for now in [3_500_000, 3_502_000, 3_505_000] {
+                let a = raster_with(&song, &flat, now, 5.0, height, false, false, false, false, true);
+                let b = raster(&song, &notes, now, 5.0, height, false, false, false, false);
+                let differing: Vec<_> = a.iter().zip(&b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| (i / 48, i % 48)).take(4).collect();
+                assert!(differing.is_empty(), "height={height} now={now}: first differing (row, col) {differing:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_flatten_with_updates_equals_one_pass() {
+        let mut seed = 99u64;
+        let mut rand = move |m: u64| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed % m };
+        let mut notes: Vec<_> = (0..600).map(|_| {
+            let start = rand(200_000);
+            let track = rand(3);
+            NoteSegment { source: track as u32, start_us: start, end_us: start + 1_000 + rand(120_000),
+                track: track as u16, channel: track as u8, pitch: 58 + rand(5) as u8 }
+        }).collect();
+        notes.sort_by_key(|n| (n.start_us, n.source));
+        let mut whole = flatten_all(&notes, 10_000_000);
+        // Same notes fed 7 ms at a time; a consumer keeps segments by id and applies updates.
+        let mut keys: Vec<_> = (0..128).map(|_| FlattenKey::default()).collect();
+        let mut store: std::collections::HashMap<NoteId, NoteSegment> = Default::default();
+        let step = 7_000u64;
+        let mut horizon = step;
+        while horizon < 400_000 {
+            let chunk: Vec<_> = notes.iter().copied().filter(|n| n.start_us < horizon && n.start_us >= horizon - step).collect();
+            let out = flatten_chunk(&mut keys, Decoded::new(chunk), horizon, 0);
+            for u in out.updates { assert!(store.insert(note_id(&u), u).is_some(), "update for a segment never sent: {u:?}"); }
+            for n in out.notes { assert!(store.insert(note_id(&n), n).is_none(), "segment sent twice: {n:?}"); }
+            horizon += step;
+        }
+        let mut chunked: Vec<_> = store.into_values().collect();
+        let key = |n: &NoteSegment| (n.pitch, n.start_us, n.track);
+        chunked.sort_by_key(key);
+        whole.sort_by_key(key);
+        assert_eq!(chunked.len(), whole.len());
+        for (a, b) in chunked.iter().zip(&whole) { assert_eq!(a, b); }
+    }
+
+    /// A format-1 file of `tracks` tracks with random overlapping notes on keys 59-62.
+    fn overlapping_song(tracks: usize, notes: usize, seed: u64) -> VisualSong {
+        let mut seed = seed;
+        let mut rand = move |m: u64| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed % m };
+        let mut file = b"MThd\0\0\0\x06\0\x01".to_vec();
+        file.extend_from_slice(&(tracks as u16).to_be_bytes());
+        file.extend_from_slice(&480u16.to_be_bytes()); // 120 BPM: ~1042 us per tick
+        for track in 0..tracks {
+            let mut events: Vec<(u64, u8, u8)> = Vec::new();
+            for _ in 0..notes {
+                let start = rand(5_000);
+                let key = 59 + rand(4) as u8;
+                events.push((start, 0x90 | track as u8, key));
+                events.push((start + 5 + rand(1_500), 0x80 | track as u8, key));
+            }
+            events.sort_by_key(|e| (e.0, e.1 >> 4)); // offs (8) before ons (9) at a tick
+            let mut body = Vec::new();
+            let mut last = 0;
+            for (tick, status, key) in events {
+                let mut delta = tick - last;
+                last = tick;
+                let mut bytes = vec![(delta & 127) as u8];
+                delta >>= 7;
+                while delta > 0 { bytes.push((delta & 127) as u8 | 128); delta >>= 7; }
+                body.extend(bytes.iter().rev());
+                body.extend_from_slice(&[status, key, if status >> 4 == 9 { 100 } else { 0 }]);
+            }
+            body.extend_from_slice(&[0, 0xff, 0x2f, 0]);
+            file.extend_from_slice(b"MTrk");
+            file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            file.extend(body);
+        }
+        let midi = Arc::new(parser::MidiFile::parse_stream(
+            Box::new(parser::Plain(std::io::Cursor::new(file))), 127, &parser::Progress::default(),
+        ).unwrap());
+        let tempo = Arc::new(song::TempoMap::from_midi(&midi));
+        VisualSong::new(Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO }))
+    }
+
+    #[test]
+    fn flatten_pipeline_matches_the_exact_painter_frame_after_frame() {
+        let song = overlapping_song(3, 250, 5);
+        let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
+        let mut exact = decode_notes(&song.data, &mut readers, 0, 30_000_000).notes;
+        exact.sort_by_key(|n| (n.start_us, n.source));
+        let mut visible = VisibleNotes::default();
+        assert!(visible.collapse_overlaps);
+        let speed = 0.5f32;
+        let mut now = 0u64;
+        while now < 5_400_000 {
+            let end = now + (speed as f64 * 1e6) as u64;
+            visible.advance(&song.data, now, end, 5000);
+            // Covered once the frontier passed the window, or the next waiting batch starts beyond it.
+            let cutoff = song.data.tempo.tick_to_time_approx(song.data.tempo.time_to_tick(end), &mut 0); // as `advance` rounds it
+            let covered = |v: &VisibleNotes| v.through >= end || v.worker.as_ref().is_some_and(|w|
+                w.pending.as_ref().is_some_and(|b| b.notes.first().is_some_and(|n| n.start_us >= cutoff)));
+            for _ in 0..2000 {
+                if covered(&visible) { break; }
+                std::thread::sleep(Duration::from_millis(1));
+                visible.advance(&song.data, now, end, 5000);
+            }
+            assert!(covered(&visible), "worker never caught up at {now}: through={} end={end} first pending start={:?}", visible.through, visible.worker.as_ref().and_then(|w| w.pending.as_ref()).map(|b| b.notes.first().map(|n| n.start_us)));
+            let flat: Vec<_> = visible.window.iter().copied().collect();
+            for height in [100, 300] {
+                let a = raster_with(&song, &flat, now, speed, height, false, false, false, false, true);
+                let b = raster(&song, &exact, now, speed, height, false, false, false, false);
+                // Within 8 rows of either window edge the reference darkens and outlines any note
+                // its clamped quad makes thin or cuts off; a piece of a longer note does neither.
+                let differing: Vec<_> = a.iter().zip(&b).enumerate().filter(|(i, (x, y))| x != y && (8..height as usize - 8).contains(&(i / 48)))
+                    .map(|(i, _)| (i / 48, i % 48)).take(3).collect();
+                if let Some(&(row, col)) = differing.first() {
+                    let t = now as f64 + (row as f64 + 0.5) / height as f64 * speed as f64 * 1e6;
+                    let near = |notes: &[NoteSegment]| notes.iter().filter(|n| n.pitch == 59 + (col / 12) as u8 && (n.start_us as f64) < t + 3000.0 && n.end_us as f64 > t - 3000.0)
+                        .map(|n| (n.start_us, n.end_us, n.source, n.channel)).collect::<Vec<_>>();
+                    panic!("now={now} height={height}: first differing (row, col) {differing:?}, row time {t:.0}
+ flat: {:?}
+ exact: {:?}", near(&flat), near(&exact));
+                }
+            }
+            now += 33_000;
+        }
+    }
+
+    #[test]
+    fn no_overlap_flatten_matches_exact_notes_and_pixels() {
         let song = test_song();
         let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
-        let exact = decode_notes(&song.data, &mut readers, 0, 20_000_000).notes;
-        let mut tracks: Vec<_> = (0..song.data.midi.tracks.len()).map(|_| CollapseTrack::default()).collect();
-        assert_eq!(decode_collapsed(&song.data, &mut tracks, 0, 20_000_000).notes, exact);
+        let enabled = render_tracks(&song.data);
+        let exact = decode_tracks(&song.data, &mut readers, 0, 20_000_000, Some(&enabled)).notes;
+        let fields = |notes: &[NoteSegment]| notes.iter().map(|n| (n.start_us, n.end_us, n.track, n.channel, n.pitch)).collect::<Vec<_>>();
+        assert_eq!(fields(&flatten_all(&exact, 20_000_000)), fields(&exact));
         let mut visible = indexed(exact, false);
         assert_raster_equal(&song, &mut visible, 123_456, 3.0, 900);
     }

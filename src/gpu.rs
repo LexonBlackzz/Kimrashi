@@ -16,6 +16,25 @@ pub struct NoteInstance {
     pub key_color: u32,
 }
 
+impl NoteInstance {
+    /// Pitch fills the low 7 bits of `key_color` (bit 7 = no start border), colour the top 24.
+    /// A negative `len` means no end border (a piece of a longer note). The top 16 bits of
+    /// the start's high word hold the whole note's length in seconds as a bfloat16, which the
+    /// shader uses to darken thin notes; starts therefore must fit in 48 bits.
+    pub fn new(note: &crate::NoteSegment, color: egui::Color32, whole_us: u64) -> Self {
+        let len = ((note.end_us - note.start_us) as f32 / 1e6).max(0.000_1);
+        let whole = (whole_us as f32 / 1e6).to_bits() >> 16;
+        Self {
+            start_us: [note.start_us as u32, ((note.start_us >> 32) as u32 & 0xFFFF) | whole << 16],
+            // A cut end runs 2 us under the newer note that cut it (drawn in front), so a pixel
+            // centre on the cut belongs to the newer note whatever the f32 rounding of the edge.
+            len: if note.channel & crate::NO_END_BORDER != 0 { -(len + 2e-6) } else { len },
+            key_color: note.pitch as u32 | if note.channel & crate::NO_START_BORDER != 0 { 0x80 } else { 0 }
+                | ((color.r() as u32) << 24) | ((color.g() as u32) << 16) | ((color.b() as u32) << 8),
+        }
+    }
+}
+
 /// Stable instance slots plus a small front-to-back draw list. Slots survive
 /// pixel-selection changes and are reused only after their note expires.
 #[derive(Clone, Copy, Debug)]
@@ -158,7 +177,7 @@ impl InstanceRing {
         let mut found: [Vec<usize>; 2] = Default::default();
         for pos in 0..self.order.len() {
             let note = &self.slots[self.order[pos] as usize];
-            let class = !(piano && crate::is_black_key((note.key_color & 255) as u8)) as usize;
+            let class = !(piano && crate::is_black_key((note.key_color & 0x7F) as u8)) as usize;
             if found[class].len() < want {
                 found[class].push(pos);
                 if class == 0 && found[0].len() == want { break; }

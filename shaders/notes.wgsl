@@ -48,6 +48,8 @@ struct VertexOutput {
     @location(2) note_size: vec2<f32>,
     @location(3) win_size: vec2<f32>,
     @location(4) border_width: f32,
+    @location(5) @interpolate(flat) edges: u32,
+    @location(6) @interpolate(flat) thin: u32,
 };
 
 fn microseconds_as_float(lo: u32, hi: u32) -> f32 {
@@ -91,7 +93,11 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     let vidx = input.vertex_index % 6u;
     let uv = corners[vidx];
 
-    let key = note.key_color & 0xFFu;
+    // Pitch is the low 7 bits; bit 7 = no start border, a negative length = no end border
+    // (the note is a piece of a longer one, cut by or exposed again by a newer note).
+    let key = note.key_color & 0x7Fu;
+    let note_length = abs(note.length);
+    let edges = select(1u, 0u, (note.key_color & 0x80u) != 0u) | select(2u, 0u, note.length < 0.0);
     let color_packed = note.key_color >> 8u;
     let key_pos = key_positions[key];
 
@@ -101,10 +107,13 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     let safe_height = max(globals.height_time, 1e-6);
     // Subtract integer microseconds before converting, just as the CPU used to.
     // Absolute f32 seconds would lose visible detail in long songs at close zoom.
-    let negative = note.start_us.y < globals.now_hi ||
-        (note.start_us.y == globals.now_hi && note.start_us.x < globals.now_lo);
-    let later = select(note.start_us, vec2<u32>(globals.now_lo, globals.now_hi), negative);
-    let earlier = select(vec2<u32>(globals.now_lo, globals.now_hi), note.start_us, negative);
+    // The top 16 bits of the high word are the whole note's length (bfloat16 seconds).
+    let note_start = vec2<u32>(note.start_us.x, note.start_us.y & 0xFFFFu);
+    let whole_seconds = bitcast<f32>(note.start_us.y & 0xFFFF0000u);
+    let negative = note_start.y < globals.now_hi ||
+        (note_start.y == globals.now_hi && note_start.x < globals.now_lo);
+    let later = select(note_start, vec2<u32>(globals.now_lo, globals.now_hi), negative);
+    let earlier = select(vec2<u32>(globals.now_lo, globals.now_hi), note_start, negative);
     let lo = later.x - earlier.x;
     let hi = later.y - earlier.y - select(0u, 1u, later.x < earlier.x);
     let delta = microseconds_as_float(lo, hi);
@@ -113,7 +122,7 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     let seconds = fma(delta, 0.000001, delta * 2.52475729e-15);
     let start = select(seconds, -seconds, negative);
     let start_norm = clamp(start / safe_height, 0.0, 2.0);
-    let end_norm = clamp((start + note.length) / safe_height, 0.0, 2.0);
+    let end_norm = clamp((start + note_length) / safe_height, 0.0, 2.0);
 
     var start_clip = 1.0 - start_norm * 2.0;
     var end_clip = 1.0 - end_norm * 2.0;
@@ -141,6 +150,12 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     out.note_size = vec2<f32>(right - left, abs(start_clip - end_clip));
     out.win_size = vec2<f32>(globals.win_width, globals.win_height);
     out.border_width = 1.0;
+    out.edges = edges;
+    // Thin is under ~3.5 px. Flattened pieces measure the whole note (however much of it a
+    // cut or the window shows); a whole length of 0 measures the clamped quad, as before.
+    let measured = select(abs(start_clip - end_clip) * globals.win_height,
+        whole_seconds / safe_height * globals.win_height * 2.0, whole_seconds > 0.0);
+    out.thin = select(0u, 1u, measured < 7.0);
     return out;
 }
 
@@ -154,14 +169,15 @@ fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
         let vert_width_pixels = max(input.note_size.y * 0.5 * input.win_size.y, 1.0);
         let horiz_margin = input.border_width / horiz_width_pixels;
         let vert_margin = input.border_width / vert_width_pixels;
+        let start_border = (input.edges & 1u) != 0u;
+        let end_border = (input.edges & 2u) != 0u;
         let border = input.uv.x < horiz_margin ||
             input.uv.x > 1.0 - horiz_margin ||
-            input.uv.y < vert_margin ||
-            input.uv.y > 1.0 - vert_margin;
-        let thickness = input.note_size.y * input.win_size.y;
+            (start_border && input.uv.y < vert_margin) ||
+            (end_border && input.uv.y > 1.0 - vert_margin);
         let dark = srgb * 0.4;
 
-        if border || thickness < 7.0 {
+        if border || input.thin != 0u {
             color = dark;
         } else {
             color = srgb;
