@@ -570,7 +570,7 @@ const DECODE_AHEAD_US: u64 = 10_000_000;
 /// A seek decodes only this far past the window itself; the worker fills in the rest,
 /// at most `WORKER_CHUNK_US` of song at a time (it all sits in memory until sent).
 const SYNC_AHEAD_US: u64 = 250_000;
-const WORKER_CHUNK_US: u64 = 1_000_000;
+const WORKER_CHUNK_US: u64 = 50_000;
 
 const NOTE_BLOCK: usize = 64;
 
