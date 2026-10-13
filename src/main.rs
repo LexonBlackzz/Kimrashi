@@ -1090,7 +1090,6 @@ impl VisibleNotes {
 
     fn cache_instance(&mut self, i: usize, ring: &mut gpu::InstanceRing, note: gpu::NoteInstance, expiry: u64) {
         let id = ring.push(note, expiry);
-        ring.add_user(id);
         self.instance_slots[i] = InstanceSlot { id, version: ring.version(id) };
     }
 
