@@ -501,11 +501,16 @@ impl NoteWindow {
     fn expire(&mut self, now: u64) -> [u64; 2] {
         let mut pitches = [0; 2];
         // Only pages that are due are visited; scanning every page grew with the song.
+        // A page is ~50 KB to free; a sustained note ending can expire tens of thousands at
+        // once, so release a bounded number per frame (dead notes lingering a few frames
+        // are harmless: row queries use times, not page liveness).
+        let mut budget = 256;
         while let Some(&std::cmp::Reverse((due, p))) = self.due.peek() {
-            if due > now { break; }
+            if due > now || budget == 0 { break; }
             self.due.pop();
             let Some(page) = self.pages[p].as_ref() else { continue };
             if page.expiry > now { self.due.push(std::cmp::Reverse((page.expiry, p))); continue; }
+            budget -= 1;
             let page = self.pages[p].take().unwrap();
             self.live -= page.notes.len() - page.first;
             for k in 0..2 { pitches[k] |= page.pitches[k]; }
@@ -1016,7 +1021,6 @@ struct SlotStore(Vec<Option<Box<[InstanceSlot; NOTE_PAGE]>>>);
 
 impl SlotStore {
     fn get(&self, i: usize) -> Option<InstanceSlot> { self.0.get(i / NOTE_PAGE)?.as_ref().map(|c| c[i % NOTE_PAGE]) }
-    fn has_chunk(&self, i: usize) -> bool { self.0.get(i / NOTE_PAGE).is_some_and(|c| c.is_some()) }
     fn free_chunk(&mut self, i: usize) { if let Some(c) = self.0.get_mut(i / NOTE_PAGE) { *c = None; } }
 }
 impl std::ops::Index<usize> for SlotStore {
@@ -1261,20 +1265,10 @@ impl VisibleNotes {
         for (k, key) in self.keys.iter_mut().enumerate() {
             if pitches[k / 64] & (1 << (k % 64)) != 0 { key.prune = true; }
         }
-        while let Some((first, end)) = self.window.retired_range() {
-            let mut i = first;
-            while i < end {
-                let chunk_end = (i / NOTE_PAGE + 1) * NOTE_PAGE;
-                if self.instance_slots.has_chunk(i) {
-                    for j in i..chunk_end.min(end) {
-                        if let Some(slot) = self.instance_slots.get(j).filter(|s| s.id != u32::MAX) {
-                            self.release_slot(slot);
-                            self.instance_slots[j] = InstanceSlot::EMPTY;
-                        }
-                    }
-                }
-                i = chunk_end;
-            }
+        // An expired page's instance slots expire in the ring at the same moment (end +
+        // hold), so nothing is released per note: visiting every slot of every page made the
+        // frame a dense passage ends in (millions of notes at once) cost ~70 ms.
+        while let Some((_, end)) = self.window.retired_range() {
             if end % NOTE_PAGE == 0 { self.instance_slots.free_chunk(end - 1); } // page fully retired
         }
         // The open-note map is looked up only by id; drop entries of expired pages in bulk.
@@ -3451,6 +3445,27 @@ mod tests {
         assert_eq!(decoded.notes.len(), 1);
         assert_eq!(decoded.notes[0].track, 2);
         assert_eq!(decoded.notes[0].start_us, 0);
+    }
+
+    #[test]
+    fn mass_page_expiry_is_spread_over_frames() {
+        // One sustained note pins every page; when it ends they are all due at once.
+        let pages = 700;
+        let note = |i: usize| NoteSegment { source: 0, start_us: i as u64, end_us: 1_000_000,
+            track: 0, channel: 0, pitch: 60 };
+        let mut window = NoteWindow::from((0..NOTE_PAGE * pages).map(note).collect::<Vec<_>>());
+        let mut calls = 0;
+        while window.live > 0 {
+            let before = window.live;
+            window.expire(2_000_000);
+            assert!(before - window.live <= 256 * NOTE_PAGE, "released too many pages in one frame");
+            calls += 1;
+            assert!(calls < 100);
+        }
+        assert!(calls >= 3);
+        let mut ranges = 0;
+        while window.retired_range().is_some() { ranges += 1; }
+        assert_eq!(ranges, pages);
     }
 
     #[test]
