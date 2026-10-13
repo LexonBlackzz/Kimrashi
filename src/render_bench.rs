@@ -180,7 +180,7 @@ pub fn run_from_args() -> bool {
     let mut renderer = gpu::RenderBenchmark::new(device, queue, 1920, 900);
     let visual = VisualSong::new(song);
     let mut visible = VisibleNotes::default();
-    visible.set_max_instances(value("--max-instances").map_or(262_144, |s| s.parse().unwrap()));
+    visible.set_max_instances(value("--max-instances").map_or(1_048_576, |s| s.parse().unwrap()));
     visible.set_collapse(!args.iter().any(|a| a == "--no-collapse-overlaps"));
     let mut reference_readers = vec![crate::TrackReader::default(); visual.data.midi.tracks.len()];
     let mut reference_window = Vec::new();
@@ -195,6 +195,7 @@ pub fn run_from_args() -> bool {
     let mut log = FrameLog::from_env();
     let mut sums = [Duration::ZERO; 8];
     let mut build_parts = [Duration::ZERO; 4];
+    let mut hitches = Vec::new();
     let mut row_counts = [0usize; 2];
     let mut budgets = Vec::new();
     let mut counts = (0usize, 0usize);
@@ -235,6 +236,10 @@ pub fn run_from_args() -> bool {
             if f == 0 { paced_since = Instant::now(); }
             else if let Some(wait) = Duration::from_micros(f as u64 * 1_000_000 / 60).checked_sub(paced_since.elapsed()) { std::thread::sleep(wait); }
         }
+        if f >= 20 && cpu.as_secs_f64() > 0.025 {
+            let b = visible.build_profile.map(|d| (d.as_secs_f64() * 1e3 * 10.0).round() / 10.0);
+            hitches.push(format!("f{f} cpu={:.1} adv={:.1} keys={} rows={} bits={} pack={} retire={} cap={} reused/queried={:?}", cpu.as_secs_f64()*1e3, (t1-t0).as_secs_f64()*1e3, b[0], b[1], b[2], b[3], b[4], b[5], visible.row_counts));
+        }
         if f < 20 { continue; }
         let a = visible.timing;
         let values = [a.retain, a.decode, a.sort, a.cull, build, upload, gpu, cpu + upload + gpu];
@@ -245,6 +250,7 @@ pub fn run_from_args() -> bool {
         counts.0 = counts.0.max(instances.len()); counts.1 += visible.last_batch;
     }
     if let Some(log) = &mut log { log.flush(); }
+    for h in &hitches { println!("{h}"); }
     let ms = |d: Duration| d.as_secs_f64() * 1e3 / frames as f64;
     budgets.sort_by(f64::total_cmp);
     println!("initial_decode_build_ms={:.3}, max_instances={}, new_per_frame={}", initial.as_secs_f64() * 1e3, counts.0, counts.1 / frames);

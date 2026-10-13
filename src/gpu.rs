@@ -139,29 +139,33 @@ impl InstanceRing {
             self.drawn[slot as usize] = self.draw_epoch;
         }
     }
-    pub fn cap(&mut self, max: usize, now: u64, piano: bool) {
+    pub fn cap(&mut self, max: usize, _now: u64, piano: bool) {
         if max == 0 || self.order.len() <= max { return; }
-        let mut drop = self.order.len() - max;
-        // Within each piano pass the draw list is newest-first. Reversing it
-        // gives oldest-start order without sorting a second copy of the list.
-        for class in 0..4 {
-            for &slot in self.order.iter().rev() {
-                if self.dropped[slot as usize] { continue; }
-                let note = &self.slots[slot as usize];
-                let start = note.start_us[0] as u64 | ((note.start_us[1] as u64) << 32);
-                let open = start <= now && self.ends[slot as usize].saturating_sub(crate::NOTE_HOLD_MICROS) > now;
-                let priority = (!open as usize) * 2
-                    + (piano && crate::is_black_key((note.key_color & 255) as u8)) as usize;
-                if priority == class {
-                    self.dropped[slot as usize] = true;
-                    drop -= 1;
-                    if drop == 0 { break; }
-                }
+        let want = self.order.len() - max;
+        // Synthesia-style: shed sharps from the top of the screen first, then naturals.
+        // Within each piano pass the draw list is newest-first, so a forward walk visits
+        // the furthest-future start first. One walk collects the first `want` of each class
+        // and stops once the sharps alone cover it. Nothing is remembered: the choice is
+        // remade every frame, so a note shed at the top comes back as it scrolls down.
+        let mut found: [Vec<usize>; 2] = Default::default();
+        for pos in 0..self.order.len() {
+            let note = &self.slots[self.order[pos] as usize];
+            let class = !(piano && crate::is_black_key((note.key_color & 255) as u8)) as usize;
+            if found[class].len() < want {
+                found[class].push(pos);
+                if class == 0 && found[0].len() == want { break; }
             }
-            if drop == 0 { break; }
         }
-        let dropped = &self.dropped;
-        self.order.retain(|&slot| !dropped[slot as usize]);
+        let mut left = want;
+        for class in found {
+            for pos in class.into_iter().take(left) {
+                self.dropped[self.order[pos] as usize] = true;
+                left -= 1;
+            }
+            if left == 0 { break; }
+        }
+        let dropped = &mut self.dropped;
+        self.order.retain(|&slot| !std::mem::take(&mut dropped[slot as usize]));
     }
     pub fn from_ordered(notes: impl IntoIterator<Item = NoteInstance>) -> Self {
         let mut ring = Self::default();
@@ -742,34 +746,23 @@ mod tests {
     }
 
     #[test]
-    fn force_culled_slots_stay_hidden_until_expiry_and_can_then_be_reused() {
-        let n = |start, pitch| NoteInstance { start_us: [start, 0], len: 1.0, key_color: pitch };
-        let mut ring = InstanceRing::default();
-        let white = ring.push(n(0, 60), 100);
-        ring.push(n(10, 61), 200);
-        ring.cap(1, 50, true);
-        ring.begin(75);
-        ring.push(n(0, 60), 100);
-        ring.push(n(10, 61), 200);
-        assert_eq!(ring.len(), 1);
-        assert_eq!(ring[0], n(10, 61));
-        ring.begin(100);
-        assert_eq!(ring.push(n(100, 60), 300), white);
-        assert_eq!(ring.len(), 1);
-        assert_eq!(ring[0], n(100, 60));
-    }
-
-    #[test]
-    fn cap_drops_old_open_naturals_before_sharps_and_future_notes() {
+    fn cap_sheds_sharps_then_naturals_newest_first_and_is_not_sticky() {
         let n = |start: u32, pitch| NoteInstance { start_us: [start, 0], len: 1.0, key_color: pitch };
-        let mut ring = InstanceRing::from_ordered([n(150, 60), n(20, 61), n(10, 60), n(0, 62)]);
+        // Newest-first draw list: sharps pass, then naturals pass.
+        let notes = [n(30, 61), n(10, 61), n(40, 60), n(20, 60), n(0, 62)];
+        let mut ring = InstanceRing::from_ordered(notes);
+        ring.cap(4, 100, true);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![n(10, 61), n(40, 60), n(20, 60), n(0, 62)]);
+        let mut ring = InstanceRing::from_ordered(notes);
         ring.cap(2, 100, true);
-        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![n(150, 60), n(20, 61)]);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![n(20, 60), n(0, 62)]);
         let original = ring.clone();
         ring.cap(0, 100, true);
         assert_eq!(ring, original);
-        ring.cap(1, 100, true);
-        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![n(150, 60)]);
+        // A fresh frame with the same notes shows them all again.
+        ring.begin(100);
+        for slot in 0..5 { ring.push_slot(slot); }
+        assert_eq!(ring.len(), 5);
     }
 
     #[test]

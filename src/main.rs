@@ -219,7 +219,7 @@ fn main() {
                 timer_guard,
                 color_by_channel: setting(&saved, "color_by_channel").unwrap_or(true),
                 color_auto: setting(&saved, "color_auto").unwrap_or(true),
-                max_instances: setting(&saved, "max_instances").unwrap_or(262_144),
+                max_instances: setting(&saved, "max_instances").unwrap_or(1_048_576),
                 collapse_overlaps: setting(&saved, "collapse_overlaps").unwrap_or(true),
                 piano_layout: setting(&saved, "piano_layout").unwrap_or(false),
                 frame_times: FrameTimes::default(),
@@ -512,6 +512,7 @@ impl NoteWindow {
         }
         pitches
     }
+    fn retired_len(&self) -> usize { self.retired.iter().map(|(_, n)| n.len()).sum() }
     fn retired_note(&mut self) -> Option<(usize, NoteSegment)> {
         loop {
             let (i, notes) = self.retired.front_mut()?;
@@ -1017,6 +1018,28 @@ impl InstanceSlot {
     const EMPTY: Self = Self { id: u32::MAX, pitch: 255, version: 0 };
 }
 
+/// Slots by note ID, in page-sized chunks allocated on first write: most notes are never
+/// drawn, and a flat Vec's doubling cost 50-100 ms at tens of millions of IDs.
+#[derive(Default)]
+struct SlotStore(Vec<Option<Box<[InstanceSlot; NOTE_PAGE]>>>);
+
+impl SlotStore {
+    fn get(&self, i: usize) -> Option<InstanceSlot> { self.0.get(i / NOTE_PAGE)?.as_ref().map(|c| c[i % NOTE_PAGE]) }
+    fn free_chunk(&mut self, i: usize) { if let Some(c) = self.0.get_mut(i / NOTE_PAGE) { *c = None; } }
+}
+impl std::ops::Index<usize> for SlotStore {
+    type Output = InstanceSlot;
+    fn index(&self, i: usize) -> &InstanceSlot {
+        self.0.get(i / NOTE_PAGE).and_then(|c| c.as_ref()).map_or(&InstanceSlot::EMPTY, |c| &c[i % NOTE_PAGE])
+    }
+}
+impl std::ops::IndexMut<usize> for SlotStore {
+    fn index_mut(&mut self, i: usize) -> &mut InstanceSlot {
+        if self.0.len() <= i / NOTE_PAGE { self.0.resize_with(i / NOTE_PAGE + 1, || None); }
+        &mut self.0[i / NOTE_PAGE].get_or_insert_with(|| vec![InstanceSlot::EMPTY; NOTE_PAGE].into_boxed_slice().try_into().ok().unwrap())[i % NOTE_PAGE]
+    }
+}
+
 /// Notes on screen. Each note is decoded from the packed tracks once, when it enters
 /// the window, and dropped once it has finished.
 struct VisibleNotes {
@@ -1037,6 +1060,7 @@ struct VisibleNotes {
     frames_since_sweep: u32,
     keys: [KeyNotes; 128],
     indexed: usize,
+    compact_from: usize,
     max_len_us: u64,
     total_len_us: u64,
     selected: Vec<usize>,
@@ -1044,7 +1068,7 @@ struct VisibleNotes {
     selected_bits: Vec<u64>,
     instance_dirty: bool,
     instance_ring_id: u64,
-    instance_slots: Vec<InstanceSlot>,
+    instance_slots: SlotStore,
     slot_users: HashMap<(u32, u64), usize>,
     retired_slots: Vec<InstanceSlot>,
     instance_style: Option<(bool, bool, bool)>,
@@ -1053,7 +1077,7 @@ struct VisibleNotes {
     instance_height_time: u32,
     instance_expiry: u64,
     /// Keyboard, row queries, bitset collection, instance packing.
-    build_profile: [Duration; 4],
+    build_profile: [Duration; 6],
     row_counts: [usize; 2],
     /// Where the last `advance` spent its time (for `FrameLog`).
     timing: AdvanceTimes,
@@ -1062,12 +1086,12 @@ struct VisibleNotes {
 impl Default for VisibleNotes {
     fn default() -> Self {
         Self {
-            time_us: 0, collapse_overlaps: true, max_instances: 262_144, note_indices: HashMap::new(), worker: None, generation: 0, through: 0, window: NoteWindow::default(), last_batch: 0,
+            time_us: 0, collapse_overlaps: true, max_instances: 1_048_576, note_indices: HashMap::new(), worker: None, generation: 0, through: 0, window: NoteWindow::default(), last_batch: 0,
             last_scanned: 0, alive: 0, frames_since_sweep: 0,
-            keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, max_len_us: 0, total_len_us: 0,
+            keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, compact_from: 0, max_len_us: 0, total_len_us: 0,
             selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
-            instance_dirty: false, instance_ring_id: 0, instance_slots: Vec::new(), slot_users: HashMap::new(), retired_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
-            build_profile: [Duration::ZERO; 4],
+            instance_dirty: false, instance_ring_id: 0, instance_slots: SlotStore::default(), slot_users: HashMap::new(), retired_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
+            build_profile: [Duration::ZERO; 6],
             row_counts: [0; 2],
             timing: AdvanceTimes::default(),
         }
@@ -1155,7 +1179,6 @@ impl VisibleNotes {
                 let open = decoded.notes.iter().chain(&prepared).filter(|n| n.end_us.saturating_add(1) >= reach).count();
                 self.note_indices.reserve(open.saturating_mul(2));
             }
-            self.instance_slots.reserve(expected.saturating_sub(self.instance_slots.len()));
             self.selected_bits.reserve(expected.div_ceil(64).saturating_sub(self.selected_bits.len()));
 
             self.last_scanned = decoded.scanned;
@@ -1220,14 +1243,16 @@ impl VisibleNotes {
                             key.tree[node] = key.tree[node * 2].max(key.tree[node * 2 + 1]);
                         }
                     }
-                    key.added_start = key.added_start.min(note.start_us);
+                    // An extension only changes rows from the old end on; using its start
+                    // threw away every cached row after it (~40 ms once a second).
+                    key.added_start = key.added_start.min(rendered_end(&old));
                     self.total_len_us = self.total_len_us.saturating_add(note.end_us.saturating_sub(old.end_us));
                     self.max_len_us = self.max_len_us.max(note.end_us - note.start_us);
                     self.window.replace(i, note);
                     if let Some(compact) = &mut key.compact {
                         if let Ok(p) = compact.indices.binary_search(&i) { compact.ends[p] = rendered_end(&note); }
                     }
-                    if let Some(slot) = self.instance_slots.get(i).copied() {
+                    if let Some(slot) = self.instance_slots.get(i).filter(|s| s.id != u32::MAX) {
                         self.release_slot(slot);
                         self.instance_slots[i] = InstanceSlot { pitch: slot.pitch, ..InstanceSlot::EMPTY };
                     }
@@ -1252,26 +1277,38 @@ impl VisibleNotes {
         for (k, key) in self.keys.iter_mut().enumerate() {
             if pitches[k / 64] & (1 << (k % 64)) != 0 { key.prune = true; }
         }
-        for _ in 0..4096 {
+        // Keep pace with expiry: a fixed budget let the queue (32 B/note) grow without bound.
+        for _ in 0..4096.max(self.window.retired_len() / 8) {
             let Some((i, note)) = self.window.retired_note() else { break };
             if self.note_indices.get(&note_id(&note)) == Some(&i) { self.note_indices.remove(&note_id(&note)); }
-            if let Some(slot) = self.instance_slots.get(i).copied() {
+            if let Some(slot) = self.instance_slots.get(i).filter(|s| s.id != u32::MAX) {
                 self.release_slot(slot);
                 self.instance_slots[i] = InstanceSlot::EMPTY;
             }
+            if i % NOTE_PAGE == NOTE_PAGE - 1 { self.instance_slots.free_chunk(i); } // page fully retired
         }
         self.alive = self.window.live;
         self.timing.retain = retain.elapsed();
         // Fully index the received batch so the exact pixel selector stays cheap.
         self.index_notes(self.indexed);
-        self.compact_keys(50_000);
+        // A pass walks every entry, so a fixed budget lets dead entries pile up to several
+        // times the live ones when notes enter fast; scale with the index instead.
+        let entries: usize = self.keys.iter().map(|k| k.indices.len()).sum();
+        // Only while stale entries exceed half the live ones.
+        if entries > self.window.live + self.window.live / 2 {
+            self.compact_keys((entries / 128).clamp(50_000, 250_000));
+        }
         self.timing.cull = t0.elapsed();
     }
 
     fn compact_keys(&mut self, mut budget: usize) {
         let window = &mut self.window;
-        for key in &mut self.keys {
-            if budget == 0 { break; }
+        // Resume where the last frame ran out: restarting at key 0 starved the high keys,
+        // since a finished key is re-armed by the next expiring page.
+        for n in 0..128 {
+            let k = (self.compact_from + n) % 128;
+            if budget == 0 { self.compact_from = k; break; }
+            let key = &mut self.keys[k];
             if key.compact.is_none() && key.prune {
                 key.prune = false;
                 key.compact = Some(KeyCompact {
@@ -1298,6 +1335,10 @@ impl VisibleNotes {
                 key.indices = compact.indices;
                 key.starts = compact.starts;
                 key.end_times = compact.ends;
+                // Compaction reserved the old length; most of it is now dead.
+                key.indices.shrink_to(key.indices.len() + key.indices.len() / 4);
+                key.starts.shrink_to(key.starts.len() + key.starts.len() / 4);
+                key.end_times.shrink_to(key.end_times.len() + key.end_times.len() / 4);
                 key.ends.clear();
                 key.ends.extend(key.end_times.chunks(NOTE_BLOCK).map(|block| *block.iter().max().unwrap()));
                 key.tree.clear();
@@ -1387,8 +1428,10 @@ impl VisibleNotes {
         let px_us = height_time as f64 * 1e6 / height_px.max(1) as f64;
         // Include uncertain edge samples as well: float rounding and the GPU's
         // subpixel raster grid must never hide an exposed colour/border pixel.
-        let guard = 2 + (((height_time as f64 * 1e6) as u64).saturating_add(self.max_len_us) >> 21)
-            + (px_us / 256.0).ceil() as u64;
+        // Rounded up to a multiple of 16: rows are cached per guard, and a guard that crept
+        // up by one as max_len_us grew used to throw away every cached row (~40 ms).
+        let guard = (2 + (((height_time as f64 * 1e6) as u64).saturating_add(self.max_len_us) >> 21)
+            + (px_us / 256.0).ceil() as u64).next_multiple_of(16);
         let height = height_px.max(1) as usize;
         let times: Vec<_> = (0..height).map(|row|
             now_us.saturating_add(((row as f64 + 0.5) * px_us) as u64)).collect();
@@ -2916,6 +2959,8 @@ fn build_note_instances(
         visible.instance_style = None;
         visible.selection.clear();
     }
+    let t_retire = Instant::now();
+    visible.build_profile = [Duration::ZERO; 6];
     if !visible.retired_slots.is_empty() {
         let ring = Arc::make_mut(instances);
         for slot in visible.retired_slots.drain(..) {
@@ -2924,6 +2969,7 @@ fn build_note_instances(
             }
         }
     }
+    visible.build_profile[4] = t_retire.elapsed();
     let mut active_keys = [false; 128];
     let mut active_colors = [Color32::TRANSPARENT; 128];
     let dense = visible.dense(height_time, height_px);
@@ -2936,8 +2982,7 @@ fn build_note_instances(
             let buf = Arc::make_mut(instances);
             buf.begin(now_us);
             for key in buf.take_freed() { visible.slot_users.remove(&key); }
-            visible.instance_slots.resize(visible.window.len(), InstanceSlot::EMPTY);
-            let mut expiry = u64::MAX;
+                let mut expiry = u64::MAX;
             let passes = if piano_layout { 2 } else { 1 };
             let indices: Vec<_> = (0..passes).flat_map(|pass| visible.window.entries().rev()
                 .filter(move |(_, n)| !piano_layout || is_black_key(n.pitch) == (pass == 0)))
@@ -3002,7 +3047,6 @@ fn build_note_instances(
         buf.begin(now_us);
         for key in buf.take_freed() { visible.slot_users.remove(&key); }
         if visible.slot_users.is_empty() { visible.slot_users.reserve(visible.selected.len().saturating_mul(4)); }
-        visible.instance_slots.resize(visible.window.len(), InstanceSlot::EMPTY);
         // Newest first, with sharps in front of naturals in the piano layout.
         let passes = if piano_layout { 2 } else { 1 };
         let selected = std::mem::take(&mut visible.selected);
@@ -3032,9 +3076,11 @@ fn build_note_instances(
     }
     visible.instance_dirty = false;
     visible.build_profile[3] = t0.elapsed();
+    let t0 = Instant::now();
     if instances.len() > visible.max_instances && visible.max_instances > 0 {
         Arc::make_mut(instances).cap(visible.max_instances, now_us, piano_layout);
     }
+    visible.build_profile[5] = t0.elapsed();
     (active_keys, active_colors)
 }
 
