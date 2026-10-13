@@ -438,8 +438,12 @@ struct NotePage {
 #[derive(Default, Debug)]
 struct NoteWindow {
     pages: Vec<Option<NotePage>>,
+    /// Every page before this one has expired: per-frame work starts here, not at ID 0.
+    first_live: usize,
     len: usize,
     live: usize,
+    /// (expiry, page) entries; a page's real expiry may have grown since, so it is rechecked.
+    due: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>>,
     /// Index ranges of expired pages (the note data is dropped on expiry).
     retired: std::collections::VecDeque<(usize, usize)>,
 }
@@ -452,8 +456,9 @@ impl NoteWindow {
         (offset >= page.first).then(|| page.notes.get(offset)).flatten()
     }
     fn entries_range(&self, first: usize, end: usize) -> impl DoubleEndedIterator<Item = (usize, &NoteSegment)> {
-        let base = first / NOTE_PAGE;
-        self.pages[base..end.div_ceil(NOTE_PAGE)].iter().enumerate()
+        let stop = end.div_ceil(NOTE_PAGE);
+        let base = (first / NOTE_PAGE).max(self.first_live).min(stop);
+        self.pages[base..stop].iter().enumerate()
             .filter_map(move |(p, page)| page.as_ref().map(|page| ((base + p) * NOTE_PAGE, page)))
             .flat_map(move |(base, page)| {
                 let lo = first.saturating_sub(base).max(page.first).min(page.notes.len());
@@ -469,6 +474,7 @@ impl NoteWindow {
             let p = self.len / NOTE_PAGE;
             let offset = self.len % NOTE_PAGE;
             if p == self.pages.len() { self.pages.push(None); }
+            self.first_live = self.first_live.min(p);
             let page = self.pages[p].get_or_insert_with(|| NotePage {
                 notes: vec![NoteSegment { source: 0, start_us: 0, end_us: 0, track: 0, channel: 0, pitch: 0 }; offset],
                 first: offset, expiry: 0, pitches: [0; 2],
@@ -480,6 +486,7 @@ impl NoteWindow {
                 page.pitches[note.pitch as usize / 64] |= 1 << (note.pitch % 64);
                 page.notes.push(note);
             }
+            self.due.push(std::cmp::Reverse((page.expiry, p)));
             self.len += count;
             self.live += count;
         }
@@ -487,20 +494,28 @@ impl NoteWindow {
     fn replace(&mut self, i: usize, note: NoteSegment) {
         let page = self.pages[i / NOTE_PAGE].as_mut().unwrap();
         page.notes[i % NOTE_PAGE] = note;
+        // No heap entry needed: the one pushed by `extend` is never later than this, and a
+        // due entry re-checks the page's real expiry.
         page.expiry = page.expiry.max(note.end_us + NOTE_HOLD_MICROS);
     }
     fn expire(&mut self, now: u64) -> [u64; 2] {
         let mut pitches = [0; 2];
-        for (p, page) in self.pages.iter_mut().enumerate() {
-            if page.as_ref().is_some_and(|page| page.expiry <= now) {
-                let page = page.take().unwrap();
-                self.live -= page.notes.len() - page.first;
-                for k in 0..2 { pitches[k] |= page.pitches[k]; }
-                self.retired.push_back((p * NOTE_PAGE + page.first, p * NOTE_PAGE + page.notes.len()));
-            }
+        // Only pages that are due are visited; scanning every page grew with the song.
+        while let Some(&std::cmp::Reverse((due, p))) = self.due.peek() {
+            if due > now { break; }
+            self.due.pop();
+            let Some(page) = self.pages[p].as_ref() else { continue };
+            if page.expiry > now { self.due.push(std::cmp::Reverse((page.expiry, p))); continue; }
+            let page = self.pages[p].take().unwrap();
+            self.live -= page.notes.len() - page.first;
+            for k in 0..2 { pitches[k] |= page.pitches[k]; }
+            self.retired.push_back((p * NOTE_PAGE + page.first, p * NOTE_PAGE + page.notes.len()));
         }
+        while self.pages.get(self.first_live).is_some_and(|page| page.is_none()) { self.first_live += 1; }
         pitches
     }
+    /// First note ID that can still be live (a multiple of 64).
+    fn live_base(&self) -> usize { self.first_live * NOTE_PAGE }
     fn retired_range(&mut self) -> Option<(usize, usize)> { self.retired.pop_front() }
 }
 
@@ -1043,6 +1058,8 @@ struct VisibleNotes {
     selected: Vec<usize>,
     selection: Vec<usize>,
     selected_bits: Vec<u64>,
+    /// One bit per word of `selected_bits`, so a frame visits only words that were set.
+    selected_summary: Vec<u64>,
     instance_dirty: bool,
     instance_ring_id: u64,
     instance_slots: SlotStore,
@@ -1065,7 +1082,7 @@ impl Default for VisibleNotes {
             time_us: 0, collapse_overlaps: true, max_instances: 1_048_576, note_indices: HashMap::new(), worker: None, generation: 0, through: 0, window: NoteWindow::default(), last_batch: 0,
             last_scanned: 0, alive: 0, frames_since_sweep: 0,
             keys: std::array::from_fn(|_| KeyNotes::default()), indexed: 0, compact_from: 0, max_len_us: 0, total_len_us: 0,
-            selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(),
+            selected: Vec::new(), selection: Vec::new(), selected_bits: Vec::new(), selected_summary: Vec::new(),
             instance_dirty: false, instance_ring_id: 0, instance_slots: SlotStore::default(), retired_slots: Vec::new(), instance_style: None, revision: 0, instance_revision: 0, instance_height_time: 0, instance_expiry: 0,
             build_profile: [Duration::ZERO; 6],
             row_counts: [0; 2],
@@ -1390,8 +1407,20 @@ impl VisibleNotes {
                 .map(|(i, _)| i));
             return;
         }
-        self.selected_bits.resize(self.window.len().div_ceil(64), 0);
-        self.selected_bits.fill(0);
+        // The bitmap stays zeroed between frames (extraction clears what it reads) and a
+        // summary bit per word means a frame visits only touched words, not every ID
+        // ever entered, which grew with the length of the song.
+        let base = self.window.live_base();
+        let mut bits = std::mem::take(&mut self.selected_bits);
+        let mut summary = std::mem::take(&mut self.selected_summary);
+        bits.resize(self.window.len().div_ceil(64) - base / 64, 0);
+        summary.resize(bits.len().div_ceil(64), 0);
+        // An ID below `base` would be an expired note; never index out of range for it.
+        let mark = |bits: &mut Vec<u64>, summary: &mut Vec<u64>, i: usize| if i >= base {
+            let word = (i - base) / 64;
+            bits[word] |= 1 << (i % 64);
+            summary[word / 64] |= 1 << (word % 64);
+        };
         let px_us = height_time as f64 * 1e6 / height_px.max(1) as f64;
         // Include uncertain edge samples as well: float rounding and the GPU's
         // subpixel raster grid must never hide an exposed colour/border pixel.
@@ -1407,7 +1436,7 @@ impl VisibleNotes {
             if key.indices.is_empty() { continue; }
             let last = *key.indices.last().unwrap();
             if self.window.get(last).is_some_and(|n| n.start_us <= now_us && n.end_us >= window_end.saturating_add(guard)) {
-                self.selected_bits[last / 64] |= 1 << (last % 64);
+                mark(&mut bits, &mut summary, last);
                 key.rows.clear();
                 continue; // top note covers the whole viewport, including its borders
             }
@@ -1439,13 +1468,13 @@ impl VisibleNotes {
                 }
                 if cached.first != usize::MAX {
                     let i = cached.first;
-                    self.selected_bits[i / 64] |= 1 << (i % 64);
+                    mark(&mut bits, &mut summary, i);
                 }
                 if cached.second != usize::MAX {
                     let i = cached.second;
-                    self.selected_bits[i / 64] |= 1 << (i % 64);
+                    mark(&mut bits, &mut summary, i);
                 }
-                for &i in &cached.rest { self.selected_bits[i / 64] |= 1 << (i % 64); }
+                for &i in &cached.rest { mark(&mut bits, &mut summary, i); }
             }
             key.rows = rows;
             key.row_time = now_us;
@@ -1456,13 +1485,19 @@ impl VisibleNotes {
         let t0 = Instant::now();
         // The bitset deduplicates row winners and emits them in the original draw
         // order without sorting or walking every NoteSegment again.
-        for (block, &bits) in self.selected_bits.iter().enumerate() {
-            let mut bits = bits;
-            while bits != 0 {
-                self.selected.push(block * 64 + bits.trailing_zeros() as usize);
-                bits &= bits - 1;
+        for (group, summary_word) in summary.iter_mut().enumerate() {
+            while *summary_word != 0 {
+                let block = group * 64 + summary_word.trailing_zeros() as usize;
+                *summary_word &= *summary_word - 1;
+                let mut word = std::mem::take(&mut bits[block]);
+                while word != 0 {
+                    self.selected.push(base + block * 64 + word.trailing_zeros() as usize);
+                    word &= word - 1;
+                }
             }
         }
+        self.selected_bits = bits;
+        self.selected_summary = summary;
         self.build_profile[2] = t0.elapsed();
     }
 
