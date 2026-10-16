@@ -118,7 +118,7 @@ fn main() {
         .map_or(output::OutputChoice::Kdmapi, |(choice, _)| choice.clone());
 
     let (cmd_tx, cmd_rx) = unbounded::<PlayerCommand>();
-    let (telemetry_tx, telemetry_rx) = unbounded::<PlayerTelemetry>();
+    let (telemetry_tx, telemetry_rx) = player::latest::<PlayerTelemetry>();
     let stop = Arc::new(AtomicBool::new(false));
     let clock = Arc::new(PlaybackClock::new());
 

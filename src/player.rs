@@ -93,6 +93,27 @@ impl StatsAcc {
     }
 }
 
+/// A one-slot channel where a new value replaces an unread one: for state the UI only needs
+/// the latest of. It is drained only while the UI repaints (not when minimized), so a queue
+/// here would grow without bound.
+#[derive(Clone)]
+pub struct Latest<T>(Sender<T>, Receiver<T>);
+
+pub fn latest<T>() -> (Latest<T>, Receiver<T>) {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    (Latest(tx, rx.clone()), rx)
+}
+
+impl<T> Latest<T> {
+    pub fn send(&self, v: T) -> Result<(), ()> {
+        if let Err(crossbeam_channel::TrySendError::Full(v)) = self.0.try_send(v) {
+            let _ = self.1.try_recv();
+            let _ = self.0.try_send(v);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PlayerTelemetry {
     pub notes_played: u64,
@@ -1127,7 +1148,7 @@ pub struct Player {
     horizon: std::cell::Cell<u64>,
     stamps: Vec<u64>,
     cmd_rx: Receiver<PlayerCommand>,
-    telemetry_tx: Sender<PlayerTelemetry>,
+    telemetry_tx: Latest<PlayerTelemetry>,
     stop: Arc<AtomicBool>,
     clock: Arc<PlaybackClock>,
     /// Passed to SVMS outputs: the clock, where its callback log goes (follows
@@ -1140,7 +1161,7 @@ impl Player {
         omni: Option<Arc<OmniMIDI>>,
         choice: OutputChoice,
         cmd_rx: Receiver<PlayerCommand>,
-        telemetry_tx: Sender<PlayerTelemetry>,
+        telemetry_tx: Latest<PlayerTelemetry>,
         stop: Arc<AtomicBool>,
         clock: Arc<PlaybackClock>,
     ) {
@@ -1709,7 +1730,7 @@ mod tests {
         let song = SongData::load(&path, 127, &Default::default()).unwrap();
         let _ = std::fs::remove_file(&path);
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-        let (tel_tx, tel_rx) = crossbeam_channel::unbounded();
+        let (tel_tx, tel_rx) = latest();
         let stop = Arc::new(AtomicBool::new(false));
         let clock = Arc::new(PlaybackClock::new());
         clock.set_speed(std::env::var("SPEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1e9));
@@ -1748,7 +1769,7 @@ mod tests {
 
         *crate::output::CAPTURE.lock().unwrap() = Some(vec![]);
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-        let (tel_tx, tel_rx) = crossbeam_channel::unbounded();
+        let (tel_tx, tel_rx) = latest();
         let stop = Arc::new(AtomicBool::new(false));
         let clock = Arc::new(PlaybackClock::new());
         clock.set_speed(1e6); // the song is over in an instant

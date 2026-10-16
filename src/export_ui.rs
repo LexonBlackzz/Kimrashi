@@ -47,7 +47,7 @@ impl ExportUi {
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crate::player::latest();
         let cancel = Arc::new(AtomicBool::new(false));
         let (cfg, flag, ctx) = (self.cfg.clone(), cancel.clone(), ctx.clone());
         std::thread::spawn(move || {

@@ -150,7 +150,7 @@ fn run(a: Args) -> Result<(), String> {
     eprintln!("loaded {} in {:.2} s; playing {:.1}..{:.1} s", a.file, song.load_time.as_secs_f64(), a.from_us as f64 / 1e6, end_us as f64 / 1e6);
 
     let (cmd_tx, cmd_rx) = unbounded();
-    let (tel_tx, tel_rx) = unbounded();
+    let (tel_tx, tel_rx) = crate::player::latest();
     let stop = Arc::new(AtomicBool::new(false));
     let clock = Arc::new(PlaybackClock::new());
     clock.set_speed(a.speed);
