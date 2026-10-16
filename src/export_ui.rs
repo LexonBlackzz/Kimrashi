@@ -199,9 +199,12 @@ impl ExportUi {
                                 }
                                 if ui.button("Show in folder").clicked() {
                                     // ponytail: Windows explorer only; the app is Windows-only today.
-                                    let _ = std::process::Command::new("explorer")
-                                        .arg(format!("/select,{}", self.cfg.output.replace('/', "\\")))
-                                        .spawn();
+                                    // Explorer wants /select,"path" with only the path quoted, hence raw_arg.
+                                    let path = std::path::absolute(&self.cfg.output).unwrap_or_else(|_| self.cfg.output.clone().into());
+                                    let _ = std::os::windows::process::CommandExt::raw_arg(
+                                        &mut std::process::Command::new("explorer"),
+                                        format!("/select,\"{}\"", path.display()),
+                                    ).spawn();
                                 }
                             });
                         }
