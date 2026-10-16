@@ -23,7 +23,7 @@ use crossbeam_channel::Receiver;
 use eframe::egui;
 use crate::sig;
 
-const REPO: &str = "LexonBlackzz/Kimrashi";
+pub(crate) const REPO: &str = "LexonBlackzz/Kimrashi";
 /// Refuse anything larger (the exe is about 11 MB).
 const MAX_SIZE: u64 = 256 << 20;
 const CHECK_EVERY_SECS: u64 = 24 * 3600;

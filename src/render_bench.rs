@@ -209,7 +209,7 @@ pub fn run_from_args() -> bool {
         let t0 = Instant::now();
         visible.advance(&visual.data, now, end, future_us / 900);
         let t1 = Instant::now();
-        crate::build_note_instances(&visual, &mut visible, now, end, speed, 900, false, true, &mut instances);
+        crate::build_note_instances(&visual, &mut visible, now, end, speed, 900, true, &mut instances);
         let build = t1.elapsed();
         let cpu = t0.elapsed();
         let (upload, gpu) = renderer.frame(&instances, &keys, speed, now);
@@ -276,7 +276,7 @@ fn reference_instances(song: &VisualSong, window: &[crate::NoteSegment], now: u6
         .filter(move |n| crate::is_black_key(n.pitch) == (pass == 0)))
         .filter(|n| n.start_us < end && n.end_us + crate::NOTE_HOLD_MICROS > now)
         .map(|note| {
-            let color = song.color_for(note, false);
+            let color = song.color_for(note);
             let packed = note.pitch as u32 | ((color.r() as u32) << 24) | ((color.g() as u32) << 16) | ((color.b() as u32) << 8);
             gpu::NoteInstance {
                 start_us: [((note.start_us as i64 - now as i64) as f32 / 1e6).to_bits(),

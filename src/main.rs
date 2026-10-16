@@ -4,11 +4,16 @@ mod archive;
 mod bench;
 mod benchmark;
 mod render_bench;
+mod export;
+mod export_ui;
 mod clock;
 mod gpu;
 mod parser;
 mod player;
+mod settings;
 mod song;
+mod theme;
+mod ui;
 mod svms;
 mod sig;
 mod update;
@@ -23,7 +28,9 @@ use omnimidi::OmniMIDI;
 use player::{Player, PlayerCommand, PlayerTelemetry};
 use rayon::prelude::*;
 use parser::{Record, TrackReader};
+use settings::{Settings, StatsMode};
 use song::SongData;
+use ui::{draw_piano_roll, format_timestamp, si, secs, wrap_for_slider, load_info, loading_details, key_columns, is_black_key};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -76,15 +83,16 @@ fn create_timer_guard() -> TimerGuard {
     None
 }
 
-const DEFAULT_NOTE_SPEED_SECONDS: f32 = 5.0;
 const DEFAULT_PITCH_MIN: u8 = 21;
 const DEFAULT_PITCH_MAX: u8 = 108;
+/// Arrow-key seek step.
+const SEEK_STEP_US: u64 = 5_000_000;
 const SYNTH_LIMIT_OFF: f64 = 20_000_000.0;
 const NOTE_HOLD_MICROS: u64 = 1_000; // keep notes visible 1ms after Note Off to avoid abrupt drop
 
 fn main() {
     let _timer = create_timer_guard();
-    if bench::run_from_args() || render_bench::run_from_args() || benchmark::run_from_args() || update::run_from_args() {
+    if bench::run_from_args() || export::run_from_args() || render_bench::run_from_args() || benchmark::run_from_args() || update::run_from_args() {
         return;
     }
     update::cleanup_old();
@@ -102,17 +110,12 @@ fn main() {
     if omni_opt.is_some() && !kdmapi {
         eprintln!("KDMAPI not available.");
     }
-    let saved = load_settings();
+    let cfg = Settings::load();
     let outputs = output::list_outputs(kdmapi);
-    let output_idx = saved
-        .get("output")
-        .and_then(|name| outputs.iter().position(|(_, n)| n == name))
-        .unwrap_or(0);
+    let output_idx = outputs.iter().position(|(_, n)| *n == cfg.output).unwrap_or(0);
     let initial_output = outputs
         .get(output_idx)
         .map_or(output::OutputChoice::Kdmapi, |(choice, _)| choice.clone());
-    let skipping = setting(&saved, "skip_notes").unwrap_or(true);
-    let synth_limit = setting(&saved, "synth_limit").unwrap_or(SYNTH_LIMIT_OFF);
 
     let (cmd_tx, cmd_rx) = unbounded::<PlayerCommand>();
     let (telemetry_tx, telemetry_rx) = unbounded::<PlayerTelemetry>();
@@ -128,11 +131,11 @@ fn main() {
         clock.clone(),
     );
 
-    let _ = cmd_tx.send(PlayerCommand::SetSkipping(skipping));
-    let svms_batch = setting(&saved, "svms_batch").unwrap_or(false);
-    let _ = cmd_tx.send(PlayerCommand::SetSvmsBatch(svms_batch));
-    if synth_limit < SYNTH_LIMIT_OFF {
-        let _ = cmd_tx.send(PlayerCommand::SetSynthLimit(synth_limit as u32));
+    let _ = cmd_tx.send(PlayerCommand::SetSkipping(cfg.skip_notes));
+    let _ = cmd_tx.send(PlayerCommand::SetSvmsBatch(cfg.svms_batch));
+    let _ = cmd_tx.send(PlayerCommand::SetLongData(cfg.long_data));
+    if cfg.synth_limit < SYNTH_LIMIT_OFF {
+        let _ = cmd_tx.send(PlayerCommand::SetSynthLimit(cfg.synth_limit as u32));
     }
 
     let native_options = eframe::NativeOptions {
@@ -146,9 +149,16 @@ fn main() {
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([560.0, 360.0]),
         depth_buffer: gpu::DEPTH_BITS,
-        // Present uncapped; VSync is done in-app (see vsync.rs) so it can be toggled live.
+        // Real swap-chain VSync (fixed at startup). Waiting for the blank by hand and then
+        // presenting uncapped tears wherever the scanout happens to be when the frame lands.
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+            present_mode: if cfg.vsync {
+                eframe::wgpu::PresentMode::Fifo
+            } else {
+                eframe::wgpu::PresentMode::AutoNoVsync
+            },
+            // Let the CPU run only one frame ahead of the display so Fifo really paces it.
+            desired_maximum_frame_latency: Some(1),
             wgpu_setup: egui_wgpu::WgpuSetupCreateNew {
                 // egui asks for wgpu's conservative default limits (256 MB buffers);
                 // take the adapter's real buffer limit so dense songs fit.
@@ -190,49 +200,36 @@ fn main() {
                 clock: clock.clone(),
                 last_telemetry: PlayerTelemetry::default(),
                 current_song: None,
+                applied_look: None,
                 playback_time_us: 0,
                 slider_override_us: None,
                 slider_grabbed: false,
-                note_speed_seconds: setting(&saved, "note_speed").unwrap_or(DEFAULT_NOTE_SPEED_SECONDS),
                 outputs,
                 output_idx,
-                synth_limit,
-                skipping,
                 tempo: 1.0,
                 log_stats: false,
-                detailed_stats: setting(&saved, "detailed_stats").unwrap_or(false),
-                synth_stats: setting(&saved, "synth_stats").unwrap_or(false),
-                loading_details: setting(&saved, "loading_details").unwrap_or(false),
-                verify_repeats: setting(&saved, "verify_repeats").unwrap_or(false),
                 benchmark: None,
-                svms_batch,
                 loading: None,
                 show_settings: false,
-                vel_levels: setting(&saved, "velocity_levels").unwrap_or(127),
-                vsync_enabled: setting(&saved, "vsync").unwrap_or(true),
-                notes_upwards: setting(&saved, "notes_rise").unwrap_or(false),
-                flat_notes: setting(&saved, "flat_notes").unwrap_or(false),
+                settings_tab: SettingsTab::Display,
+                settings_search: String::new(),
                 visible: VisibleNotes::default(),
                 instances: Arc::default(),
-                refresh_rate_hz: vsync::VBlank::refresh_hz(),
-                vblank: vsync::VBlank::new(),
+                refresh_rate_hz: vsync::refresh_hz(),
                 status_message: None,
                 fps: 0.0,
                 last_frame: None,
                 timer_guard,
-                color_by_channel: setting(&saved, "color_by_channel").unwrap_or(true),
-                color_auto: setting(&saved, "color_auto").unwrap_or(true),
-                max_instances: setting(&saved, "max_instances").unwrap_or(1_048_576),
-                collapse_overlaps: setting(&saved, "collapse_overlaps").unwrap_or(true),
                 updater: {
-                    let mut updater = update::Updater::new(setting(&saved, "check_updates").unwrap_or(true), setting(&saved, "last_update_check").unwrap_or(0));
+                    let mut updater = update::Updater::new(cfg.check_updates, cfg.last_update_check);
                     updater.start_if_due();
                     updater
                 },
-                piano_layout: setting(&saved, "piano_layout").unwrap_or(false),
+                cfg,
                 frame_times: FrameTimes::default(),
                 frame_log: FrameLog::from_env(),
                 open_at_us,
+                export: Default::default(),
             };
             if let Some(path) = open_path {
                 state.start_loading(path);
@@ -341,8 +338,12 @@ impl FrameLog {
 
 struct VisualSong {
     data: Arc<SongData>,
-    channel_colors: Vec<Color32>,
-    track_colors: Vec<Color32>,
+    /// One color per (track, channel) pair: index = channel rank + track * channels used.
+    colors: Vec<Color32>,
+    /// Each channel's place among the channels the file uses.
+    channel_rank: [u8; 16],
+    channels: usize,
+    palette: theme::NotePalette,
     pitch_min: u8,
     pitch_max: u8,
 }
@@ -353,33 +354,28 @@ impl VisualSong {
             Some((lo, hi)) => (lo.min(DEFAULT_PITCH_MIN), hi.max(DEFAULT_PITCH_MAX)),
             None => (DEFAULT_PITCH_MIN, DEFAULT_PITCH_MAX),
         };
-
-        // Generate 16 colors, one for each MIDI channel
-        let colors = generate_palette(16);
-        let track_colors = generate_palette(data.midi.source_tracks.max(1));
-        Self {
-            data,
-            channel_colors: colors,
-            track_colors,
-            pitch_min,
-            pitch_max,
-        }
+        let used = data.midi.channels_used;
+        let channel_rank = std::array::from_fn(|c| (used & ((1u16 << c) - 1)).count_ones() as u8);
+        let channels = used.count_ones().max(1) as usize;
+        let mut song = Self { data, colors: Vec::new(), channel_rank, channels, palette: theme::NotePalette::default(), pitch_min, pitch_max };
+        song.set_palette(theme::NotePalette::default(), &theme::default_custom());
+        song
     }
 
-    fn color_for(&self, note: &NoteSegment, by_channel: bool) -> Color32 {
-        if by_channel {
-            if self.channel_colors.is_empty() {
-                Color32::from_rgb(120, 180, 255)
-            } else {
-                let idx = (note.channel() as usize) % self.channel_colors.len();
-                self.channel_colors[idx]
-            }
-        } else if self.track_colors.is_empty() {
-            Color32::from_rgb(120, 180, 255)
-        } else {
-            let idx = note.track as usize % self.track_colors.len();
-            self.track_colors[idx]
+    fn set_palette(&mut self, palette: theme::NotePalette, custom: &[[u8; 3]]) {
+        // ponytail: capped; past 65k pairs the colors just repeat.
+        let pairs = (self.data.midi.source_tracks.max(1) * self.channels).min(65_536);
+        self.colors = palette.colors(pairs, custom);
+        self.palette = palette;
+    }
+
+    /// Every track and every channel its own color, whichever the file has more of.
+    fn color_for(&self, note: &NoteSegment) -> Color32 {
+        if self.palette == theme::NotePalette::Pitch {
+            return theme::pitch_color(note.pitch, self.pitch_min, self.pitch_max);
         }
+        let i = self.channel_rank[note.channel() as usize % 16] as usize + note.track as usize * self.channels;
+        self.colors[i % self.colors.len()]
     }
 }
 
@@ -1051,7 +1047,7 @@ struct VisibleNotes {
     instance_ring_id: u64,
     instance_slots: SlotStore,
     retired_slots: Vec<InstanceSlot>,
-    instance_style: Option<(bool, bool, bool)>,
+    instance_style: Option<(bool, bool)>,
     revision: u64,
     instance_revision: u64,
     instance_height_time: u32,
@@ -1492,86 +1488,6 @@ impl VisibleNotes {
     }
 }
 
-/// A byte count with a unit (decimal: kB to PB).
-fn si_bytes(b: u64) -> String {
-    let (mut v, mut unit) = (b as f64, 0);
-    while v >= 1000.0 && unit < 5 {
-        v /= 1000.0;
-        unit += 1;
-    }
-    format!("{v:.1} {}", ["B", "kB", "MB", "GB", "TB", "PB"][unit])
-}
-
-/// The load's counters (all relaxed atomics the worker bumps once per track): rates are
-/// averages since the start, so nothing is sampled.
-fn loading_details(ui: &mut egui::Ui, l: &Loading) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let p = &l.progress;
-    let live = p.live_notes.load(Relaxed);
-    let (read, midi, notes) = (p.bytes.load(Relaxed), p.midi_bytes.load(Relaxed), p.notes.load(Relaxed) + live);
-    let done = p.tracks_done.load(Relaxed);
-    let total = p.tracks_total.load(Relaxed).max(done); // (a header can undercount)
-    let secs_f = l.started.elapsed().as_secs_f64().max(0.001);
-    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1e6);
-    let layers = p.layers.lock().map(|s| s.clone()).unwrap_or_default();
-    egui::Grid::new("loading_details").num_columns(2).show(ui, |ui| {
-        ui.label("Format");
-        ui.label(if layers.is_empty() { "mid".to_owned() } else { format!("{layers} › mid") });
-        ui.end_row();
-        ui.label("Read from disk");
-        ui.label(format!("{} of {} ({}/s)", mb(read.min(l.total)), mb(l.total), mb((read as f64 / secs_f) as u64)));
-        ui.end_row();
-        ui.label("MIDI parsed");
-        ui.label(format!("{} ({}/s)", mb(midi), mb((midi as f64 / secs_f) as u64)));
-        ui.end_row();
-        let scanned = p.scan_done.load(Relaxed);
-        if scanned > 0 {
-            // The layer is read in full to find the repeated tracks; a track's share of it
-            // times the track count is a guess at the whole.
-            let unit = p.scan_unit.load(Relaxed);
-            let guess = unit * p.tracks_total.load(Relaxed);
-            // The speed over the last ~10 s (an average since the start would count the
-            // time spent parsing, when nothing was scanned).
-            let id = egui::Id::new("scan_samples");
-            let mut samples: Vec<(f64, u64)> = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
-            if samples.last().is_none_or(|s| secs_f - s.0 >= 0.5) {
-                samples.push((secs_f, scanned));
-            }
-            samples.retain(|s| s.0 <= secs_f && secs_f - s.0 <= 10.0);
-            let rate = match samples.first() {
-                Some(&(t, b)) if secs_f - t > 1.0 => scanned.saturating_sub(b) as f64 / (secs_f - t),
-                _ => scanned as f64 / secs_f,
-            };
-            ui.data_mut(|d| d.insert_temp(id, samples));
-            ui.label("Scanning repeats");
-            ui.label(if guess > scanned {
-                let left = (guess - scanned) as f64 / rate.max(1.0);
-                format!("{} of ~{} ({}/s, ~{} left)", si_bytes(scanned), si_bytes(guess), si_bytes(rate as u64), secs(left))
-            } else {
-                format!("{} ({}/s)", si_bytes(scanned), si_bytes(rate as u64))
-            });
-            ui.end_row();
-        }
-        let trusted = p.trusted_tracks.load(Relaxed);
-        if trusted > 0 {
-            ui.label("Repeats");
-            ui.label(format!("{trusted} tracks counted without reading (sizes add up)"));
-            ui.end_row();
-        }
-        ui.label("Tracks");
-        ui.label(if total == 0 { "waiting for the header…".to_owned() } else { format!("{done} of {total}") });
-        ui.end_row();
-        if live > 0 {
-            ui.label("Current track");
-            ui.label(format!("{} notes found so far", si(live as f64)));
-            ui.end_row();
-        }
-        ui.label("Notes");
-        ui.label(format!("{} ({}/s)", si(notes as f64), si(notes as f64 / secs_f)));
-        ui.end_row();
-    });
-}
-
 enum BenchMsg {
     Step(usize, String),
     Done(benchmark::Report),
@@ -1603,63 +1519,51 @@ struct AppState {
     clock: Arc<PlaybackClock>,
     last_telemetry: PlayerTelemetry,
     current_song: Option<VisualSong>,
+    /// The look last pushed to egui and the song; `None` forces a re-apply.
+    applied_look: Option<(theme::UiTheme, theme::NotePalette, Vec<[u8; 3]>)>,
     playback_time_us: u64,
     slider_override_us: Option<u64>,
     slider_grabbed: bool,
-    note_speed_seconds: f32,
+    /// Everything saved between runs (see `settings`).
+    cfg: Settings,
     /// MIDI outputs (choice, display name) and the selected one.
     outputs: Vec<(output::OutputChoice, String)>,
     output_idx: usize,
-    /// Max note-ons/s to the synth; `SYNTH_LIMIT_OFF` = no limit.
-    synth_limit: f64,
-    /// Smart note skipping (off = send every note, for synth stress tests).
-    skipping: bool,
     /// Playback speed multiplier.
     tempo: f64,
     log_stats: bool,
-    /// Full stats overlay (off = just the note count).
-    detailed_stats: bool,
-    /// Synth/player/SVMS lines in the detailed overlay.
-    synth_stats: bool,
-    /// Show the loading stats in a window while a file loads (they're always in the
-    /// progress bar's tooltip).
-    loading_details: bool,
-    /// Read every repeat of a track instead of trusting a pattern that checks out.
-    verify_repeats: bool,
     /// The benchmark window (see `benchmark`).
     benchmark: Option<BenchRun>,
-    /// Submit through SVMS's native batch API (SVMS only).
-    svms_batch: bool,
     loading: Option<Loading>,
     show_settings: bool,
-    /// Velocity precision used when loading (127 = exact, 1 = single velocity).
-    vel_levels: u8,
-    vsync_enabled: bool,
-    notes_upwards: bool,
-    flat_notes: bool,
+    settings_tab: SettingsTab,
+    settings_search: String,
     visible: VisibleNotes,
     /// Reused across frames; the GPU callback holds a clone until it renders.
     instances: Arc<gpu::InstanceRing>,
     /// Display refresh rate reported by the compositor (for the VSync label).
     refresh_rate_hz: Option<f32>,
-    vblank: vsync::VBlank,
+    /// The last load error, shown until dismissed or a new load starts.
     status_message: Option<String>,
     fps: f32,
     last_frame: Option<Instant>,
     #[allow(dead_code)]
     timer_guard: TimerGuard,
-    color_by_channel: bool,
-    /// Pick by channel or by track from the song (see `colors_by_channel`).
-    color_auto: bool,
-    /// Notes laid out like the keys (see `key_columns`) rather than an even grid.
-    piano_layout: bool,
-    collapse_overlaps: bool,
     updater: update::Updater,
-    max_instances: usize,
     frame_times: FrameTimes,
     frame_log: Option<FrameLog>,
     /// Where to seek once the file given on the command line has loaded.
     open_at_us: Option<u64>,
+    export: export_ui::ExportUi,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsTab {
+    Display,
+    Audio,
+    Loading,
+    Performance,
+    Benchmark,
 }
 
 impl eframe::App for AppState {
@@ -1673,13 +1577,17 @@ impl eframe::App for AppState {
             update::Outcome::Nothing => {}
         }
         self.updater.window(ctx);
-        if self.vsync_enabled {
-            let (rect, ppp) = ctx.input(|i| {
-                let v = i.viewport();
-                (v.outer_rect, v.native_pixels_per_point.unwrap_or(1.0))
-            });
-            let c = rect.map_or(Pos2::ZERO, |r| r.center());
-            self.vblank.wait((c.x * ppp) as i32, (c.y * ppp) as i32);
+        if self.cfg.fps_limit > 0 {
+            if let Some(prev) = self.last_frame {
+                let target = prev + std::time::Duration::from_secs_f64(1.0 / self.cfg.fps_limit as f64);
+                if let Some(left) = target.checked_duration_since(Instant::now()) {
+                    // Sleep is coarse; spin the last stretch.
+                    std::thread::sleep(left.saturating_sub(std::time::Duration::from_micros(1500)));
+                    while Instant::now() < target {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
         }
 
         let frame_start = Instant::now();
@@ -1731,6 +1639,27 @@ impl eframe::App for AppState {
             self.toggle_play(current_time_us);
         }
 
+        if !ctx.wants_keyboard_input() {
+            let (open, cancel, back, fwd) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::O),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                )
+            });
+            if open {
+                self.open_file();
+            }
+            if cancel {
+                self.cancel_loading();
+            }
+            if self.current_song.is_some() && (back || fwd) {
+                let target = if fwd { current_time_us.saturating_add(SEEK_STEP_US) } else { current_time_us.saturating_sub(SEEK_STEP_US) };
+                self.seek(target.min(duration_us));
+            }
+        }
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             // Wraps onto a second line instead of clipping when the window is narrow.
@@ -1740,16 +1669,16 @@ impl eframe::App for AppState {
                 wrap_for_slider(ui);
                 ui.label("Note speed");
                 ui.add(
-                    egui::Slider::new(&mut self.note_speed_seconds, 0.01..=12.0)
+                    egui::Slider::new(&mut self.cfg.note_speed, 0.01..=12.0)
                         .logarithmic(true)
                         .suffix(" s"),
                 )
                 .on_hover_text("Seconds a note takes to reach the keyboard");
                 ui.separator();
-                ui.toggle_value(&mut self.show_settings, "Settings");
+                ui.toggle_value(&mut self.show_settings, "Settings").on_hover_text("Ctrl+,");
                 self.updater.toolbar(ui);
             });
-            let mut cancel = false;
+            let (mut cancel, mut dismiss_error) = (false, false);
             if let Some(l) = &self.loading {
                 let done = l.progress.bytes.load(std::sync::atomic::Ordering::Relaxed) as f32;
                 let frac = (done / l.total.max(1) as f32).min(1.0);
@@ -1761,18 +1690,26 @@ impl eframe::App for AppState {
                             .text(format!("{:.0}% · {}", frac * 100.0, secs(l.started.elapsed().as_secs_f64()))),
                     )
                     .on_hover_ui(|ui| loading_details(ui, l));
-                    cancel = ui.button("Cancel").clicked();
+                    cancel = ui.button("Cancel").on_hover_text("Esc").clicked();
                 });
-                if self.loading_details {
+                if self.cfg.loading_details {
                     egui::Window::new("Loading").collapsible(false).resizable(false).show(ctx, |ui| loading_details(ui, l));
                 }
             }
             if cancel {
                 self.cancel_loading();
             }
+            if dismiss_error {
+                self.status_message = None;
+            }
             match (&self.status_message, &self.current_song) {
                 (Some(msg), _) => {
-                    ui.colored_label(Color32::from_rgb(255, 140, 0), msg);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::from_rgb(255, 110, 100), format!("⚠ {msg}"));
+                        if ui.small_button("Dismiss").clicked() {
+                            dismiss_error = true;
+                        }
+                    });
                 }
                 (None, Some(song)) => {
                     let name = std::path::Path::new(&song.data.path)
@@ -1807,7 +1744,8 @@ impl eframe::App for AppState {
                         has_song,
                         egui::Slider::new(&mut secs, 0.0..=duration_us as f64 / 1_000_000.0)
                             .show_value(false),
-                    );
+                    )
+                    .on_hover_text("Click or drag to seek · ←/→ ±5 s");
                     if response.changed() {
                         self.slider_override_us = Some((secs.max(0.0) * 1_000_000.0) as u64);
                         self.slider_grabbed = true;
@@ -1816,13 +1754,7 @@ impl eframe::App for AppState {
                     if self.slider_grabbed && !response.is_pointer_button_down_on() {
                         if let Some(target) = self.slider_override_us.take() {
                             let target = target.min(duration_us);
-                            let _ = self.cmd_tx.send(PlayerCommand::Seek(target));
-                            self.playback_time_us = target;
-                            if self.last_telemetry.is_playing {
-                                self.clock.set_running(target);
-                            } else {
-                                self.clock.set_paused(target);
-                            }
+                            self.seek(target);
                         }
                         self.slider_grabbed = false;
                     }
@@ -1834,8 +1766,19 @@ impl eframe::App for AppState {
             ui.add_space(4.0);
         });
 
-        self.visible.set_collapse(self.collapse_overlaps);
-        self.visible.set_max_instances(self.max_instances);
+        let look = (self.cfg.ui_theme, self.cfg.note_palette, self.cfg.custom_colors.clone());
+        if self.applied_look.as_ref() != Some(&look) {
+            if self.applied_look.as_ref().map(|l| l.0) != Some(look.0) {
+                look.0.apply(ctx);
+            }
+            if let Some(song) = &mut self.current_song {
+                song.set_palette(look.1, &look.2);
+                self.visible.instance_ring_id = u64::MAX; // drops the cached note colors
+            }
+            self.applied_look = Some(look);
+        }
+        self.visible.set_collapse(self.cfg.collapse_overlaps);
+        self.visible.set_max_instances(self.cfg.max_instances);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -1847,12 +1790,11 @@ impl eframe::App for AppState {
                     duration_us,
                     &self.last_telemetry,
                     self.fps,
-                    self.note_speed_seconds,
-                    self.notes_upwards,
-                    self.flat_notes,
-                    self.colors_by_channel(),
-                    self.piano_layout,
-                    (self.detailed_stats, self.synth_stats),
+                    self.cfg.note_speed,
+                    self.cfg.notes_rise,
+                    self.cfg.flat_notes,
+                    self.cfg.piano_layout,
+                    (self.cfg.stats, self.cfg.synth_stats),
                     &mut self.visible,
                     &mut self.instances,
                     &mut self.frame_times,
@@ -1860,6 +1802,7 @@ impl eframe::App for AppState {
             });
 
         self.settings_window(ctx);
+        self.export.window(ctx);
         self.benchmark_window(ctx);
 
         if let Some(log) = &mut self.frame_log {
@@ -1882,16 +1825,14 @@ impl AppState {
         self.visible = VisibleNotes::default();
     }
 
-    /// What to color notes by: the setting, or for Auto, channels when the file has few
-    /// tracks that use several channels between them (or one track), else tracks
-    /// (a file of many tracks, or tracks that are its parts on one channel).
-    fn colors_by_channel(&self) -> bool {
-        match (&self.current_song, self.color_auto) {
-            (Some(song), true) => {
-                let m = &song.data.midi;
-                m.note_tracks < 2 || (m.note_tracks <= 16 && m.channels_used.count_ones() >= 2)
-            }
-            _ => self.color_by_channel,
+    /// Jump to `target_us`, keeping the clock running or paused as it was.
+    fn seek(&mut self, target_us: u64) {
+        let _ = self.cmd_tx.send(PlayerCommand::Seek(target_us));
+        self.playback_time_us = target_us;
+        if self.last_telemetry.is_playing {
+            self.clock.set_running(target_us);
+        } else {
+            self.clock.set_paused(target_us);
         }
     }
 
@@ -1908,373 +1849,13 @@ impl AppState {
         }
     }
 
-    fn transport_controls(&mut self, ui: &mut egui::Ui, current_time_us: u64) {
-        if ui.button("Open MIDI…").clicked() {
-            self.open_file();
-        }
-
-        let has_song = self.current_song.is_some();
-        let label = if self.last_telemetry.is_playing { "⏸ Pause" } else { "▶ Play" };
-        if ui.add_enabled(has_song, egui::Button::new(label)).clicked() {
-            self.toggle_play(current_time_us);
-        }
-
-        if ui
-            .add_enabled(has_song, egui::Button::new("Unload"))
-            .on_hover_text("Close the song and free its memory")
-            .clicked()
-        {
-            self.slider_override_us = None;
-            self.slider_grabbed = false;
-            self.playback_time_us = 0;
-            self.last_telemetry.is_playing = false;
-            self.current_song = None;
-            self.reset_visible_indices();
-            self.clock.reset();
-            let _ = self.cmd_tx.send(PlayerCommand::Stop);
-        }
-
-        wrap_for_slider(ui);
-        ui.label("Tempo");
-        let tempo = ui
-            .add(
-                egui::Slider::new(&mut self.tempo, 0.1..=20.0)
-                    .logarithmic(true)
-                    .custom_formatter(|v, _| format!("{v:.2}×")),
-            )
-            .on_hover_text("Playback speed. Faster = more notes per second for the synth. Double-click to reset.");
-        if tempo.double_clicked() {
-            self.tempo = 1.0;
-        }
-        if tempo.changed() || tempo.double_clicked() {
-            self.clock.set_speed(self.tempo);
-        }
-    }
-
-    fn start_benchmark(&mut self, ctx: &egui::Context) {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let report = benchmark::run(benchmark::Scale::FULL, |i, name| {
-                let _ = tx.send(BenchMsg::Step(i, name.to_owned()));
-                ctx.request_repaint();
-            });
-            let _ = tx.send(BenchMsg::Done(report));
-            ctx.request_repaint();
-        });
-        self.benchmark = Some(BenchRun { rx, step: 0, name: String::new(), report: None, started: Instant::now() });
-    }
-
-    fn benchmark_window(&mut self, ctx: &egui::Context) {
-        let Some(b) = &mut self.benchmark else { return };
-        while let Ok(m) = b.rx.try_recv() {
-            match m {
-                BenchMsg::Step(i, name) => (b.step, b.name) = (i, name),
-                BenchMsg::Done(r) => b.report = Some(r),
-            }
-        }
-        let mut open = true;
-        egui::Window::new("Benchmark")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| match &b.report {
-                None => {
-                    ui.label(format!("Test {} of {}: {}", b.step + 1, benchmark::REFERENCE.len(), b.name));
-                    ui.label(secs(b.started.elapsed().as_secs_f64()));
-                    ui.add_space(6.0);
-                    ui.weak("Hands off the mouse. Every program left open costs points.");
-                    ctx.request_repaint_after(Duration::from_millis(250));
-                }
-                Some(r) => {
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new(format!("{:.0}", r.score)).size(64.0).strong());
-                        ui.label(format!("points · benchmark v{}", benchmark::VERSION));
-                    });
-                    ui.add_space(8.0);
-                    egui::Grid::new("benchmark_results").num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
-                        for t in &r.tests {
-                            ui.label(t.name);
-                            ui.label(format!("{:.2} {}", t.rate, t.unit));
-                            ui.label(format!("{:.0}", t.points));
-                            ui.end_row();
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.weak(format!("{} · {} threads · {:.0} GB RAM · {}", r.cpu, r.threads, r.ram_gb, secs(r.secs)));
-                    ui.add_space(4.0);
-                    ui.label(benchmark::nag(r));
-                    if ui.button("Copy to share").clicked() {
-                        ctx.copy_text(r.line());
-                    }
-                }
-            });
-        if !open {
-            self.benchmark = None;
-        }
-    }
-
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        let mut start_benchmark = false;
-        let mut open = self.show_settings;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            // Top right, clear of the stats overlay (still draggable).
-            .pivot(egui::Align2::RIGHT_TOP)
-            .default_pos(ctx.screen_rect().right_top() + Vec2::new(-12.0, 64.0))
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.heading("Display");
-                egui::Grid::new("display").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                    ui.label("Notes");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.notes_upwards, false, "Fall");
-                        ui.selectable_value(&mut self.notes_upwards, true, "Rise");
-                    });
-                    ui.end_row();
-
-                    ui.label("Layout");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.piano_layout, false, "Even").on_hover_text(
-                            "Every key the same width",
-                        );
-                        ui.selectable_value(&mut self.piano_layout, true, "Piano").on_hover_text(
-                            "Like the keys: sharps narrower, drawn over the naturals",
-                        );
-                    });
-                    ui.end_row();
-
-                    ui.label("Instance limit");
-                    ui.add(egui::DragValue::new(&mut self.max_instances).range(0..=10_000_000).speed(1024))
-                        .on_hover_text("0 disables the limit. Drops oldest sounding notes first; protects sharps in piano layout.");
-                    ui.end_row();
-
-                    ui.label("Overlaps");
-                    ui.checkbox(&mut self.collapse_overlaps, "Hide covered notes")
-                        .on_hover_text("Keeps only what is visible on each key: the newest note on top, an older one showing again when it ends, hidden notes dropped. Borders only mark real starts and ends. Off draws every original note.");
-                    ui.end_row();
-
-                    ui.label("Shading");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.flat_notes, false, "Shaded");
-                        ui.selectable_value(&mut self.flat_notes, true, "Flat");
-                    });
-                    ui.end_row();
-
-                    ui.label("Colors");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.color_auto, true, "Auto").on_hover_text(
-                            "By channel if a few tracks use several channels, else by track",
-                        );
-                        if ui.selectable_label(!self.color_auto && self.color_by_channel, "By channel").clicked() {
-                            (self.color_auto, self.color_by_channel) = (false, true);
-                        }
-                        if ui.selectable_label(!self.color_auto && !self.color_by_channel, "By track").clicked() {
-                            (self.color_auto, self.color_by_channel) = (false, false);
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("VSync");
-                    let vsync_label = match self.refresh_rate_hz {
-                        Some(hz) => format!("Sync to display ({hz:.0} Hz)"),
-                        None => "Sync to display".to_owned(),
-                    };
-                    ui.checkbox(&mut self.vsync_enabled, vsync_label);
-                    ui.end_row();
-                });
-
-                ui.add_space(8.0);
-                ui.heading("Audio");
-                egui::Grid::new("audio").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                    ui.label("Output");
-                    let selected =
-                        self.outputs.get(self.output_idx).map_or("No MIDI output", |o| o.1.as_str());
-                    let mut picked = None;
-                    egui::ComboBox::from_id_salt("output")
-                        .selected_text(selected)
-                        .show_ui(ui, |ui| {
-                            for (i, (_, name)) in self.outputs.iter().enumerate() {
-                                if ui.selectable_label(i == self.output_idx, name).clicked() {
-                                    picked = Some(i);
-                                }
-                            }
-                        });
-                    if let Some(i) = picked.filter(|&i| i != self.output_idx) {
-                        self.output_idx = i;
-                        let _ = self.cmd_tx.send(PlayerCommand::SetOutput(self.outputs[i].0.clone()));
-                    }
-                    ui.end_row();
-
-                    ui.label("Skip notes");
-                    if ui
-                        .checkbox(&mut self.skipping, "When the synth falls behind")
-                        .on_hover_text(
-                            "Merge rapid re-strikes so playback stays in time when the synth \
-                             can't keep up. Turn off to stress-test a synth: every note is sent, \
-                             and Lag shows how far behind it falls.",
-                        )
-                        .changed()
-                    {
-                        let _ = self.cmd_tx.send(PlayerCommand::SetSkipping(self.skipping));
-                    }
-                    ui.end_row();
-
-                    ui.label("Synth limit");
-                    let response = ui
-                        .add(
-                            egui::Slider::new(&mut self.synth_limit, 1_000.0..=SYNTH_LIMIT_OFF)
-                                .logarithmic(true)
-                                .custom_formatter(|v, _| match v {
-                                    v if v >= SYNTH_LIMIT_OFF => "off".to_owned(),
-                                    v if v >= 1e6 => format!("{:.1}M notes/s", v / 1e6),
-                                    v => format!("{:.0}k notes/s", v / 1e3),
-                                }),
-                        )
-                        .on_hover_text(
-                            "Max notes per second sent to the synth. Beyond it, rapid re-strikes \
-                             of the same key are merged into the note already sounding.",
-                        );
-                    if response.changed() {
-                        let limit =
-                            if self.synth_limit >= SYNTH_LIMIT_OFF { 0 } else { self.synth_limit as u32 };
-                        let _ = self.cmd_tx.send(PlayerCommand::SetSynthLimit(limit));
-                    }
-                    ui.end_row();
-
-                    ui.label("SVMS submit");
-                    if ui
-                        .checkbox(&mut self.svms_batch, "Batch API")
-                        .on_hover_text(
-                            "SuperVirtualMIDISynth only: send each tick's messages in one \
-                             send_short_batch call instead of one SendDirectData per message. \
-                             Compare ns/msg with it on and off.",
-                        )
-                        .changed()
-                    {
-                        let _ = self.cmd_tx.send(PlayerCommand::SetSvmsBatch(self.svms_batch));
-                    }
-                    ui.end_row();
-
-                    ui.label("Stats overlay");
-                    ui.checkbox(&mut self.detailed_stats, "Detailed (otherwise note count only)");
-                    ui.end_row();
-
-                    ui.label("");
-                    ui.add_enabled(
-                        self.detailed_stats,
-                        egui::Checkbox::new(&mut self.synth_stats, "Synth / player / SVMS timing"),
-                    );
-                    ui.end_row();
-
-                    ui.label("Stats log");
-                    if ui
-                        .checkbox(&mut self.log_stats, "Write per-second stats to CSV")
-                        .on_hover_text(
-                            "msg/s, ns/msg, busy %, worst batch, lag, NPS, polyphony… one row per \
-                             second, in a `stats` folder next to the player. With SVMS, every \
-                             audio callback also goes to a matching _svms.csv.",
-                        )
-                        .changed()
-                    {
-                        let _ = self.cmd_tx.send(PlayerCommand::SetStatsLog(self.log_stats));
-                    }
-                    ui.end_row();
-                    if let Some(path) = &self.last_telemetry.log_path {
-                        ui.label("");
-                        ui.weak(path);
-                        ui.end_row();
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.heading("Loading");
-                egui::Grid::new("loading").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                    ui.label("Velocity");
-                    ui.add(egui::Slider::new(&mut self.vel_levels, 1..=127).custom_formatter(|v, _| {
-                        match v as u8 {
-                            127 => "exact".to_owned(),
-                            1 => "single".to_owned(),
-                            n => format!("{n} levels"),
-                        }
-                    }))
-                    .on_hover_text(
-                        "Velocity precision for files opened from now on. Fewer levels means \
-                         more notes repeat their track's velocity, which packs them smaller in \
-                         memory. Exact keeps every velocity; single plays every note at full \
-                         velocity.",
-                    );
-                    ui.end_row();
-                    ui.label("Repeats");
-                    ui.checkbox(&mut self.verify_repeats, "Read every repeated track")
-                        .on_hover_text(
-                            "A file of one track repeated thousands of times (in xz) is loaded by reading \
-                             a few copies and counting the rest, if the sizes add up to whole copies. \
-                             Tick this to read every copy instead: exact, but a huge file can take hours.",
-                        );
-                    ui.end_row();
-                    ui.label("Details");
-                    ui.checkbox(&mut self.loading_details, "Show a stats window while loading")
-                        .on_hover_text("Hovering the progress bar shows the same stats.");
-                    ui.end_row();
-                });
-                ui.add_space(8.0);
-                ui.heading("Updates");
-                egui::Grid::new("updates").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| self.updater.settings(ui));
-                ui.add_space(8.0);
-                ui.heading("Benchmark");
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(self.benchmark.is_none(), |ui| {
-                        if ui.button("Run (~1.5 min)").clicked() {
-                            start_benchmark = true;
-                        }
-                    });
-                })
-                .response
-                .on_hover_text(
-                    "Times loading and playback code on made-up data and scores it. Close other \
-                     programs first, and pause playback.",
-                );
-            });
-        if start_benchmark {
-            self.start_benchmark(ctx);
-        }
-        if self.show_settings && !open {
-            self.save_settings();
-        }
-        self.show_settings = open;
-    }
-
-    /// Remember settings between runs (see `load_settings`).
+    /// Remember settings between runs.
     fn save_settings(&self) {
-        let output = self.outputs.get(self.output_idx).map_or("", |o| o.1.as_str());
-        let mut text = format!(
-            "note_speed={}\nnotes_rise={}\nflat_notes={}\ncolor_by_channel={}\ncolor_auto={}\npiano_layout={}\nvsync={}\n\
-             output={output}\nskip_notes={}\nsynth_limit={}\nvelocity_levels={}\nsvms_batch={}\ndetailed_stats={}\nsynth_stats={}\nloading_details={}\nverify_repeats={}\n",
-            self.note_speed_seconds,
-            self.notes_upwards,
-            self.flat_notes,
-            self.color_by_channel,
-            self.color_auto,
-            self.piano_layout,
-            self.vsync_enabled,
-            self.skipping,
-            self.synth_limit,
-            self.vel_levels,
-            self.svms_batch,
-            self.detailed_stats,
-            self.synth_stats,
-            self.loading_details,
-            self.verify_repeats,
-        );
-        if let Some(path) = settings_path() {
-            text.push_str(&format!("max_instances={}\n", self.max_instances));
-        text.push_str(&format!("collapse_overlaps={}\n", self.collapse_overlaps));
-        text.push_str(&format!("check_updates={}\nlast_update_check={}\n", self.updater.enabled, self.updater.last_check));
-        let _ = std::fs::write(path, text);
-        }
+        let mut cfg = self.cfg.clone();
+        cfg.output = self.outputs.get(self.output_idx).map_or_else(String::new, |o| o.1.clone());
+        cfg.check_updates = self.updater.enabled;
+        cfg.last_update_check = self.updater.last_check;
+        cfg.save();
     }
 
     fn open_file(&mut self) {
@@ -2306,9 +1887,9 @@ impl AppState {
         let total = std::fs::metadata(&path).map_or(1, |m| m.len());
         self.cancel_loading();
         let progress = Arc::new(parser::Progress::default());
-        progress.verify_all.store(self.verify_repeats, std::sync::atomic::Ordering::Relaxed);
+        progress.verify_all.store(self.cfg.verify_repeats, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let (vel_levels, p) = (self.vel_levels, progress.clone());
+        let (vel_levels, p) = (self.cfg.velocity_levels, progress.clone());
         std::thread::spawn(move || {
             let _ = tx.send(SongData::load(&path, vel_levels, &p).map_err(|e| e.to_string()));
         });
@@ -2329,7 +1910,7 @@ impl AppState {
             Err(crossbeam_channel::TryRecvError::Empty) => return,
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err("loader thread died".into()),
         };
-        self.loading = None;
+        let name = self.loading.take().map(|l| l.name).unwrap_or_default();
         match result {
             Ok(song) => {
                 let duration = song.tempo.duration_us();
@@ -2345,6 +1926,7 @@ impl AppState {
                 self.last_telemetry.playback_time_us = 0;
                 self.last_telemetry.is_playing = true;
                 self.current_song = Some(VisualSong::new(song));
+                self.applied_look = None;
                 self.playback_time_us = 0;
                 self.slider_override_us = None;
                 self.slider_grabbed = false;
@@ -2352,558 +1934,13 @@ impl AppState {
                 self.reset_visible_indices();
             }
             Err(e) => {
-                self.status_message = Some(format!("Failed to load MIDI: {}", e));
+                self.status_message = Some(format!("Couldn't open {name}: {e}"));
             }
         }
     }
 }
 
 
-fn draw_piano_roll(
-    ui: &mut egui::Ui,
-    frame: &eframe::Frame,
-    song: Option<&VisualSong>,
-    now_us: u64,
-    duration_us: u64,
-    telemetry: &PlayerTelemetry,
-    fps: f32,
-    note_speed_seconds: f32,
-    notes_upwards: bool,
-    flat_notes: bool,
-    color_by_channel: bool,
-    piano_layout: bool,
-    (detailed_stats, synth_stats): (bool, bool),
-    visible: &mut VisibleNotes,
-    instances: &mut Arc<gpu::InstanceRing>,
-    times: &mut FrameTimes,
-) {
-    let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
-    let rect = response.rect;
-
-    let keyboard_height = (rect.height() * 0.12).clamp(36.0, 120.0);
-    let note_area = Rect::from_min_max(
-        Pos2::new(rect.left(), rect.top()),
-        Pos2::new(rect.right(), rect.bottom() - keyboard_height),
-    );
-    let keyboard_rect = Rect::from_min_max(
-        Pos2::new(rect.left(), rect.bottom() - keyboard_height),
-        Pos2::new(rect.right(), rect.bottom()),
-    );
-
-    painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(10, 10, 12));
-    painter.rect_filled(note_area, CornerRadius::ZERO, Color32::from_rgb(20, 20, 24));
-    painter.rect_filled(
-        keyboard_rect,
-        CornerRadius::ZERO,
-        Color32::from_rgb(235, 235, 240),
-    );
-
-    let speed = note_speed_seconds.clamp(0.01, 15.0);
-    let future_us = (speed * 1_000_000.0).max(1.0) as u64;
-    let window_end = now_us
-        .saturating_add(future_us)
-        .min(duration_us.max(now_us));
-
-    let (pitch_min, pitch_max) = if let Some(song) = song {
-        (song.pitch_min, song.pitch_max)
-    } else {
-        (DEFAULT_PITCH_MIN, DEFAULT_PITCH_MAX)
-    };
-
-    let pitch_span_i = (pitch_max as i32 - pitch_min as i32 + 1).max(1);
-
-    let mut active_keys = [false; 128];
-    let mut active_colors = [Color32::TRANSPARENT; 128];
-    let mut gpu_key_positions = [gpu::KeyPosition {
-        left: 0.0,
-        right: 0.0,
-        _pad0: 0.0,
-        _pad1: 0.0,
-    }; 256];
-
-    let columns = key_columns(piano_layout, pitch_min, pitch_max);
-    if pitch_span_i > 0 {
-        for pitch in pitch_min..=pitch_max {
-            let (left, right) = columns[pitch as usize];
-            gpu_key_positions[pitch as usize] = gpu::KeyPosition {
-                left,
-                right,
-                _pad0: 0.0,
-                _pad1: 0.0,
-            };
-        }
-    }
-
-    painter.line_segment(
-        [
-            Pos2::new(note_area.left(), note_area.bottom()),
-            Pos2::new(note_area.right(), note_area.bottom()),
-        ],
-        Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210)),
-    );
-
-    if let Some(song) = song {
-        let px_us = future_us as f32 / (note_area.height() * ui.ctx().pixels_per_point()).max(1.0);
-        visible.advance(&song.data, now_us, window_end, px_us as u64);
-        times.advance = visible.timing;
-        times.decoded = visible.last_batch;
-        let t0 = Instant::now();
-
-        (active_keys, active_colors) = build_note_instances(
-            song, visible, now_us, window_end, speed,
-            ((note_area.bottom() * ui.ctx().pixels_per_point()).round()
-                - (note_area.top() * ui.ctx().pixels_per_point()).round()).max(1.0) as u32,
-            color_by_channel, piano_layout, instances,
-        );
-
-        times.build = t0.elapsed();
-        times.instances = instances.len();
-        if let Some(state) = frame.wgpu_render_state() {
-            if !instances.is_empty() {
-                painter.add(gpu::NotesCallback::new(
-                    note_area,
-                    state.target_format,
-                    instances.clone(),
-                    gpu_key_positions,
-                    speed,
-                    now_us,
-                    if notes_upwards { 1.0 } else { -1.0 },
-                    flat_notes,
-                ));
-            }
-        }
-    } else {
-        painter.text(
-            note_area.center(),
-            Align2::CENTER_CENTER,
-            "Load a MIDI file to start playback",
-            egui::FontId::proportional(18.0),
-            Color32::from_rgb(190, 190, 200),
-        );
-    }
-
-    draw_keyboard(
-        &painter,
-        keyboard_rect,
-        pitch_min,
-        pitch_max,
-        piano_layout.then_some(&columns),
-        &active_keys,
-        &active_colors,
-    );
-
-    let mut stats_text = if detailed_stats {
-        format!(
-            "Time: {}/{}
-Notes: {}
-NPS: {}
-Skipped: {}/s
-Poly: {} (max {})
-FPS: {:>4.1}",
-            format_timestamp(now_us.min(duration_us)),
-            format_timestamp(duration_us),
-            telemetry.notes_played,
-            telemetry.nps,
-            telemetry.skipped_nps,
-            telemetry.polyphony,
-            telemetry.peak_polyphony,
-            fps,
-        )
-    } else {
-        format!("Notes: {}", telemetry.notes_played)
-    };
-    if detailed_stats && synth_stats {
-        stats_text += &format!(
-            "
-
-Synth:  {} msg/s, {:.0} ns/msg ({})
-        busy {:.0}%, worst batch {} us
-             Player: busy {:.0}%, {} ticks/s
-Lag:    {:.1} ms",
-            si(telemetry.stats.msgs_per_sec as f64),
-            telemetry.stats.synth_ns_per_msg,
-            if telemetry.stats.batched { "batch call" } else { "per message" },
-            telemetry.stats.synth_busy * 100.0,
-            telemetry.stats.worst_batch_us,
-            telemetry.stats.sched_busy * 100.0,
-            si(telemetry.stats.ticks_per_sec as f64),
-            telemetry.lag_us as f64 / 1000.0,
-        );
-        if let Some(s) = &telemetry.svms {
-            stats_text += &svms_text(s);
-        }
-    }
-    let font_id = egui::FontId::monospace(14.0);
-    let (stats_galley, stats_size) = ui.ctx().fonts(|fonts| {
-        let galley = fonts.layout_no_wrap(
-            stats_text.clone(),
-            font_id.clone(),
-            Color32::from_rgb(225, 225, 230),
-        );
-        (galley.clone(), galley.size())
-    });
-    let stats_bg = Rect::from_min_size(
-        note_area.left_top() + Vec2::new(6.0, 6.0),
-        stats_size + Vec2::new(12.0, 12.0),
-    );
-    painter.rect_filled(
-        stats_bg,
-        CornerRadius::same(6),
-        Color32::from_rgba_unmultiplied(12, 12, 16, 210),
-    );
-    painter.galley(
-        stats_bg.min + Vec2::new(6.0, 6.0),
-        stats_galley,
-        Color32::from_rgb(50, 50, 70),
-    );
-}
-
-/// Each key's column across the notes area, as (left, right) fractions of its width.
-/// Even: one equal column per semitone. Piano: as in Piano From Above, white keys all
-/// the same width, sharps narrower and centred on the line between their neighbours
-/// (C#, F# nudged left and D#, A# right, as on a real keyboard), so a sharp's column
-/// overlaps the naturals beside it.
-fn key_columns(piano: bool, pitch_min: u8, pitch_max: u8) -> [(f32, f32); 128] {
-    const SHARP: f32 = 0.65; // a sharp's width as a fraction of a white key's
-    let mut out = [(0.0, 0.0); 128];
-    if pitch_min > pitch_max {
-        return out;
-    }
-    if !piano {
-        let span = (pitch_max - pitch_min + 1) as f32;
-        for p in pitch_min..=pitch_max {
-            let i = (p - pitch_min) as f32;
-            out[p as usize] = (i / span, (i + 1.0) / span);
-        }
-        return out;
-    }
-    let whites_below = |p: u8| (0..p).filter(|&q| !is_black_key(q)).count() as f32;
-    let first_sharp = is_black_key(pitch_min);
-    // Room for half a sharp past each end if that end is a sharp.
-    let buffer = (first_sharp as u8 + is_black_key(pitch_max) as u8) as f32 * SHARP / 2.0;
-    let whites = whites_below(pitch_max + 1) - whites_below(pitch_min);
-    let white_cx = 1.0 / (whites + buffer);
-    for p in pitch_min..=pitch_max {
-        let index = whites_below(p) - whites_below(pitch_min);
-        let (offset, width) = if is_black_key(p) {
-            let nudge = match p % 12 {
-                1 | 6 => -SHARP / 5.0,
-                3 | 10 => SHARP / 5.0,
-                _ => 0.0,
-            };
-            ((first_sharp as u8 as f32 - 1.0) * SHARP / 2.0 + nudge, SHARP)
-        } else {
-            (first_sharp as u8 as f32 * SHARP / 2.0, 1.0)
-        };
-        let left = white_cx * (index + offset);
-        out[p as usize] = (left, left + white_cx * width);
-    }
-    out
-}
-
-fn draw_keyboard(
-    painter: &egui::Painter,
-    rect: Rect,
-    pitch_min: u8,
-    pitch_max: u8,
-    // Where the notes' columns are, when they follow the keys (see `key_columns`);
-    // otherwise the notes are on an even grid and the keys are laid out on their own.
-    columns: Option<&[(f32, f32); 128]>,
-    active_keys: &[bool; 128],
-    active_colors: &[Color32; 128],
-) {
-    if pitch_min > pitch_max {
-        return;
-    }
-
-    let white_idle = Color32::from_rgb(245, 245, 250);
-    let white_active = Color32::from_rgb(255, 220, 140);
-    let black_idle = Color32::from_rgb(25, 25, 30);
-    let black_active = Color32::from_rgb(255, 160, 100);
-
-    // --- Strategy: Calculate layout based on white keys.
-    // We ignore the passed `_key_width` as it's based on a semitone-grid
-    // for the piano roll, not a realistic keyboard layout.
-
-    // White-key index per pitch (None for black keys and out-of-range pitches).
-    let mut white_key_positions = [None::<u32>; 128];
-    let mut white_key_count = 0;
-
-    // 1. Find all white keys in range and count them.
-    for pitch in pitch_min..=pitch_max {
-        if !is_black_key(pitch) {
-            white_key_positions[pitch as usize] = Some(white_key_count);
-            white_key_count += 1;
-        }
-    }
-
-    if white_key_count == 0 {
-        return; // No white keys in range, nothing to draw.
-    }
-
-    let white_key_width = rect.width() / white_key_count as f32;
-    let black_key_width = white_key_width * 0.7; // 70% of a white key's width
-    let black_key_height = rect.height() * 0.65; // 65% of the keyboard height, for overlap
-
-    // --- Draw white keys first (bottom layer)
-    for (idx, index) in white_key_positions
-        .iter()
-        .enumerate()
-        .filter_map(|(p, i)| Some((p, (*i)?)))
-    {
-        let (left, right) = match columns {
-            Some(c) => (rect.left() + c[idx].0 * rect.width(), rect.left() + c[idx].1 * rect.width()),
-            None => {
-                let left = rect.left() + (index as f32 * white_key_width);
-                (left, left + white_key_width)
-            }
-        };
-        let key_rect =
-            Rect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom()));
-
-        let color = if active_keys[idx] {
-            let channel_color = active_colors[idx]; // This is now a channel color
-            if channel_color == Color32::TRANSPARENT {
-                white_active
-            } else {
-                channel_color
-            }
-        } else {
-            white_idle
-        };
-
-        painter.rect_filled(key_rect, CornerRadius::same(1), color);
-        painter.rect_stroke(
-            key_rect,
-            CornerRadius::same(2),
-            Stroke::new(1.0_f32, Color32::from_rgb(150, 150, 160)),
-            StrokeKind::Inside,
-        );
-    }
-
-    // --- Draw black keys on top layer
-    for pitch in pitch_min..=pitch_max {
-        if is_black_key(pitch) {
-            // Find the white key *before* this black key.
-            let prev_white_key_pitch = pitch.saturating_sub(1);
-
-            // Check if the previous white key is in our visible range (when the notes
-            // follow the keys, a black key at the edge is drawn too).
-            if columns.is_some() || white_key_positions[prev_white_key_pitch as usize].is_some() {
-                let (left, right) = match columns {
-                    Some(c) => (rect.left() + c[pitch as usize].0 * rect.width(), rect.left() + c[pitch as usize].1 * rect.width()),
-                    None => {
-                        // Center the black key on the dividing line between the two white keys
-                        let prev_index = white_key_positions[prev_white_key_pitch as usize].unwrap_or(0);
-                        let center_x = rect.left() + (prev_index as f32 + 1.0) * white_key_width;
-                        let left = center_x - (black_key_width / 2.0);
-                        (left, left + black_key_width)
-                    }
-                };
-
-                let key_rect = Rect::from_min_max(
-                    Pos2::new(left, rect.top()),
-                    Pos2::new(right, rect.top() + black_key_height),
-                );
-
-                let idx = pitch as usize;
-                let color = if active_keys[idx] {
-                    let channel_color = active_colors[idx]; // This is now a channel color
-                    if channel_color == Color32::TRANSPARENT {
-                        black_active
-                    } else {
-                        channel_color
-                    }
-                } else {
-                    black_idle
-                };
-
-                painter.rect_filled(key_rect, CornerRadius::same(1), color);
-                // Add a border to black keys
-                painter.rect_stroke(
-                    key_rect,
-                    CornerRadius::same(1),
-                    Stroke::new(1.0_f32, Color32::from_rgb(80, 80, 80)),
-                    StrokeKind::Inside,
-                );
-            }
-        }
-    }
-}
-
-fn is_black_key(pitch: u8) -> bool {
-    matches!(pitch % 12, 1 | 3 | 6 | 8 | 10)
-}
-
-/// `settings.txt` next to the player: `key=value` lines.
-fn settings_path() -> Option<std::path::PathBuf> {
-    Some(std::env::current_exe().ok()?.parent()?.join("settings.txt"))
-}
-
-fn load_settings() -> HashMap<String, String> {
-    let text = settings_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    text.lines()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-        .collect()
-}
-
-fn setting<T: std::str::FromStr>(saved: &HashMap<String, String>, key: &str) -> Option<T> {
-    saved.get(key)?.parse().ok()
-}
-
-/// In a wrapping row, start a new line if a label + slider won't fit (egui doesn't
-/// wrap a slider as one unit, so it would get clipped at the window edge).
-fn wrap_for_slider(ui: &mut egui::Ui) {
-    let needed = ui.spacing().slider_width + 180.0;
-    if ui.available_size_before_wrap().x < needed {
-        ui.end_row();
-    }
-}
-
-/// One-line load summary plus a per-phase breakdown (for the hover).
-fn load_info(song: &SongData) -> (String, String) {
-    let m = &song.midi;
-    let notes = m.note_count as f64;
-    let parse = m.parse_time.as_secs_f64().max(1e-9);
-    let total = song.load_time.as_secs_f64();
-    let packed = m.packed_bytes() as f64;
-    let summary = format!(
-        "{} notes · loaded in {} ({} notes/s) · {} packed ({:.2} B/note)",
-        si(notes),
-        secs(total),
-        si(notes / parse),
-        bytes(packed),
-        packed / notes.max(1.0),
-    );
-    let file = match &m.source {
-        Some((format, size)) => format!(
-            "{} (unpacked from a {} {format})",
-            bytes(m.file_bytes as f64),
-            bytes(*size as f64)
-        ),
-        None => bytes(m.file_bytes as f64),
-    };
-    let parse_label = if m.source.is_some() { "Decompress, parse & pack" } else { "Parse & pack" };
-    let st = &m.pack_stats;
-    let pct = |n: u64| 100.0 * n as f64 / st.notes.max(1) as f64;
-    let details = format!(
-        "Tracks: {}{}\nFile: {file}\n\nTotal load: {}\n  {parse_label}: {} ({} notes/s, {}/s)\n  \
-         Open, index & tempo map: {}\n\nPacked: {} ({:.2} B/note, {:.2}:1 vs file)\n  \
-         repeats stored once: {} before, {:.1}x smaller ({} distinct chunks)\n\n\
-         Note encoding (a note is 2 bytes unless it needs extras):\n  \
-         2-byte notes: {:.1}%\n  new velocity: {:.1}% (+1 byte)\n  \
-         new duration: {:.1}% (+{:.2} bytes avg)\n  long delta: {:.1}% (+1 byte or more)\n  \
-         status byte: {:.1}% (+1 byte)\n  other events: {}",
-        m.source_tracks,
-        if m.tracks.len() == m.source_tracks {
-            String::new()
-        } else {
-            format!(" (packed as {}: big ones are split by channel)", m.tracks.len())
-        },
-        secs(total),
-        secs(parse),
-        si(notes / parse),
-        bytes(m.file_bytes as f64 / parse),
-        secs((total - parse).max(0.0)),
-        bytes(packed),
-        packed / notes.max(1.0),
-        packed / (m.file_bytes as f64).max(1.0),
-        bytes(m.logical_bytes as f64),
-        m.logical_bytes as f64 / packed.max(1.0),
-        si(m.chunks.len() as f64),
-        pct(st.two_byte),
-        pct(st.new_velocity),
-        pct(st.new_duration),
-        st.duration_bytes as f64 / st.new_duration.max(1) as f64,
-        pct(st.long_delta),
-        pct(st.status_byte),
-        bytes(st.other_bytes as f64),
-    );
-    (summary, details)
-}
-
-/// 1234567 -> "1.23M"
-fn si(v: f64) -> String {
-    match v {
-        v if v >= 1e12 => format!("{:.2}T", v / 1e12),
-        v if v >= 1e9 => format!("{:.2}B", v / 1e9),
-        v if v >= 1e6 => format!("{:.2}M", v / 1e6),
-        v if v >= 1e3 => format!("{:.1}K", v / 1e3),
-        v => format!("{v:.0}"),
-    }
-}
-
-fn bytes(v: f64) -> String {
-    match v {
-        v if v >= 1e12 => format!("{:.2} TB", v / 1e12),
-        v if v >= 1e9 => format!("{:.2} GB", v / 1e9),
-        v if v >= 1e6 => format!("{:.1} MB", v / 1e6),
-        v if v >= 1e3 => format!("{:.1} KB", v / 1e3),
-        v => format!("{v:.0} B"),
-    }
-}
-
-fn secs(s: f64) -> String {
-    if s >= 1.0 {
-        format!("{s:.2} s")
-    } else {
-        format!("{:.1} ms", s * 1e3)
-    }
-}
-
-/// The SVMS section of the stats overlay: the synth's own view of the last second.
-fn svms_text(s: &svms::Stats) -> String {
-    let lost = if s.lost > 0 { format!(", {} records lost", s.lost) } else { String::new() };
-    format!(
-        "\n\nSVMS:   load {:.0}% avg, {:.0}% max @ {}\n        {} over budget, p99 {:.0}%, \
-         {} frames @ {} Hz\n        sched {:.1}% · render {:.1}% · post {:.1}% · path {}\n\
-         \x20       events {}/s, late {}/s (max {:.1} ms)\n        skipped {:.0} ms\n\
-         \x20       voices {}/{} (peak {}, releasing {})\n        note-ons {}/s, steals {}/s\n\
-         \x20       backlog {} sched, {} ingress, {} compiled\n        submit blocked {:.1} ms/s{lost}",
-        s.load_avg,
-        s.load_max,
-        format_timestamp(s.worst_at_us),
-        s.over_budget,
-        s.p99,
-        s.buffer_frames,
-        s.sample_rate,
-        s.schedule_pct,
-        s.render_pct,
-        s.post_pct,
-        svms::paths(s.paths),
-        si(s.events_per_s),
-        si(s.late_per_s),
-        s.max_late_ms,
-        s.skipped_ms,
-        si(s.active_voices as f64),
-        si(s.max_voices as f64),
-        si(s.peak_voices as f64),
-        si(s.releasing_voices as f64),
-        si(s.note_ons_per_s),
-        si(s.steals_per_s),
-        si(s.scheduled_backlog as f64),
-        si(s.ingress_backlog as f64),
-        si(s.compiled_backlog as f64),
-        s.blocked_ms_per_s,
-    )
-}
-
-fn format_timestamp(us: u64) -> String {
-    let total_ms = us / 1_000;
-    let millis = total_ms % 1_000;
-    let total_seconds = total_ms / 1_000;
-    let seconds = total_seconds % 60;
-    let minutes = (total_seconds / 60) % 60;
-    let hours = total_seconds / 3_600;
-    if hours > 0 {
-        format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
-    } else {
-        format!("{minutes:02}:{seconds:02}.{millis:03}")
-    }
-}
 
 fn generate_palette(count: usize) -> Vec<Color32> {
     const BASE_COLORS: &[Color32] = &[
@@ -2943,12 +1980,10 @@ fn build_note_instances(
     window_end: u64,
     height_time: f32,
     height_px: u32,
-    color_by_channel: bool,
     piano_layout: bool,
     instances: &mut Arc<gpu::InstanceRing>,
 ) -> ([bool; 128], [Color32; 128]) {
-    if visible.instance_ring_id != instances.id()
-        || visible.instance_style.is_some_and(|style| style.0 != color_by_channel) {
+    if visible.instance_ring_id != instances.id() {
         *instances = Arc::new(gpu::InstanceRing::default());
         visible.instance_ring_id = instances.id();
         visible.retired_slots.clear();
@@ -2965,7 +2000,7 @@ fn build_note_instances(
     let mut active_keys = [false; 128];
     let mut active_colors = [Color32::TRANSPARENT; 128];
     let dense = visible.dense(height_time, height_px);
-    let style = (color_by_channel, piano_layout, dense);
+    let style = (piano_layout, dense);
     if !dense {
         // Sparse windows are cheaper to visit directly than to query every row.
         let write = visible.instance_dirty || visible.instance_style != Some(style) || visible.instance_revision != visible.revision
@@ -2981,7 +2016,7 @@ fn build_note_instances(
                 .map(|(i, _)| i).collect();
             for i in indices {
                 let note = visible.window[i];
-                let color = song.color_for(&note, color_by_channel);
+                let color = song.color_for(&note);
                 if note.start_us <= now_us && note.end_us > now_us && !active_keys[note.pitch as usize] {
                     active_keys[note.pitch as usize] = true;
                     active_colors[note.pitch as usize] = color;
@@ -2997,7 +2032,7 @@ fn build_note_instances(
             for note in visible.window.iter().rev() {
                 if note.start_us <= now_us && note.end_us > now_us && !active_keys[note.pitch as usize] {
                     active_keys[note.pitch as usize] = true;
-                    active_colors[note.pitch as usize] = song.color_for(note, color_by_channel);
+                    active_colors[note.pitch as usize] = song.color_for(note);
                 }
             }
         }
@@ -3018,7 +2053,7 @@ fn build_note_instances(
             let Some(note) = visible.window.get(key.indices[p]) else { before = p; continue; };
             if note.end_us > now_us {
                 active_keys[pitch] = true;
-                active_colors[pitch] = song.color_for(note, color_by_channel);
+                active_colors[pitch] = song.color_for(note);
                 break;
             }
             before = p;
@@ -3041,7 +2076,7 @@ fn build_note_instances(
             }
             visible.release_slot(slot);
             let note = visible.window[i];
-            let color = song.color_for(&note, color_by_channel);
+            let color = song.color_for(&note);
             visible.cache_instance(i, buf, gpu::NoteInstance::new(&note, color, visible.whole_us(&note)), note.end_us + NOTE_HOLD_MICROS);
         }
         buf.finish();
@@ -3171,16 +2206,16 @@ mod tests {
     /// geometry, minimum length and border shading. Input is back to front.
     fn raster(
         song: &VisualSong, notes: &[NoteSegment], now: u64, speed: f32,
-        height: u32, by_channel: bool, piano: bool, flat: bool, upwards: bool,
+        height: u32, piano: bool, flat: bool, upwards: bool,
     ) -> Vec<[u8; 3]> {
-        raster_with(song, notes, now, speed, height, by_channel, piano, flat, upwards, false)
+        raster_with(song, notes, now, speed, height, piano, flat, upwards, false)
     }
 
     /// `flattened`: segments carry their whole note's length in `source` (thin notes darken
     /// by that, not by the visible piece).
     fn raster_with(
         song: &VisualSong, notes: &[NoteSegment], now: u64, speed: f32,
-        height: u32, by_channel: bool, piano: bool, flat: bool, upwards: bool, flattened: bool,
+        height: u32, piano: bool, flat: bool, upwards: bool, flattened: bool,
     ) -> Vec<[u8; 3]> {
         let width = 48;
         let columns = key_columns(piano, 59, 62);
@@ -3200,7 +2235,7 @@ mod tests {
             let (left, right) = columns[note.pitch as usize];
             let x0 = left * width as f32;
             let x1 = right * width as f32;
-            let color = song.color_for(note, by_channel);
+            let color = song.color_for(note);
             for y in 0..height as usize {
                 let cy = y as f32 + 0.5;
                 if cy < (y0 * 256.0).round() / 256.0 || cy >= (y1 * 256.0).round() / 256.0 { continue; }
@@ -3235,8 +2270,8 @@ mod tests {
                 for flat in [false, true] {
                     for upwards in [false, true] {
                         assert_eq!(
-                            raster(song, &selected, now, speed, height, by_channel, piano, flat, upwards),
-                            raster(song, &visible.window.iter().copied().collect::<Vec<_>>(), now, speed, height, by_channel, piano, flat, upwards),
+                            raster(song, &selected, now, speed, height, piano, flat, upwards),
+                            raster(song, &visible.window.iter().copied().collect::<Vec<_>>(), now, speed, height, piano, flat, upwards),
                             "now={now}, speed={speed}, height={height}, channel={by_channel}, piano={piano}, flat={flat}, up={upwards}",
                         );
                     }
@@ -3262,14 +2297,14 @@ mod tests {
         assert_eq!(surviving.iter().map(|n| (n.start_us, n.end_us, n.track)).collect::<Vec<_>>(),
             [(20, 100_000, 1), (20, 40_000, 2), (50_500, 99_000, 0)]);
         let mut instances = Arc::new(gpu::InstanceRing::default());
-        build_note_instances(&song, &mut visible, 0, 100_000, 0.1, 64, false, false, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 100_000, 0.1, 64, false, &mut instances);
         for instance in instances.iter().filter(|n| n.key_color & 255 == 60) {
             let start = instance.start_us[0] as u64;
             let note = surviving.iter().find(|n| n.start_us == start &&
                 ((n.end_us - n.start_us) as f32 / 1e6).max(0.000_1) == instance.len &&
-                ((song.color_for(n, false).r() as u32) << 24 |
-                 (song.color_for(n, false).g() as u32) << 16 |
-                 (song.color_for(n, false).b() as u32) << 8 | 60) == instance.key_color);
+                ((song.color_for(n).r() as u32) << 24 |
+                 (song.color_for(n).g() as u32) << 16 |
+                 (song.color_for(n).b() as u32) << 8 | 60) == instance.key_color);
             assert!(note.is_some(), "surviving instance must keep its original colour and span");
         }
     }
@@ -3319,11 +2354,11 @@ mod tests {
             channel: (i % 3) as u8, pitch: 60,
         }).collect(), false);
         let mut instances = Arc::new(gpu::InstanceRing::default());
-        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, false, true, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, true, &mut instances);
         let coarse = instances.clone();
-        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, false, true, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, true, &mut instances);
         assert!(Arc::ptr_eq(&coarse, &instances));
-        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 10_000, false, true, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 10_000, true, &mut instances);
         assert!(instances.len() > coarse.len() * 10);
         assert_raster_equal(&song, &mut visible, 123_456, 0.01, 48);
     }
@@ -3340,7 +2375,7 @@ mod tests {
         let mut a = Arc::new(gpu::InstanceRing::default());
         let mut b = Arc::new(gpu::InstanceRing::default());
         let build = |visible: &mut VisibleNotes, buf: &mut Arc<gpu::InstanceRing>, now| {
-            build_note_instances(&song, visible, now, now + 3_000_000, 3.0, 900, false, true, buf);
+            build_note_instances(&song, visible, now, now + 3_000_000, 3.0, 900, true, buf);
         };
         build(&mut stepped, &mut a, 2_000_000);
         stepped.frames_since_sweep = 239;
@@ -3471,8 +2506,8 @@ mod tests {
             for now in [0, 5_000, 23_456] {
                 for by_channel in [false, true] {
                     for piano in [false, true] {
-                        let a = raster_with(&song, &flat, now, 0.1, height, by_channel, piano, false, false, true);
-                        let b = raster(&song, &sorted, now, 0.1, height, by_channel, piano, false, false);
+                        let a = raster_with(&song, &flat, now, 0.1, height, piano, false, false, true);
+                        let b = raster(&song, &sorted, now, 0.1, height, piano, false, false);
                         let differing: Vec<_> = a.iter().zip(&b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| (i / 48, i % 48)).take(5).collect();
                         assert!(differing.is_empty(), "height={height} now={now} channel={by_channel} piano={piano}: first differing (row, col) {differing:?}");
                     }
@@ -3490,8 +2525,8 @@ mod tests {
         let flat = flatten_all(&notes, 100_000_000);
         for height in [64, 300, 900] {
             for now in [3_500_000, 3_502_000, 3_505_000] {
-                let a = raster_with(&song, &flat, now, 5.0, height, false, false, false, false, true);
-                let b = raster(&song, &notes, now, 5.0, height, false, false, false, false);
+                let a = raster_with(&song, &flat, now, 5.0, height, false, false, false, true);
+                let b = raster(&song, &notes, now, 5.0, height, false, false, false);
                 let differing: Vec<_> = a.iter().zip(&b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| (i / 48, i % 48)).take(4).collect();
                 assert!(differing.is_empty(), "height={height} now={now}: first differing (row, col) {differing:?}");
             }
@@ -3594,8 +2629,8 @@ mod tests {
             assert!(covered(&visible), "worker never caught up at {now}: through={} end={end} first pending start={:?}", visible.through, visible.worker.as_ref().and_then(|w| w.pending.as_ref()).map(|b| b.notes.first().map(|n| n.start_us)));
             let flat: Vec<_> = visible.window.iter().copied().collect();
             for height in [100, 300] {
-                let a = raster_with(&song, &flat, now, speed, height, false, false, false, false, true);
-                let b = raster(&song, &exact, now, speed, height, false, false, false, false);
+                let a = raster_with(&song, &flat, now, speed, height, false, false, false, true);
+                let b = raster(&song, &exact, now, speed, height, false, false, false);
                 // Within 8 rows of either window edge the reference darkens and outlines any note
                 // its clamped quad makes thin or cuts off; a piece of a longer note does neither.
                 let differing: Vec<_> = a.iter().zip(&b).enumerate().filter(|(i, (x, y))| x != y && (8..height as usize - 8).contains(&(i / 48)))
@@ -3690,7 +2725,7 @@ mod tests {
         }).collect();
         let mut visible = indexed(notes, false);
         let mut instances = Arc::new(gpu::InstanceRing::default());
-        build_note_instances(&song, &mut visible, 260_000, 760_000, 0.5, 100, false, true, &mut instances);
+        build_note_instances(&song, &mut visible, 260_000, 760_000, 0.5, 100, true, &mut instances);
         let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
         decode_notes(&song.data, &mut readers, 0, 20_000_000);
         visible.worker = Some(DecodeWorker::new(song.data.clone(), readers, 20_000_000, visible.generation, None, Vec::new()));
@@ -3705,21 +2740,23 @@ mod tests {
     }
 
     #[test]
-    fn sparse_cache_expires_notes_and_updates_colour_mode() {
-        let song = test_song();
+    fn sparse_cache_expires_notes_and_updates_colour_on_palette_change() {
+        let mut song = test_song();
         let mut visible = indexed(vec![
             NoteSegment { source: 0, start_us: 0, end_us: 2000, track: 1, channel: 2, pitch: 60 },
             NoteSegment { source: 0, start_us: 5000, end_us: 10_000, track: 1, channel: 2, pitch: 60 },
         ], false);
         let mut instances = Arc::new(gpu::InstanceRing::default());
-        build_note_instances(&song, &mut visible, 0, 10_000, 0.01, 100, false, false, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 10_000, 0.01, 100, false, &mut instances);
         assert_eq!(instances.len(), 2);
-        build_note_instances(&song, &mut visible, 4000, 14_000, 0.01, 100, false, false, &mut instances);
+        build_note_instances(&song, &mut visible, 4000, 14_000, 0.01, 100, false, &mut instances);
         assert_eq!(instances.len(), 1);
-        let track_colour = instances[0].key_color;
-        let (active, colours) = build_note_instances(&song, &mut visible, 6000, 16_000, 0.01, 100, true, false, &mut instances);
-        assert_ne!(track_colour, instances[0].key_color);
+        let old_colour = instances[0].key_color;
+        song.set_palette(theme::NotePalette::Pitch, &[]);
+        visible.instance_ring_id = u64::MAX; // what the UI does on a palette change
+        let (active, colours) = build_note_instances(&song, &mut visible, 6000, 16_000, 0.01, 100, false, &mut instances);
+        assert_ne!(old_colour, instances[0].key_color);
         assert!(active[60]);
-        assert_eq!(colours[60], song.color_for(&visible.window[1], true));
+        assert_eq!(colours[60], song.color_for(&visible.window[1]));
     }
 }

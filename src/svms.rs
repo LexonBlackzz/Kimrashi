@@ -15,7 +15,9 @@ use crate::clock::PlaybackClock;
 const ABI_VERSION_1: u32 = 1;
 const STRUCT_VERSION_1: u32 = 1;
 const RESULT_OK: i32 = 0;
+const CAP_EXACT_QPC_TIMESTAMPS: u64 = 1 << 0;
 const CAP_SHORT_EVENT_BATCH: u64 = 1 << 1;
+const CAP_SYSTEM_EXCLUSIVE: u64 = 1 << 2;
 const CAP_TELEMETRY_V2: u64 = 1 << 15;
 const CAP_CALLBACK_TRACE: u64 = 1 << 16;
 
@@ -43,7 +45,8 @@ pub struct Interface {
     destroy_session: Option<unsafe extern "C" fn(Session) -> i32>,
     _send_short: [usize; 2],
     send_short_batch: Option<unsafe extern "C" fn(Session, *const ShortEvent, u32) -> i32>,
-    _send_sysex_reset_telemetry: [usize; 3],
+    send_system_exclusive: Option<unsafe extern "C" fn(Session, *const u8, u32) -> i32>,
+    _reset_telemetry: [usize; 2],
     get_runtime_clock: Option<unsafe extern "C" fn(*mut u64, *mut u64) -> i32>,
     _unused: [usize; 18],
     get_telemetry_v2: Option<unsafe extern "C" fn(Session, *mut TelemetryV2) -> i32>,
@@ -98,7 +101,13 @@ pub struct TelemetryV2 {
     callback_p95_percent: f32,
     callback_p99_percent: f32,
     callback_p999_percent: f32,
-    reserved: [u32; 5],
+    /// Exact note-on merging: voices the pool would hold unmerged, its peak, and
+    /// the cumulative note-ons folded into other voices (low/high halves).
+    effective_voices: u32,
+    effective_voices_peak: u32,
+    note_merged_low: u32,
+    note_merged_high: u32,
+    reserved: u32,
 }
 
 /// `SVMS_CallbackTrace` (208 bytes): one audio callback.
@@ -181,7 +190,24 @@ impl Link {
         self.api.capabilities & CAP_SHORT_EVENT_BATCH != 0 && self.api.send_short_batch.is_some()
     }
 
-    /// Submit messages in one call, all timestamped at submission.
+    /// Events can carry exact times (QPC ticks of `clock`): the synth schedules them.
+    pub fn can_timestamp(&self) -> bool {
+        self.api.capabilities & CAP_EXACT_QPC_TIMESTAMPS != 0 && self.can_batch()
+    }
+
+    /// SysEx goes straight to the engine (not through the KDMAPI facade's checks).
+    pub fn can_sysex(&self) -> bool {
+        self.api.capabilities & CAP_SYSTEM_EXCLUSIVE != 0 && self.api.send_system_exclusive.is_some()
+    }
+
+    /// Send one complete SysEx message (F0 .. F7); the synth copies it before returning.
+    pub fn send_sysex(&self, bytes: &[u8]) {
+        if let Some(f) = self.api.send_system_exclusive {
+            unsafe { f(self.session, bytes.as_ptr(), bytes.len() as u32) };
+        }
+    }
+
+    /// Submit messages in one call, each with its own timestamp (0 = at submission).
     pub fn send_batch(&self, events: &[ShortEvent]) {
         if let Some(f) = self.api.send_short_batch {
             for chunk in events.chunks(u32::MAX as usize) {
@@ -190,7 +216,8 @@ impl Link {
         }
     }
 
-    fn clock(&self) -> (u64, u64) {
+    /// The synth's clock: (ticks now, ticks per second), the domain of event timestamps.
+    pub fn clock(&self) -> (u64, u64) {
         let (mut now, mut freq) = (0, 1);
         unsafe { (self.api.get_runtime_clock.unwrap())(&mut now, &mut freq) };
         (now, freq.max(1))
@@ -226,7 +253,11 @@ impl Drop for Link {
 }
 
 pub fn short_event(msg: u32) -> ShortEvent {
-    ShortEvent { timestamp_qpc: 0, packed_message: msg, reserved: 0 }
+    short_event_at(msg, 0)
+}
+
+pub fn short_event_at(msg: u32, timestamp_qpc: u64) -> ShortEvent {
+    ShortEvent { timestamp_qpc, packed_message: msg, reserved: 0 }
 }
 
 /// Synth-side numbers over the last second.
@@ -319,6 +350,8 @@ impl Drop for Monitor {
 struct CsvLog {
     path: PathBuf,
     file: std::io::BufWriter<std::fs::File>,
+    /// Per-window deltas of the flow counters (coalescing, collapsing, shedding).
+    flow: Option<std::io::BufWriter<std::fs::File>>,
 }
 
 const CSV_HEADER: &str = "song_s,wall_ms,callback,frames,load_pct,total_us,schedule_us,render_us,post_us,\
@@ -342,6 +375,8 @@ fn run(
     let mut log: Option<CsvLog> = None;
     let mut w = Window::default();
     let mut window_start = Instant::now();
+    // SVMS_STATS_SECS shortens the stats row period (default 1 s) for burst analysis.
+    let stats_window: f64 = std::env::var("SVMS_STATS_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(50));
@@ -355,7 +390,12 @@ fn run(
                     .ok()?;
                 let mut file = std::io::BufWriter::new(file);
                 writeln!(file, "{CSV_HEADER}").ok()?;
-                Some(CsvLog { path, file })
+                let flow = std::fs::File::create(path.with_extension("flow.csv")).ok().map(|f| {
+                    let mut f = std::io::BufWriter::new(f);
+                    let _ = writeln!(f, "song_s,wall_ms,submitted,accepted,dispatched,late,late_clamped,stale_on_skipped,stale_off_compacted,fence_suppressed,cc_collapsed,shed,dropped,cancelled,seq_gaps,not_accepted,note_merged,effective_voices,effective_peak");
+                    f
+                });
+                Some(CsvLog { path, file, flow })
             });
         }
 
@@ -466,8 +506,27 @@ fn run(
         }
 
         let secs = window_start.elapsed().as_secs_f64();
-        if secs >= 1.0 {
+        if secs >= stats_window {
+            let before = telemetry;
             telemetry = link.telemetry().unwrap_or(telemetry);
+            if let Some(l) = &mut log {
+                if let Some(f) = &mut l.flow {
+                    let d = |a: u64, b: u64| a.saturating_sub(b);
+                    let _ = writeln!(f, "{:.4},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                        song_now as f64 / 1e6, qpc_now.saturating_sub(start_qpc) as f64 * 1e3 / freq as f64,
+                        d(telemetry.submitted_events, before.submitted_events), d(telemetry.accepted_events, before.accepted_events),
+                        d(telemetry.dispatched_events, before.dispatched_events), d(telemetry.late_events, before.late_events),
+                        d(telemetry.late_clamped_events, before.late_clamped_events), d(telemetry.stale_note_ons_skipped, before.stale_note_ons_skipped),
+                        d(telemetry.stale_note_offs_compacted, before.stale_note_offs_compacted), d(telemetry.fence_suppressed_note_ons, before.fence_suppressed_note_ons),
+                        d(telemetry.cc_collapsed_events, before.cc_collapsed_events), d(telemetry.shed_note_ons, before.shed_note_ons),
+                        d(telemetry.dropped_events, before.dropped_events), d(telemetry.cancelled_submissions, before.cancelled_submissions),
+                        d(telemetry.sequence_gaps, before.sequence_gaps),
+                        d(telemetry.submitted_events.saturating_sub(telemetry.accepted_events), before.submitted_events.saturating_sub(before.accepted_events)),
+                        d(telemetry.note_merged_low as u64 | (telemetry.note_merged_high as u64) << 32, before.note_merged_low as u64 | (before.note_merged_high as u64) << 32),
+                        telemetry.effective_voices, telemetry.effective_voices_peak);
+                    let _ = f.flush();
+                }
+            }
             let mut s = std::mem::take(&mut w.s);
             let n = s.callbacks.max(1) as f64;
             s.load_avg = (w.load_sum / n) as f32;

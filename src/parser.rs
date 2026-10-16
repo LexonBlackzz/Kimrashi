@@ -142,6 +142,7 @@ impl Progress {
 //   data    = 0x9n note:   key, [velocity], [vlv(duration + 1)]   (duration 0 = never released)
 //             0xAn/Bn/En:  d1, d2
 //             0xCn/Dn:     d1
+//             0xF0/0xF7:  vlv(length), payload (SysEx; status always written; see `MAX_SYSEX`)
 //   flags   = bit 0: velocity present, bit 1: duration present (notes only).
 //             When absent, the note reuses the track's previous velocity / duration
 //             (running velocity / running duration).
@@ -155,7 +156,8 @@ impl Progress {
 //
 // Note-offs (0x8n and 0x9n vel 0) are not stored: they're folded into the note's
 // duration, and playback regenerates them. Meta events except tempo and SysEx are
-// dropped (never sent during playback). Deltas are mostly < 32, so the flags ride
+// dropped (never sent during playback). SysEx is kept inline, except in tracks split by
+// channel (it belongs to no channel) and past `MAX_SYSEX` bytes. Deltas are mostly < 32, so the flags ride
 // along for free: a note repeating its track's velocity and length costs 2 bytes.
 
 /// One decoded record of a packed track.
@@ -164,6 +166,9 @@ pub enum Record {
     /// `dur` is None for a note that is never released.
     Note { ch: u8, key: u8, vel: u8, dur: Option<u32> },
     Other { status: u8, d1: u8, d2: u8 },
+    /// SysEx (`status` 0xF0) or an escaped message (0xF7): `len` payload bytes at `at` in
+    /// `MidiFile::store`. An 0xF0 message is sent as 0xF0 followed by the payload.
+    Sysex { status: u8, at: usize, len: u32 },
 }
 
 /// A packed track: its chunks, in order (see `MidiFile::track`).
@@ -293,6 +298,11 @@ impl TrackReader {
                 p += 1;
                 Record::Other { status, d1: data[p - 1], d2: 0 }
             }
+            0xF0 => {
+                let (len, at) = get_vlv(data, p);
+                p = at + len as usize;
+                Record::Sysex { status, at, len: len as u32 }
+            }
             _ => {
                 p += 2;
                 Record::Other { status, d1: data[p - 2], d2: data[p - 1] }
@@ -381,6 +391,11 @@ impl MidiFile {
     pub fn packed_bytes(&self) -> u64 {
         let refs: usize = self.tracks.iter().map(|t| t.len()).sum();
         (self.store.len() + self.chunks.len() * std::mem::size_of::<Chunk>() + refs * 4) as u64
+    }
+
+    /// A SysEx record's payload.
+    pub fn sysex(&self, at: usize, len: u32) -> &[u8] {
+        &self.store[at..at + len as usize]
     }
 
     pub fn track(&self, i: usize) -> Track<'_> {
@@ -742,9 +757,11 @@ struct PackedTrack {
     channels: u16,
 }
 
-enum RawEvent {
+enum RawEvent<'a> {
     Channel { status: u8, d1: u8, d2: u8 },
     Tempo(u32),
+    /// Status (0xF0 or 0xF7) and payload; only for payloads up to `MAX_SYSEX`.
+    SysEx(u8, &'a [u8]),
 }
 
 /// Caps raw track bytes held in memory at once while loading (a single larger track
@@ -930,6 +947,7 @@ struct Pending {
     /// Note-on: the tick of its note-off, `NEVER` until (unless) one arrives.
     end: u32,
     /// Note-on: sequence number of the next open note on the same channel+key.
+    /// SysEx: its payload's offset in the sequencer's arena (and `end`: its length).
     next: u32,
     status: u8,
     d1: u8,
@@ -937,6 +955,11 @@ struct Pending {
 }
 
 const NEVER: u32 = u32::MAX;
+
+/// Longest SysEx payload kept (longer ones are dropped), and the most payload bytes
+/// held back at once behind open notes.
+const MAX_SYSEX: usize = 1 << 16;
+const MAX_SYSEX_PENDING: usize = 64 << 20;
 
 /// Most events held back behind open notes (16 bytes each). A longer wait than this ends
 /// the oldest open note early, so a note that never ends can't use all the memory.
@@ -1091,11 +1114,21 @@ impl<'a> Packer<'a> {
     }
 
     /// Write the record for `p` (its duration, if it's a note, is final).
-    fn emit(&mut self, p: &Pending) {
+    fn emit(&mut self, p: &Pending, payload: &[u8]) {
         let data = &mut *self.data;
         let delta = ((p.tick - self.last_tick) as u64) << 2;
         self.last_tick = p.tick;
         let start = data.len();
+        if p.status & 0xF0 == 0xF0 {
+            let payload = &payload[p.next as usize..(p.next + p.end) as usize];
+            put_vlv(data, delta);
+            data.push(p.status); // always: a length byte could pass for data
+            self.running = p.status;
+            put_vlv(data, payload.len() as u64);
+            data.extend_from_slice(payload);
+            self.stats.other_bytes += (data.len() - start) as u64;
+            return self.cut_after(start);
+        }
         if p.status & 0xF0 != 0x90 {
             put_vlv(data, delta);
             if p.status != self.running {
@@ -1199,7 +1232,7 @@ fn pack_track<R: Read>(
     let mut since = 0u32;
     let end_tick = walk_raw_track(input, |tick, ev| match ev {
         RawEvent::Channel { status, d1, d2 } => {
-            seq.event(tick, status, d1, d2, &mut |p| out.emit(p));
+            seq.event(tick, status, d1, d2, &mut |p, x| out.emit(p, x));
             since += 1;
             if since >= 1 << 20 {
                 since = 0;
@@ -1209,8 +1242,9 @@ fn pack_track<R: Read>(
             }
         }
         RawEvent::Tempo(t) => tempos.push((tick, t)),
+        RawEvent::SysEx(status, bytes) => seq.sysex(tick, status, bytes, &mut |p, x| out.emit(p, x)),
     })?;
-    seq.finish(&mut |p| out.emit(p));
+    seq.finish(&mut |p, x| out.emit(p, x));
     out.flush();
     Ok(out.into_track(&seq, tempos, end_tick))
 }
@@ -1243,12 +1277,12 @@ fn pack_track_split<R: Read>(
                 let mut seq = Sequencer::new(&mut queue);
                 for mut events in rx {
                     for &[tick, w] in &events {
-                        seq.event(tick, w as u8, (w >> 8) as u8, (w >> 16) as u8, &mut |p| out.emit(p));
+                        seq.event(tick, w as u8, (w >> 8) as u8, (w >> 16) as u8, &mut |p, x| out.emit(p, x));
                     }
                     events.clear();
                     let _ = spare_tx.try_send(events);
                 }
-                seq.finish(&mut |p| out.emit(p));
+                seq.finish(&mut |p, x| out.emit(p, x));
                 out.flush();
                 out.into_track(&seq, Vec::new(), 0)
             });
@@ -1271,6 +1305,7 @@ fn pack_track_split<R: Read>(
                 }
             }
             RawEvent::Tempo(t) => tempos.push((tick, t)),
+            RawEvent::SysEx(..) => {} // no channel to deal it to
         });
         for (ch, events) in pending.into_iter().enumerate() {
             if !events.is_empty() {
@@ -1316,6 +1351,8 @@ fn spread_over_channels<R: Read>(input: &mut Input<R>) -> bool {
 /// duration is known.
 struct Sequencer<'a> {
     queue: &'a mut std::collections::VecDeque<Pending>,
+    /// Payloads of the SysEx events in `queue`; emptied when the queue is.
+    arena: Vec<u8>,
     /// Open notes per channel+key: a FIFO as a linked list through `Pending::next`
     /// (head/tail sequence numbers; the queue's front is `base`).
     head: [u32; 16 * 128],
@@ -1334,6 +1371,7 @@ impl<'a> Sequencer<'a> {
         queue.clear();
         Sequencer {
             queue,
+            arena: Vec::new(),
             head: [Self::NONE; 16 * 128],
             tail: [Self::NONE; 16 * 128],
             base: 0,
@@ -1344,7 +1382,7 @@ impl<'a> Sequencer<'a> {
     }
 
     #[inline]
-    fn event(&mut self, tick: u32, status: u8, d1: u8, d2: u8, emit: &mut impl FnMut(&Pending)) {
+    fn event(&mut self, tick: u32, status: u8, d1: u8, d2: u8, emit: &mut impl FnMut(&Pending, &[u8])) {
         const NONE: u32 = Sequencer::NONE;
         let slot = (status as usize & 0x0F) * 128 + (d1 as usize & 0x7F);
         let mut p = Pending { tick, end: 0, next: NONE, status, d1, d2 };
@@ -1379,13 +1417,32 @@ impl<'a> Sequencer<'a> {
             }
             _ => self.queue.push_back(p),
         }
+        self.drain(tick, emit);
+    }
+
+    /// A SysEx event (`status` 0xF0 or 0xF7); empty and oversized payloads are dropped.
+    fn sysex(&mut self, tick: u32, status: u8, payload: &[u8], emit: &mut impl FnMut(&Pending, &[u8])) {
+        if payload.is_empty() || payload.len() > MAX_SYSEX || self.arena.len() + payload.len() > MAX_SYSEX_PENDING {
+            return;
+        }
+        let next = self.arena.len() as u32;
+        self.arena.extend_from_slice(payload);
+        self.queue.push_back(Pending { tick, end: payload.len() as u32, next, status, d1: 0, d2: 0 });
+        self.drain(tick, emit);
+    }
+
+    /// Emit what's at the front of the queue and no longer waiting for a note-off.
+    fn drain(&mut self, tick: u32, emit: &mut impl FnMut(&Pending, &[u8])) {
         while let Some(front) = self.queue.front() {
             if front.end == NEVER {
                 break; // an open note
             }
-            emit(front);
+            emit(front, &self.arena);
             self.queue.pop_front();
             self.base = self.base.wrapping_add(1);
+        }
+        if self.queue.is_empty() {
+            self.arena.clear();
         }
         if self.queue.len() > MAX_PENDING {
             self.release_oldest(tick, emit);
@@ -1395,7 +1452,7 @@ impl<'a> Sequencer<'a> {
     /// Too many events are waiting behind open notes (a stuck note under billions of
     /// others would need gigabytes): the oldest open notes end now, as if released.
     #[cold]
-    fn release_oldest(&mut self, tick: u32, emit: &mut impl FnMut(&Pending)) {
+    fn release_oldest(&mut self, tick: u32, emit: &mut impl FnMut(&Pending, &[u8])) {
         while self.queue.len() > MAX_PENDING {
             // (every queue entry before the first open note has been emitted)
             let Some(front) = self.queue.front_mut() else { return };
@@ -1409,17 +1466,20 @@ impl<'a> Sequencer<'a> {
                 if front.end == NEVER {
                     break;
                 }
-                emit(front);
+                emit(front, &self.arena);
                 self.queue.pop_front();
                 self.base = self.base.wrapping_add(1);
             }
         }
+        if self.queue.is_empty() {
+            self.arena.clear();
+        }
     }
 
     /// The track is over: notes still open were never released.
-    fn finish(&mut self, emit: &mut impl FnMut(&Pending)) {
+    fn finish(&mut self, emit: &mut impl FnMut(&Pending, &[u8])) {
         for p in self.queue.drain(..) {
-            emit(&p);
+            emit(&p, &self.arena);
         }
     }
 }
@@ -1428,7 +1488,7 @@ impl<'a> Sequencer<'a> {
 /// Returns the tick of the last event.
 fn walk_raw_track<R: Read>(
     input: &mut Input<R>,
-    mut f: impl FnMut(u32, RawEvent),
+    mut f: impl FnMut(u32, RawEvent<'_>),
 ) -> Result<u32, ParseError> {
     let mut abs_tick: u32 = 0;
     let mut running_status: u8 = 0;
@@ -1490,6 +1550,7 @@ fn walk_raw_track<R: Read>(
         // A payload to skip once the event's fixed part is consumed, and the error if
         // the track ends inside it.
         let mut skip = (0usize, "");
+        let mut sysex = None;
         match status {
             0x80..=0xBF | 0xE0..=0xEF => {
                 if cursor + 2 > len {
@@ -1509,11 +1570,14 @@ fn walk_raw_track<R: Read>(
                 cursor += 1;
             }
 
-            // SysEx: skipped (never sent during playback)
+            // SysEx: kept up to `MAX_SYSEX` bytes, read once the length is consumed
             0xF0 | 0xF7 => {
                 let (sy_len, sy_len_len) = read_vlv_from_buf(&w[cursor..])?;
                 cursor += sy_len_len;
                 skip = (sy_len as usize, "Unexpected end of track in sysex");
+                if (1..=MAX_SYSEX).contains(&(sy_len as usize)) {
+                    sysex = Some((status, sy_len as usize));
+                }
             }
 
             // Meta: only Set Tempo (0x51) is kept
@@ -1537,6 +1601,27 @@ fn walk_raw_track<R: Read>(
             }
         }
         input.pos += cursor;
+        if let Some((status, n)) = sysex {
+            let w = input.window(n)?;
+            if w.len() >= n {
+                f(abs_tick, RawEvent::SysEx(status, &w[..n]));
+                input.pos += n;
+            } else {
+                // Longer than the window: gather it piece by piece.
+                let mut bytes = Vec::with_capacity(n);
+                while bytes.len() < n {
+                    let w = input.window(1)?;
+                    if w.is_empty() {
+                        return Err(skip.1.into());
+                    }
+                    let take = w.len().min(n - bytes.len());
+                    bytes.extend_from_slice(&w[..take]);
+                    input.pos += take;
+                }
+                f(abs_tick, RawEvent::SysEx(status, &bytes));
+            }
+            continue;
+        }
         if !input.skip(skip.0)? {
             return Err(skip.1.into());
         }
@@ -1845,7 +1930,11 @@ mod tests {
                 _ => {
                     // other meta or sysex, sometimes longer than the read window
                     let n = if rng.below(4) == 0 { 100 + rng.below(200) } else { rng.below(20) } as usize;
-                    raw.extend_from_slice(if rng.below(2) == 0 { &[0xFF, 0x01] } else { &[0xF0] });
+                    let sysex = rng.below(2) != 0;
+                    raw.extend_from_slice(if sysex { &[0xF0] } else { &[0xFF, 0x01] });
+                    if sysex && n > 0 {
+                        want.records.push((tick, Record::Sysex { status: 0xF0, at: 0, len: n as u32 }));
+                    }
                     put_vlv(&mut raw, n as u64);
                     raw.extend(std::iter::repeat(0x55).take(n));
                     prev_status = 0;
@@ -1858,8 +1947,13 @@ mod tests {
 
     fn decode(m: &MidiFile, i: usize) -> Vec<(u32, Record)> {
         let (mut r, mut out) = (TrackReader::default(), vec![]);
-        while let Some(x) = r.next(m.track(i)) {
-            out.push(x);
+        while let Some((tick, mut rec)) = r.next(m.track(i)) {
+            if let Record::Sysex { at, len, status } = &mut rec {
+                // the payload is all 0x55 in these tracks; its place in the store is not the point
+                assert!(m.sysex(*at, *len).iter().all(|&b| b == 0x55) && *status == 0xF0);
+                *at = 0;
+            }
+            out.push((tick, rec));
         }
         out
     }
@@ -1964,6 +2058,7 @@ mod tests {
                         .filter(|(_, r)| match *r {
                             Record::Note { ch, .. } => ch == c,
                             Record::Other { status, .. } => status & 0x0F == c,
+                            Record::Sysex { .. } => false, // belongs to no channel: dropped when split
                         })
                         .collect();
                     assert_eq!(decode(&m, i), of_channel, "seed {seed}, batch {batch}, channel {c}");
@@ -2009,7 +2104,7 @@ mod tests {
         let mut seq = Sequencer::new(&mut queue);
         let (mut emitted, mut open, mut last) = (0u64, 0usize, 0u32);
         let n = MAX_PENDING as u32 * 2;
-        let mut emit = |p: &Pending| {
+        let mut emit = |p: &Pending, _: &[u8]| {
             assert!(p.end >= p.tick && p.tick >= last);
             open += usize::from(p.end == NEVER);
             last = p.tick;

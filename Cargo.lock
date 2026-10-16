@@ -1841,6 +1841,7 @@ dependencies = [
  "liblzma",
  "lzma-rust2",
  "memchr",
+ "png",
  "rand_core 0.6.4",
  "rayon",
  "rfd",

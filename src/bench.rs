@@ -3,7 +3,7 @@
 //! the stats CSVs (plus SVMS's per-callback CSV when the synth is SVMS).
 //!
 //! `kimrashi --play <file> [--from m:ss] [--to m:ss] [--dll <KDMAPI dll>]
-//!  [--batch] [--no-skip] [--limit <notes/s>] [--speed <x>]`
+//!  [--batch] [--longdata] [--no-skip] [--limit <notes/s>] [--speed <x>]`
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -23,6 +23,7 @@ struct Args {
     to_us: Option<u64>,
     dll: Option<String>,
     batch: bool,
+    long_data: bool,
     skip: bool,
     limit: u32,
     speed: f64,
@@ -39,7 +40,7 @@ pub fn parse_time(s: &str) -> Result<u64, String> {
 }
 
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
-    let mut a = Args { file: String::new(), from_us: 0, to_us: None, dll: None, batch: false, skip: true, limit: 0, speed: 1.0, analyze: false };
+    let mut a = Args { file: String::new(), from_us: 0, to_us: None, dll: None, batch: false, long_data: false, skip: true, limit: 0, speed: 1.0, analyze: false };
     while let Some(arg) = it.next() {
         let mut val = || it.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
@@ -48,6 +49,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--to" => a.to_us = Some(parse_time(&val()?)?),
             "--dll" => a.dll = Some(val()?),
             "--batch" => a.batch = true,
+            "--longdata" => a.long_data = true,
             "--analyze" => a.analyze = true,
             "--no-skip" => a.skip = false,
             "--limit" => a.limit = val()?.parse().map_err(|e| format!("--limit: {e}"))?,
@@ -101,6 +103,7 @@ fn analyze(a: &Args) -> Result<(), String> {
                         s.len_us += (tempo.tick_to_time_with_cache(tick + d, &mut cache) - us) as f64;
                     }
                 }
+                Record::Sysex { .. } => *s.other.entry("sysex".into()).or_default() += 1,
                 Record::Other { status, d1, .. } => {
                     let kind = match status & 0xF0 {
                         0xB0 => format!("cc{d1}"),
@@ -156,6 +159,7 @@ fn run(a: Args) -> Result<(), String> {
         PlayerCommand::SetSkipping(a.skip),
         PlayerCommand::SetSynthLimit(a.limit),
         PlayerCommand::SetSvmsBatch(a.batch),
+        PlayerCommand::SetLongData(a.long_data),
         PlayerCommand::SetStatsLog(true),
         PlayerCommand::Play(song.clone()),
         PlayerCommand::Seek(a.from_us),

@@ -1,4 +1,5 @@
 /target
 frames.csv
+settings.json
 # Release signing keys never belong here
 *.key

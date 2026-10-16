@@ -2,6 +2,7 @@
 
 use libloading::Library;
 use std::path::Path;
+use winapi::um::mmsystem::MIDIHDR;
 
 pub type BOOL = i32;
 pub type DWORD = u32;
@@ -32,6 +33,9 @@ type Fn_SendDirectData = unsafe extern "system" fn(DWORD);
 /// `void WINAPI SendDirectDataBatch(const DWORD* msgs, DWORD count);`
 type Fn_SendDirectDataBatch = unsafe extern "system" fn(*const DWORD, DWORD);
 
+/// KDMAPI's long (SysEx) messages: `UINT Fn(MIDIHDR*, UINT header_size)`.
+type Fn_LongData = unsafe extern "system" fn(*mut MIDIHDR, u32) -> u32;
+
 pub struct OmniMIDI {
     _lib: Library,
     pub is_av: Option<Fn_IsKDMAPIAvailable>,
@@ -41,6 +45,9 @@ pub struct OmniMIDI {
     pub getdbg: Option<Fn_GetDriverDebugInfo>,
     pub send_direct: Option<Fn_SendDirectData>,
     pub send_batch: Option<Fn_SendDirectDataBatch>,
+    prepare_long: Option<Fn_LongData>,
+    send_long: Option<Fn_LongData>,
+    unprepare_long: Option<Fn_LongData>,
     /// SVMS native API bootstrap (SuperVirtualMIDISynth only).
     pub svms_get_interface: Option<crate::svms::GetInterfaceFn>,
 }
@@ -75,12 +82,18 @@ impl OmniMIDI {
             .get::<Fn_SendDirectDataBatch>(b"SendDirectDataBatch")
             .ok()
             .map(|s| *s);
+        let prepare_long = lib.get::<Fn_LongData>(b"PrepareLongData").ok().map(|s| *s);
+        let send_long = lib.get::<Fn_LongData>(b"SendDirectLongData").ok().map(|s| *s);
+        let unprepare_long = lib.get::<Fn_LongData>(b"UnprepareLongData").ok().map(|s| *s);
         let svms_get_interface = lib
             .get::<crate::svms::GetInterfaceFn>(b"SVMS_GetInterface")
             .ok()
             .map(|s| *s);
         Ok(Self {
             svms_get_interface,
+            prepare_long,
+            send_long,
+            unprepare_long,
             _lib: lib,
             is_av,
             init,
@@ -104,6 +117,27 @@ impl OmniMIDI {
     pub unsafe fn send_short(&self, w: DWORD) {
         if let Some(f) = self.send_direct {
             f(w);
+        }
+    }
+    /// Whether the synth takes long messages (SysEx, and batches of events as a byte stream).
+    pub fn has_long(&self) -> bool {
+        self.send_long.is_some()
+    }
+
+    /// Send one SysEx (or other long) message, status byte included.
+    pub unsafe fn send_long_msg(&self, bytes: &[u8]) {
+        let Some(send) = self.send_long else { return };
+        let mut hdr: MIDIHDR = std::mem::zeroed();
+        hdr.lpData = bytes.as_ptr() as *mut _; // the driver copies it
+        hdr.dwBufferLength = bytes.len() as u32;
+        hdr.dwBytesRecorded = bytes.len() as u32;
+        let size = std::mem::size_of::<MIDIHDR>() as u32;
+        if let Some(prepare) = self.prepare_long {
+            prepare(&mut hdr, size);
+        }
+        send(&mut hdr, size);
+        if let Some(unprepare) = self.unprepare_long {
+            unprepare(&mut hdr, size);
         }
     }
     #[allow(dead_code)]

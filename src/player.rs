@@ -30,6 +30,9 @@ pub enum PlayerCommand {
     SetStatsLog(bool),
     /// Submit through SVMS's native batch API instead of one `SendDirectData` per message.
     SetSvmsBatch(bool),
+    /// Send each slice as raw MIDI bytes (running status) in long messages instead of one
+    /// short message at a time (KDMAPI synths that understand it, e.g. OmniMIDI).
+    SetLongData(bool),
 }
 
 /// Player-thread and synth performance over the last second.
@@ -271,12 +274,123 @@ struct Cursor {
     due: RadixHeap<Due>,
 }
 
+/// A SysEx message to send. In a batch of messages it stands as `sysex_marker(index)`,
+/// which no short message can be (their status byte is below 0xF0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SysexRef {
+    status: u8,
+    at: usize,
+    len: u32,
+}
+
+/// A batch as raw MIDI bytes, sent through `send` in pieces of about `STREAM_CHUNK` bytes,
+/// each one complete on its own. Consecutive messages with the same status leave it out
+/// (running status), and note-offs go out as note-ons of velocity 0 so they keep the run
+/// going. A SysEx takes a long message to itself, so a malformed one can't swallow what
+/// follows it.
+fn stream_chunks(song: &SongData, msgs: &[u32], sysex: &[SysexRef], bytes: &mut Vec<u8>, mut send: impl FnMut(&[u8])) {
+    const STREAM_CHUNK: usize = 4096;
+    let mut running = 0u8;
+    bytes.clear();
+    for &m in msgs {
+        let mut flush = false;
+        if m as u8 == 0xF0 {
+            let x = sysex[(m >> 8) as usize];
+            if !bytes.is_empty() {
+                send(bytes);
+                bytes.clear();
+            }
+            if x.status == 0xF0 {
+                bytes.push(0xF0);
+            }
+            bytes.extend_from_slice(song.midi.sysex(x.at, x.len));
+            flush = true;
+        } else {
+            let (mut status, d1, mut d2) = (m as u8, (m >> 8) as u8, (m >> 16) as u8);
+            if status & 0xF0 == 0x80 {
+                (status, d2) = (status | 0x10, 0);
+            }
+            if status != running {
+                bytes.push(status);
+                running = status;
+            }
+            bytes.push(d1);
+            if !matches!(status & 0xF0, 0xC0 | 0xD0) {
+                bytes.push(d2);
+            }
+        }
+        if flush || bytes.len() >= STREAM_CHUNK {
+            send(bytes);
+            bytes.clear();
+            running = 0;
+        }
+    }
+    if !bytes.is_empty() {
+        send(bytes);
+    }
+}
+
+/// The synth-clock time of each message of a slice (`out`), given the song time
+/// `first_us + offs[i]` it is due at, the song time `now_us` and `speed`, and the synth's
+/// clock `qpc` (ticks now) at `freq` ticks a second. Late messages go as of now, and no
+/// time is before the previous one (`last`, which is updated): order is kept.
+fn stamp_slice(first_us: u64, offs: &[u32], now_us: u64, speed: f64, qpc: u64, freq: u64, last: &mut u64, out: &mut Vec<u64>) {
+    out.clear();
+    let ticks_per_song_us = freq as f64 / 1e6 / speed;
+    for &off in offs {
+        let due = first_us + off as u64;
+        let ahead = (due.saturating_sub(now_us) as f64 * ticks_per_song_us) as u64;
+        *last = (qpc + ahead).max(*last);
+        out.push(*last);
+    }
+}
+
+fn sysex_marker(index: usize) -> u32 {
+    0xF0 | (index as u32) << 8
+}
+
+/// Whether a SysEx payload resets the synth (GM on/off, GS or XG reset): what came
+/// before it no longer matters.
+fn is_reset(payload: &[u8]) -> bool {
+    payload.windows(3).any(|w| w[0] == 0x7E && w[2] == 0x09)
+        || payload.windows(4).any(|w| w == [0x40, 0x00, 0x7F, 0x00])
+        || payload.windows(5).any(|w| w == [0x4C, 0x00, 0x00, 0x7E, 0x00])
+}
+
+/// Most SysEx messages replayed on a seek (the latest ones).
+const CHASE_SYSEX: usize = 1024;
+
 struct SeekResult {
     cursor: Cursor,
     /// Note-ons for notes that are sounding at the seek point.
     chase: Vec<u32>,
     /// Notes that started before the seek point.
     started: u64,
+    /// SysEx, then program, controller, bend and pressure state at the seek point, to send
+    /// before `chase` (SysEx as markers into `sysex`).
+    controllers: Vec<u32>,
+    sysex: Vec<SysexRef>,
+}
+
+/// What a controller-like record overwrites: the last of each kind is the state at a
+/// seek point. Data entry and RPN/NRPN selects (CC 6, 38, 96-101) depend on one another
+/// in order, so each of those is kept (per tick) instead of only the last.
+fn controller_key(status: u8, d1: u8, tick: u32) -> u64 {
+    let kind = match status & 0xF0 {
+        0xB0 if matches!(d1, 6 | 38 | 96..=101) => d1 as u64 | (tick as u64) << 16,
+        0xB0 | 0xA0 => d1 as u64,
+        _ => 0,
+    };
+    status as u64 | kind << 8
+}
+
+/// Bank select goes before program change, everything else after.
+fn controller_rank(msg: u32) -> u8 {
+    match (msg as u8 & 0xF0, (msg >> 8) as u8) {
+        (0xB0, 0 | 32) => 0,
+        (0xC0, _) => 1,
+        _ => 2,
+    }
 }
 
 impl Cursor {
@@ -290,6 +404,9 @@ impl Cursor {
                 let data = midi.track(i);
                 let mut r = TrackReader::default();
                 let mut active = Vec::new();
+                let mut ctl: std::collections::HashMap<u64, (u32, u32, u32)> = Default::default();
+                let mut sx = Vec::new();
+                let mut seq = 0u32;
                 let mut started = 0u64;
                 loop {
                     let mut n = r;
@@ -302,12 +419,18 @@ impl Cursor {
                                 if end.map_or(true, |e| e > tick) {
                                     active.push((ch, key, vel, end));
                                 }
+                            } else if let Record::Sysex { status, at, len } = rec {
+                                seq += 1;
+                                sx.push((t, seq, SysexRef { status, at, len }));
+                            } else if let Record::Other { status, d1, d2 } = rec {
+                                seq += 1;
+                                ctl.insert(controller_key(status, d1, t), (t, seq, pack_short(status, d1, d2)));
                             }
                         }
                         _ => break,
                     }
                 }
-                (r, active, started)
+                (r, active, started, ctl, sx)
             })
             .collect();
 
@@ -318,13 +441,25 @@ impl Cursor {
             },
             chase: Vec::new(),
             started: 0,
+            controllers: Vec::new(),
+            sysex: Vec::new(),
         };
-        for (i, (r, active, started)) in per_track.into_iter().enumerate() {
+        let mut sysex: Vec<(u32, usize, u32, SysexRef)> = Vec::new();
+        // key -> (tick, track, order in track, message): the latest wins.
+        let mut latest: std::collections::HashMap<u64, (u32, usize, u32, u32)> = Default::default();
+        for (i, (r, active, started, ctl, sx)) in per_track.into_iter().enumerate() {
             if let Some(t) = r.peek_tick(midi.track(i)) {
                 res.cursor.due.push(t, Due::Track(i as u32));
             }
             res.cursor.readers.push(r);
             res.started += started * midi.track_copies[i];
+            sysex.extend(sx.into_iter().map(|(t, n, x)| (t, i, n, x)));
+            for (key, (t, n, msg)) in ctl {
+                let e = latest.entry(key).or_insert((t, i, n, msg));
+                if (t, i, n) >= (e.0, e.1, e.2) {
+                    *e = (t, i, n, msg);
+                }
+            }
             for (ch, key, vel, end) in active {
                 res.chase.push(pack_short(0x90 | ch, key, vel));
                 if let Some(e) = end {
@@ -332,6 +467,21 @@ impl Cursor {
                 }
             }
         }
+        // SysEx from the last reset on; what the controllers did before it is undone.
+        sysex.sort_unstable_by_key(|&(t, i, n, _)| (t, i, n));
+        let reset = sysex.iter().rposition(|x| is_reset(midi.sysex(x.3.at, x.3.len)));
+        let from = reset.unwrap_or(0).max(sysex.len().saturating_sub(CHASE_SYSEX));
+        if let Some(r) = reset {
+            let tick = sysex[r].0;
+            latest.retain(|_, v| v.0 >= tick);
+        }
+        for (k, &(.., x)) in sysex[from..].iter().enumerate() {
+            res.controllers.push(sysex_marker(k));
+            res.sysex.push(x);
+        }
+        let mut ctl: Vec<_> = latest.into_values().collect();
+        ctl.sort_unstable_by_key(|&(t, i, n, msg)| (controller_rank(msg), t, i, n));
+        res.controllers.extend(ctl.into_iter().map(|(.., msg)| msg));
         res
     }
 
@@ -568,6 +718,8 @@ struct Engine {
     sent: u64,
     polyphony: u32,
     peak_polyphony: u32,
+    /// The SysEx messages whose markers are in the batch being built (see `SysexRef`).
+    sysex: Vec<SysexRef>,
     /// Scratch: what's due this tick, and its tracks.
     due_buf: Vec<Due>,
     track_buf: Vec<u32>,
@@ -585,16 +737,10 @@ impl Engine {
             sent: 0,
             polyphony: 0,
             peak_polyphony: 0,
+            sysex: Vec::new(),
             due_buf: Vec::new(),
             track_buf: Vec::new(),
         }
-    }
-
-    /// Copy the note counters into telemetry.
-    fn sync(&self, live: &mut PlayerTelemetry) {
-        live.notes_played = self.notes_played;
-        live.polyphony = self.polyphony;
-        live.peak_polyphony = self.peak_polyphony;
     }
 
     /// Append the messages for `tick` (which plays at `target_us`, `us_per_tick` long)
@@ -662,6 +808,10 @@ impl Engine {
                         }
                     }
                     Record::Other { status, d1, d2 } => batch.push(pack_short(status, d1, d2)),
+                    Record::Sysex { status, at, len } => {
+                        batch.push(sysex_marker(self.sysex.len()));
+                        self.sysex.push(SysexRef { status, at, len });
+                    }
                 }
             }
             if let Some(t) = r.peek_tick(data) {
@@ -683,6 +833,285 @@ pub fn bench_engine(song: &SongData) {
     }
 }
 
+/// Messages due over a short stretch of song time, decoded ahead by the decoder thread
+/// and sent to the synth by the player thread when their time comes.
+#[derive(Default)]
+struct Slice {
+    /// Bumped by every seek; slices of an older epoch are stale and dropped.
+    epoch: u32,
+    /// Song time of its first tick.
+    first_us: u64,
+    /// The song has no more events after this (it carries none itself).
+    end: bool,
+    msgs: Vec<u32>,
+    sysex: Vec<SysexRef>,
+    /// With timestamps on: each message's time after `first_us` (song µs).
+    offs: Vec<u32>,
+    ticks: u32,
+    /// What the decoder spent on it.
+    own: Duration,
+    /// Notes decoded and notes not played since the previous slice.
+    notes: u64,
+    skipped: u64,
+    /// The engine's counters after it.
+    notes_played: u64,
+    polyphony: u32,
+    peak_polyphony: u32,
+}
+
+/// What the decoder thread is told besides decoding on.
+enum ToDecoder {
+    /// Continue from `cursor` (see `Cursor::seek`); `chase` is what was sent to restore the
+    /// sound, for the skipper and the polyphony.
+    Seek { epoch: u32, cursor: Cursor, chase: Vec<u32>, started: u64, time_us: u64 },
+    SynthLimit(u32),
+    Skipping(bool),
+}
+
+/// What the sender tells the decoder, for the skipper's budget.
+struct Feedback {
+    /// How far behind the clock the last send was (wall µs).
+    lag_us: std::sync::atomic::AtomicU64,
+    /// Time in the synth per message (ns, f32 bits).
+    synth_ns: std::sync::atomic::AtomicU32,
+    /// How far ahead of the clock to decode (wall µs).
+    ahead_us: std::sync::atomic::AtomicU64,
+    /// Slices carry per-message times.
+    timed: std::sync::atomic::AtomicBool,
+    /// Messages decoded and not yet taken by the sender.
+    queued: std::sync::atomic::AtomicU64,
+}
+
+/// Decoded song time is kept this far ahead of the clock (wall µs): enough that a slice
+/// is ready when its time comes, little enough that the skipper sees what's happening
+/// now rather than the future.
+const AHEAD_US: u64 = 3_000;
+/// With timestamps: slices go to the synth this far ahead of their time (wall µs). A
+/// seek or stop waits this long for what was already handed over to play out.
+const TIMED_LEAD_US: u64 = 4_000;
+/// Decoded messages waiting for the sender at most, so that when it falls behind the
+/// skipper hears about it soon.
+const MAX_QUEUED_MSGS: u64 = 4 * MAX_SLICE_MSGS as u64;
+/// Song time one slice may cover.
+const SLICE_SPAN_US: u64 = 500;
+/// Most messages in a slice, so a long backlog doesn't hold up the synth for long
+/// before the first of them is heard.
+const MAX_SLICE_MSGS: usize = 1 << 13;
+/// Slices in flight at most.
+const SLICES_IN_FLIGHT: usize = 32;
+
+/// The decoding half of playback: turns the song into `Slice`s a little ahead of the
+/// clock, so that decoding overlaps with the synth calls of the thread sending them.
+struct Decoder {
+    song: Arc<SongData>,
+    eng: Engine,
+    cmds: Receiver<ToDecoder>,
+    out: Sender<Slice>,
+    /// Emptied slices to reuse.
+    spare: Receiver<Slice>,
+    clock: Arc<PlaybackClock>,
+    feedback: Arc<Feedback>,
+    epoch: u32,
+    costs: Costs,
+    seg_idx: usize,
+    /// The end of the song was reported (until the next seek).
+    ended: bool,
+}
+
+/// How `Decoder::deliver` went.
+enum Delivery {
+    Sent,
+    /// A seek came in meanwhile: the slice is stale.
+    Seeked,
+    /// The player has gone.
+    Gone,
+}
+
+impl Decoder {
+    fn spawn(
+        song: Arc<SongData>,
+        eng: Engine,
+        clock: Arc<PlaybackClock>,
+        feedback: Arc<Feedback>,
+    ) -> (Sender<ToDecoder>, Receiver<Slice>, Sender<Slice>) {
+        let (cmd_tx, cmds) = crossbeam_channel::unbounded();
+        let (out, slices) = crossbeam_channel::bounded(SLICES_IN_FLIGHT);
+        let (spare_tx, spare) = crossbeam_channel::bounded(SLICES_IN_FLIGHT * 2);
+        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false };
+        thread::Builder::new().name("player-decode".into()).spawn(move || d.run()).expect("spawn decoder");
+        (cmd_tx, slices, spare_tx)
+    }
+
+    /// Apply a command; true if it was a seek.
+    fn apply(&mut self, cmd: ToDecoder) -> bool {
+        match cmd {
+            ToDecoder::Seek { epoch, cursor, chase, started, time_us } => {
+                self.epoch = epoch;
+                self.eng.cur = cursor;
+                self.eng.notes_played = started;
+                self.eng.polyphony = chase.len() as u32;
+                self.eng.peak_polyphony = self.eng.peak_polyphony.max(self.eng.polyphony);
+                self.eng.notes_this_second = 0;
+                self.eng.skipper.reset(&chase, time_us);
+                self.ended = false;
+                true
+            }
+            ToDecoder::SynthLimit(limit) => {
+                self.eng.skipper.limit_nps = limit;
+                false
+            }
+            ToDecoder::Skipping(on) => {
+                self.eng.skipper.enabled = on;
+                false
+            }
+        }
+    }
+
+    /// Apply the commands waiting: Ok(whether any was a seek), or Err if the player is gone.
+    fn commands(&mut self) -> Result<bool, ()> {
+        let mut seeked = false;
+        loop {
+            match self.cmds.try_recv() {
+                Ok(cmd) => seeked |= self.apply(cmd),
+                Err(crossbeam_channel::TryRecvError::Empty) => return Ok(seeked),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return Err(()),
+            }
+        }
+    }
+
+    fn fresh(&mut self) -> Slice {
+        let mut s = self.spare.try_recv().unwrap_or_default();
+        s.msgs.clear();
+        s.sysex.clear();
+        s.offs.clear();
+        (s.end, s.ticks, s.own) = (false, 0, Duration::ZERO);
+        s
+    }
+
+    /// Stamp a slice with the epoch and the engine's counters.
+    fn stamp(&mut self, s: &mut Slice) {
+        let eng = &mut self.eng;
+        s.epoch = self.epoch;
+        s.notes = std::mem::take(&mut eng.notes_this_second);
+        s.skipped = std::mem::take(&mut eng.skipper.skipped) as u64 + std::mem::take(&mut eng.repeats_skipped);
+        s.notes_played = eng.notes_played;
+        s.polyphony = eng.polyphony;
+        s.peak_polyphony = eng.peak_polyphony;
+    }
+
+    /// Hand a slice over, waiting for room while still taking commands.
+    fn deliver(&mut self, mut slice: Slice) -> Delivery {
+        loop {
+            let msgs = slice.msgs.len() as u64;
+            match self.out.send_timeout(slice, Duration::from_millis(1)) {
+                Ok(()) => {
+                    self.feedback.queued.fetch_add(msgs, Ordering::Relaxed);
+                    return Delivery::Sent;
+                }
+                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return Delivery::Gone,
+                Err(crossbeam_channel::SendTimeoutError::Timeout(s)) => {
+                    slice = s;
+                    match self.commands() {
+                        Ok(true) => return Delivery::Seeked,
+                        Ok(false) => {}
+                        Err(()) => return Delivery::Gone,
+                    }
+                }
+            }
+        }
+    }
+
+    fn run(mut self) {
+        let tempo = self.song.tempo.clone();
+        loop {
+            if self.commands().is_err() {
+                return;
+            }
+            let Some(tick) = self.eng.cur.next_tick() else {
+                if !self.ended {
+                    self.ended = true;
+                    let mut slice = self.fresh();
+                    self.stamp(&mut slice);
+                    slice.end = true;
+                    if let Delivery::Gone = self.deliver(slice) {
+                        return;
+                    }
+                }
+                match self.cmds.recv_timeout(Duration::from_millis(5)) {
+                    Ok(cmd) => {
+                        self.apply(cmd);
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                }
+                continue;
+            };
+            let first_us = tempo.tick_to_time_approx(tick, &mut self.seg_idx);
+
+            // Keep to the clock: no further ahead than `AHEAD_US`.
+            let (_, now_us, speed) = self.clock.snapshot();
+            let ahead = (self.feedback.ahead_us.load(Ordering::Relaxed) as f64 * speed) as u64;
+            if self.feedback.queued.load(Ordering::Relaxed) > MAX_QUEUED_MSGS {
+                thread::sleep(Duration::from_micros(50));
+                continue;
+            }
+            if first_us > now_us.saturating_add(ahead) {
+                let wait = ((first_us - now_us - ahead) as f64 / speed) as u64;
+                thread::sleep(Duration::from_micros(wait.clamp(200, 2_000)));
+                continue;
+            }
+
+            let start = Instant::now();
+            let mut slice = self.fresh();
+            self.costs.speed = speed;
+            self.costs.synth_ns = f32::from_bits(self.feedback.synth_ns.load(Ordering::Relaxed));
+            let lag_us = self.feedback.lag_us.load(Ordering::Relaxed);
+            self.eng.skipper.regulate(lag_us, start, self.costs);
+            let (decoded0, sent0) = (self.eng.decoded, self.eng.sent);
+            let timed = self.feedback.timed.load(Ordering::Relaxed);
+            // Song time moves faster than wall time when sped up, and a slice is one send.
+            let span = (SLICE_SPAN_US as f64 * speed.max(1.0)) as u64;
+            slice.first_us = first_us;
+            let (mut tick, mut tick_us) = (tick, first_us);
+            loop {
+                self.eng.process_tick(&self.song, tick, tick_us, tempo.us_per_tick(self.seg_idx), &mut slice.msgs);
+                slice.ticks += 1;
+                if timed {
+                    slice.offs.resize(slice.msgs.len(), (tick_us - first_us).min(u32::MAX as u64) as u32);
+                }
+                if slice.msgs.len() >= MAX_SLICE_MSGS {
+                    break;
+                }
+                let Some(next) = self.eng.cur.next_tick() else { break };
+                let next_us = tempo.tick_to_time_approx(next, &mut self.seg_idx);
+                if next_us - first_us >= span || next_us > now_us.saturating_add(ahead) {
+                    break;
+                }
+                (tick, tick_us) = (next, next_us);
+            }
+            std::mem::swap(&mut self.eng.sysex, &mut slice.sysex);
+            self.eng.sysex.clear();
+            slice.own = start.elapsed();
+
+            // What things cost, for the skipper's budget (only from slices big enough to
+            // measure).
+            let (decoded, sent) = ((self.eng.decoded - decoded0) as f32, (self.eng.sent - sent0) as f32);
+            let ewma = |cost: &mut f32, sample: f32| *cost += 0.2 * (sample - *cost);
+            if decoded >= 32.0 {
+                ewma(&mut self.costs.engine_ns, slice.own.as_nanos() as f32 / decoded);
+            }
+            if sent >= 32.0 {
+                ewma(&mut self.costs.msgs_per_note, slice.msgs.len() as f32 / sent);
+            }
+
+            self.stamp(&mut slice);
+            if let Delivery::Gone = self.deliver(slice) {
+                return;
+            }
+        }
+    }
+}
+
 pub struct Player {
     omni: Option<Arc<OmniMIDI>>,
     choice: OutputChoice,
@@ -690,6 +1119,13 @@ pub struct Player {
     synth_limit: u32,
     skipping: bool,
     log_stats: bool,
+    /// See `PlayerCommand::SetLongData`, and the scratch its bytes are built in.
+    long_data: bool,
+    stream_buf: Vec<u8>,
+    /// Timestamped submission (SVMS): wanted, the latest time handed to the synth (its
+    /// clock's ticks), and a scratch for the times of one slice.
+    horizon: std::cell::Cell<u64>,
+    stamps: Vec<u64>,
     cmd_rx: Receiver<PlayerCommand>,
     telemetry_tx: Sender<PlayerTelemetry>,
     stop: Arc<AtomicBool>,
@@ -708,8 +1144,9 @@ impl Player {
         stop: Arc<AtomicBool>,
         clock: Arc<PlaybackClock>,
     ) {
-        // Single playback thread: it waits for each event's time and sends straight to the
-        // synth, so seeks and stops take effect immediately (nothing is queued ahead).
+        // The playback thread waits for each slice's time and sends it to the synth; a
+        // decoder thread (see `Decoder`) keeps slices coming a few ms ahead, so seeks and
+        // stops still take effect at once.
         thread::spawn(move || {
             let mut player = Self {
                 omni,
@@ -718,6 +1155,10 @@ impl Player {
                 synth_limit: 0,
                 skipping: true,
                 log_stats: false,
+                long_data: false,
+                stream_buf: Vec::new(),
+                horizon: Default::default(),
+                stamps: Vec::new(),
                 cmd_rx,
                 telemetry_tx,
                 stop,
@@ -764,6 +1205,10 @@ impl Player {
                         self.log_stats = on;
                         continue;
                     }
+                    Ok(PlayerCommand::SetLongData(on)) => {
+                        self.long_data = on;
+                        continue;
+                    }
                     Ok(PlayerCommand::SetSvmsBatch(on)) => {
                         self.svms.batch = on;
                         continue;
@@ -785,23 +1230,36 @@ impl Player {
         self.out = Output::Closed;
     }
 
+    /// Plays a song: this thread waits for each decoded slice's time and sends it to the
+    /// synth; a `Decoder` thread keeps slices coming a little ahead of the clock. Seeks
+    /// are scanned here, then handed to the decoder (slices from before it are dropped,
+    /// by epoch), so seeks and stops still take effect at once.
     fn play_song(&mut self, song: Arc<SongData>) -> Option<Arc<SongData>> {
         if !self.out.is_open() {
             self.out = Output::open(&self.choice, self.omni.as_ref(), &self.svms);
         }
 
         const UI_UPDATE: Duration = Duration::from_millis(33);
-        /// Most messages sent in one call, so a long backlog doesn't hold up the synth
-        /// for long before the first of them is heard.
-        const MAX_SLICE_MSGS: usize = 1 << 15;
 
         let tempo = &song.tempo;
         let duration_us = tempo.duration_us();
-        let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(self.synth_limit, self.skipping));
-        // One tick's messages, sent to the synth in one timed call (or loop).
-        let mut batch: Vec<u32> = Vec::new();
+        let feedback = Arc::new(Feedback {
+            lag_us: Default::default(),
+            synth_ns: std::sync::atomic::AtomicU32::new(Costs::default().synth_ns.to_bits()),
+            ahead_us: std::sync::atomic::AtomicU64::new(AHEAD_US),
+            timed: Default::default(),
+            queued: Default::default(),
+        });
+        let mut timed_on = false;
+        let eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(self.synth_limit, self.skipping));
+        // Dropping `to_decoder` (when this returns) ends the decoder thread.
+        let (to_decoder, slices, spare) = Decoder::spawn(song.clone(), eng, self.clock.clone(), feedback.clone());
+        let mut epoch = 0u32;
+        // The slice being waited for, and whether the decoder has run out of events.
+        let mut waiting: Option<Slice> = None;
+        let mut exhausted = false;
+        let mut synth_ns = Costs::default().synth_ns;
         let mut acc = StatsAcc::new();
-        let mut costs = Costs::default();
         let open_log = |on: bool| on.then(|| StatsLog::create(&song.path)).and_then(|r| {
             r.map_err(|e| eprintln!("Could not create stats log: {e}")).ok()
         });
@@ -818,6 +1276,8 @@ impl Player {
         };
         let mut abs_time_us: u64 = 0;
         let mut seg_idx: usize = 0;
+        // Notes decoded and not played, since the last second was reported.
+        let (mut notes_this_second, mut skipped_this_second) = (0u64, 0u64);
 
         let mut last_second = Instant::now();
         let mut last_ui = Instant::now();
@@ -871,11 +1331,11 @@ impl Player {
                     }
                     PlayerCommand::SetSynthLimit(limit) => {
                         self.synth_limit = limit;
-                        eng.skipper.limit_nps = limit;
+                        let _ = to_decoder.send(ToDecoder::SynthLimit(limit));
                     }
                     PlayerCommand::SetSkipping(on) => {
                         self.skipping = on;
-                        eng.skipper.enabled = on;
+                        let _ = to_decoder.send(ToDecoder::Skipping(on));
                     }
                     PlayerCommand::SetStatsLog(on) => {
                         self.log_stats = on;
@@ -883,6 +1343,7 @@ impl Player {
                         live.log_path = log.as_ref().map(|l| l.path.clone());
                         *self.svms.log.lock().unwrap() = svms_log(&log);
                     }
+                    PlayerCommand::SetLongData(on) => self.long_data = on,
                     PlayerCommand::SetSvmsBatch(on) => {
                         self.svms.batch = on;
                         self.out.set_svms_batch(on);
@@ -895,122 +1356,151 @@ impl Player {
                 thread::sleep(Duration::from_millis(5));
                 continue;
             }
+            let want_timed = self.out.can_timed();
+            if want_timed != timed_on {
+                timed_on = want_timed;
+                feedback.timed.store(timed_on, Ordering::Relaxed);
+                feedback.ahead_us.store(AHEAD_US + if timed_on { TIMED_LEAD_US } else { 0 }, Ordering::Relaxed);
+            }
 
             if let Some(target_us) = pending_seek.take() {
                 let target_tick = tempo.time_to_tick(target_us.min(duration_us));
                 let seek = Cursor::seek(&song, target_tick);
-                eng.cur = seek.cursor;
-                eng.notes_played = seek.started;
-                eng.polyphony = seek.chase.len() as u32;
-                eng.peak_polyphony = eng.peak_polyphony.max(eng.polyphony);
-                eng.notes_this_second = 0;
-                abs_time_us =
-                    tempo.tick_to_time_with_cache(target_tick, &mut seg_idx);
-                eng.skipper.reset(&seek.chase, abs_time_us);
+                abs_time_us = tempo.tick_to_time_with_cache(target_tick, &mut seg_idx);
+                // Everything decoded so far is from before the seek.
+                epoch = epoch.wrapping_add(1);
+                let _ = to_decoder.send(ToDecoder::Seek {
+                    epoch,
+                    cursor: seek.cursor,
+                    chase: seek.chase.clone(),
+                    started: seek.started,
+                    time_us: abs_time_us,
+                });
+                while let Ok(old) = slices.try_recv() {
+                    feedback.queued.fetch_sub(old.msgs.len() as u64, Ordering::Relaxed);
+                    let _ = spare.try_send(old);
+                }
+                waiting = None;
+                exhausted = false;
                 self.clock.set_running(abs_time_us);
-                eng.sync(&mut live);
+                live.notes_played = seek.started;
+                live.polyphony = seek.chase.len() as u32;
+                live.peak_polyphony = live.peak_polyphony.max(live.polyphony);
+                notes_this_second = 0;
                 live.nps = 0;
                 live.playback_time_us = abs_time_us;
                 live.is_playing = true;
                 self.telemetry_tx.send(live.clone()).ok();
 
                 self.all_notes_off();
+                self.send_events(&song, &seek.controllers, &seek.sysex);
                 self.out.send_batch(&seek.chase);
                 continue;
             }
 
-            let Some(tick) = eng.cur.next_tick() else {
-                if now_us >= duration_us {
-                    // Finished: pause at the end but stay on this song so seeks still work.
-                    self.all_notes_off();
-                    abs_time_us = duration_us;
-                    self.clock.set_paused(abs_time_us);
-                    eng.sync(&mut live);
-                    live.playback_time_us = abs_time_us;
-                    live.is_playing = false;
-                    live.nps = 0;
-                    live.polyphony = 0;
-                    live.stats = SchedStats::default();
-                    self.telemetry_tx.send(live.clone()).ok();
-                } else {
-                    thread::sleep(Duration::from_millis(5));
+            let slice = match waiting.take() {
+                Some(slice) => slice,
+                None => {
+                    // The song ran out: it is over once its time has.
+                    if exhausted {
+                        if now_us >= duration_us {
+                            // Finished: pause at the end but stay on this song so seeks still work.
+                            self.all_notes_off();
+                            abs_time_us = duration_us;
+                            self.clock.set_paused(abs_time_us);
+                            live.playback_time_us = abs_time_us;
+                            live.is_playing = false;
+                            live.nps = 0;
+                            live.polyphony = 0;
+                            live.stats = SchedStats::default();
+                            self.telemetry_tx.send(live.clone()).ok();
+                        } else {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        continue;
+                    }
+                    match slices.recv_timeout(Duration::from_micros(500)) {
+                        Ok(slice) => {
+                            feedback.queued.fetch_sub(slice.msgs.len() as u64, Ordering::Relaxed);
+                            slice
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            self.all_notes_off();
+                            return None;
+                        }
+                    }
                 }
-                continue;
             };
-
-            let target_us = tempo.tick_to_time_with_cache(tick, &mut seg_idx);
-
-            // Wait for the event's time. Sleep in short slices (commands stay responsive),
-            // then spin the last stretch for accuracy.
-            if target_us > now_us {
-                // Song time runs `speed`x faster than wall time.
-                let wait_us = ((target_us - now_us) as f64 / speed) as u64;
-                if wait_us > 1_500 {
-                    thread::sleep(Duration::from_micros((wait_us - 1_000).min(5_000)));
-                } else {
-                    std::hint::spin_loop();
-                }
+            if slice.epoch != epoch {
+                let _ = spare.try_send(slice);
+                continue;
+            }
+            if slice.end {
+                exhausted = true;
+                let _ = spare.try_send(slice);
                 continue;
             }
 
-            // Everything due by now goes out in one call, in order. (When behind, that
-            // is a lot of ticks: one clock read, one synth call and one stats update
-            // instead of one each per tick.)
-            let slice_start = Instant::now();
-            live.lag_us = ((now_us - target_us) as f64 / speed) as u64; // wall time
-            costs.speed = speed;
-            eng.skipper.regulate(live.lag_us, slice_start, costs);
-            batch.clear();
-            let (decoded0, sent0) = (eng.decoded, eng.sent);
-            let (mut tick, mut target_us) = (tick, target_us);
-            loop {
-                abs_time_us = target_us;
-                eng.process_tick(&song, tick, target_us, tempo.us_per_tick(seg_idx), &mut batch);
-                acc.ticks += 1;
-                if batch.len() >= MAX_SLICE_MSGS {
-                    break;
-                }
-                let Some(next) = eng.cur.next_tick() else { break };
-                let next_us = tempo.tick_to_time_with_cache(next, &mut seg_idx);
-                if next_us > now_us {
-                    break;
-                }
-                (tick, target_us) = (next, next_us);
+            // Wait for its time. Sleep in short slices (commands stay responsive), then
+            // spin the last stretch for accuracy. With timestamps it goes out a few ms
+            // early instead (the synth knows when), so nothing needs spinning; a slice
+            // with SysEx still goes out on time, since SysEx can't be timestamped.
+            let timed = timed_on && slice.sysex.is_empty() && slice.offs.len() == slice.msgs.len();
+            let lead = if timed { (TIMED_LEAD_US as f64 * speed) as u64 } else { 0 };
+            // Song time runs `speed`x faster than wall time.
+            let wait_us = (slice.first_us.saturating_sub(now_us).saturating_sub(lead) as f64 / speed) as u64;
+            if wait_us > 1_500 {
+                thread::sleep(Duration::from_micros((wait_us - 1_000).min(5_000)));
+                waiting = Some(slice);
+                continue;
+            }
+            if wait_us > 0 && !timed {
+                std::hint::spin_loop();
+                waiting = Some(slice);
+                continue;
             }
 
-            // Send, timing the synth separately from our own work.
+            // Everything due by now goes out in order; behind the clock, slices follow
+            // each other without a pause (no decoding in between: that's another thread).
+            live.lag_us = (now_us.saturating_sub(slice.first_us) as f64 / speed) as u64; // wall time
+            feedback.lag_us.store(live.lag_us, Ordering::Relaxed);
+            abs_time_us = slice.first_us;
+            acc.ticks += slice.ticks;
+            acc.sched += slice.own;
+            notes_this_second += slice.notes;
+            skipped_this_second += slice.skipped;
+            (live.notes_played, live.polyphony, live.peak_polyphony) =
+                (slice.notes_played, slice.polyphony, slice.peak_polyphony);
+
+            // Send, timing the synth separately from the decoding.
             let send_start = Instant::now();
-            self.out.send_batch(&batch);
+            if timed {
+                self.send_timed(&slice, speed);
+            } else {
+                self.send_events(&song, &slice.msgs, &slice.sysex);
+            }
             let done = Instant::now();
-            let (send_time, own_time) = (done - send_start, send_start - slice_start);
-            acc.sched += own_time;
+            let send_time = done - send_start;
             acc.synth += send_time;
             acc.worst_batch = acc.worst_batch.max(send_time);
-            acc.msgs += batch.len() as u64;
+            acc.msgs += slice.msgs.len() as u64;
 
-            // What things cost, for the skipper's budget (only from slices big enough
-            // to measure).
-            let (decoded, sent) = ((eng.decoded - decoded0) as f32, (eng.sent - sent0) as f32);
-            let ewma = |cost: &mut f32, sample: f32| *cost += 0.2 * (sample - *cost);
-            if batch.len() >= 32 {
-                ewma(&mut costs.synth_ns, send_time.as_nanos() as f32 / batch.len() as f32);
+            // What the synth costs, for the skipper's budget (only from slices big
+            // enough to measure).
+            if slice.msgs.len() >= 32 {
+                synth_ns += 0.2 * (send_time.as_nanos() as f32 / slice.msgs.len() as f32 - synth_ns);
+                feedback.synth_ns.store(synth_ns.to_bits(), Ordering::Relaxed);
             }
-            if decoded >= 32.0 {
-                ewma(&mut costs.engine_ns, own_time.as_nanos() as f32 / decoded);
-            }
-            if sent >= 32.0 {
-                ewma(&mut costs.msgs_per_note, batch.len() as f32 / sent);
-            }
+            let _ = spare.try_send(slice);
 
             // --- Telemetry and Stats ---
             if done - last_second >= Duration::from_secs(1) {
-                live.nps = std::mem::take(&mut eng.notes_this_second);
-                live.skipped_nps =
-                    std::mem::take(&mut eng.skipper.skipped) as u64 + std::mem::take(&mut eng.repeats_skipped);
+                live.nps = std::mem::take(&mut notes_this_second);
+                live.skipped_nps = std::mem::take(&mut skipped_this_second);
                 live.stats = acc.take();
                 live.stats.batched = self.out.batched();
                 live.playback_time_us = self.clock.now_us();
-                eng.sync(&mut live);
                 if let Some(log) = &mut log {
                     log.row(&live, speed, &self.choice, self.skipping);
                 }
@@ -1018,7 +1508,6 @@ impl Player {
             }
 
             if done - last_ui >= UI_UPDATE {
-                eng.sync(&mut live);
                 live.svms = self.out.svms_stats();
                 live.playback_time_us = self.clock.now_us();
                 live.is_playing = !self.clock.is_paused();
@@ -1028,7 +1517,58 @@ impl Player {
         }
     }
 
+    /// Send a batch that may hold SysEx markers: the messages between them go out as
+    /// batches, each SysEx on its own, in order.
+    fn send_events(&mut self, song: &SongData, msgs: &[u32], sysex: &[SysexRef]) {
+        if self.long_data && self.out.can_long() {
+            // All of it through long messages, even a few events: they don't go through
+            // the synth's event buffer, so mixing the paths could reorder them.
+            let Self { out, stream_buf, .. } = self;
+            return stream_chunks(song, msgs, sysex, stream_buf, |b| out.send_long(b));
+        }
+        if sysex.is_empty() {
+            return self.out.send_batch(msgs);
+        }
+        let (mut from, mut bytes) = (0, Vec::new());
+        for (i, &m) in msgs.iter().enumerate() {
+            if m as u8 != 0xF0 {
+                continue;
+            }
+            self.out.send_batch(&msgs[from..i]);
+            from = i + 1;
+            let x = sysex[(m >> 8) as usize];
+            bytes.clear();
+            if x.status == 0xF0 {
+                bytes.push(0xF0);
+            }
+            bytes.extend_from_slice(song.midi.sysex(x.at, x.len));
+            self.out.send_long(&bytes);
+        }
+        self.out.send_batch(&msgs[from..]);
+    }
+
+    /// Hand a slice to the synth with the time each message is due, in the synth's clock.
+    fn send_timed(&mut self, slice: &Slice, speed: f64) {
+        let Some((qpc, freq)) = self.out.synth_clock() else { return };
+        let mut horizon = self.horizon.get();
+        stamp_slice(slice.first_us, &slice.offs, self.clock.now_us(), speed, qpc, freq, &mut horizon, &mut self.stamps);
+        self.horizon.set(horizon);
+        self.out.send_batch_at(&slice.msgs, &self.stamps);
+    }
+
+    /// Wait for what was handed to the synth with a time in the future to play out, so
+    /// that what is sent next (silencing, a seek's chase) comes after it.
+    fn wait_for_horizon(&self) {
+        let horizon = self.horizon.replace(0);
+        if let Some((now, freq)) = self.out.synth_clock() {
+            if horizon > now {
+                thread::sleep(Duration::from_micros((horizon - now) * 1_000_000 / freq.max(1) + 200));
+            }
+        }
+    }
+
     fn all_notes_off(&self) {
+        self.wait_for_horizon();
         let msgs: Vec<u32> = (0..16)
             .flat_map(|ch| {
                 [
@@ -1071,6 +1611,237 @@ mod tests {
         offs.retain(|(_, d)| matches!(d, Due::Off(_)));
         offs.sort();
         assert_eq!(offs, [(192, Due::Off((0, 60))), (384, Due::Off((1, 48)))]);
+    }
+
+    #[test]
+    fn seek_chases_controller_state() {
+        // ch 0: bank, program, volume twice (last wins), bend; RPN 0 data; then a note at 200.
+        let trk = [
+            0x00, 0xB0, 0, 5, 0x00, 0xC0, 9, 0x00, 0xB0, 7, 100, 0x01, 0xB0, 7, 50,
+            0x00, 0xE0, 1, 2, 0x00, 0xB0, 101, 0, 0x00, 0xB0, 100, 0, 0x00, 0xB0, 6, 12,
+            0x81, 0x48, 0x90, 60, 100, 0x10, 0x80, 60, 0,
+        ];
+        let mut f = b"MThd".to_vec();
+        f.extend_from_slice(&[0, 0, 0, 6, 0, 0, 0, 1, 0, 96]);
+        f.extend_from_slice(b"MTrk");
+        f.extend_from_slice(&(trk.len() as u32).to_be_bytes());
+        f.extend_from_slice(&trk);
+        let path = std::env::temp_dir().join("kimrashi_seek_ctl_test.mid");
+        std::fs::write(&path, f).unwrap();
+        let song = SongData::load(&path, 127, &Default::default()).unwrap();
+        let s = Cursor::seek(&song, 100);
+        let m = |st, a, b| pack_short(st, a, b);
+        // bank, program, then the rest by tick; volume 100 was overwritten by 50.
+        assert_eq!(
+            s.controllers,
+            [m(0xB0, 0, 5), m(0xC0, 9, 0), m(0xB0, 7, 50), m(0xE0, 1, 2), m(0xB0, 101, 0), m(0xB0, 100, 0), m(0xB0, 6, 12)]
+        );
+        assert!(s.chase.is_empty());
+        assert!(Cursor::seek(&song, 0).controllers.is_empty());
+    }
+
+    #[test]
+    fn sysex_is_played_in_order_and_chased_from_the_last_reset() {
+        let trk = [
+            0x00, 0xB0, 7, 90, // tick 0: volume (undone by the reset)
+            0x0A, 0xF0, 5, 0x7E, 0x7F, 0x09, 0x01, 0xF7, // tick 10: GM on
+            0x0A, 0xF0, 3, 0x41, 0x10, 0xF7, // tick 20
+            0x00, 0xB0, 10, 64, // tick 20: pan
+            0x0A, 0x90, 60, 100, 0x0A, 0x80, 60, 0, // tick 30..40
+        ];
+        let mut f = b"MThd".to_vec();
+        f.extend_from_slice(&[0, 0, 0, 6, 0, 0, 0, 1, 0, 96]);
+        f.extend_from_slice(b"MTrk");
+        f.extend_from_slice(&(trk.len() as u32).to_be_bytes());
+        f.extend_from_slice(&trk);
+        let path = std::env::temp_dir().join(format!("kimrashi_sysex_test_{}.mid", std::process::id()));
+        std::fs::write(&path, f).unwrap();
+        let song = SongData::load(&path, 127, &Default::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
+        let mut batch = vec![];
+        while let Some(tick) = eng.cur.next_tick() {
+            eng.process_tick(&song, tick, 0, 0.0, &mut batch);
+        }
+        let m = &song.midi;
+        let bytes: Vec<_> = eng.sysex.iter().map(|x| (x.status, m.sysex(x.at, x.len).to_vec())).collect();
+        assert_eq!(bytes, [(0xF0, vec![0x7E, 0x7F, 0x09, 0x01, 0xF7]), (0xF0, vec![0x41, 0x10, 0xF7])]);
+        assert_eq!(
+            batch,
+            [pack_short(0xB0, 7, 90), sysex_marker(0), sysex_marker(1), pack_short(0xB0, 10, 64), pack_short(0x90, 60, 100), pack_short(0x80, 60, 0)]
+        );
+
+        // As a byte stream: running status, the note-off as a velocity-0 note-on, and each
+        // SysEx in a message of its own (the chunk before it ends there).
+        let mut chunks: Vec<Vec<u8>> = vec![];
+        stream_chunks(&song, &batch, &eng.sysex, &mut vec![], |b| chunks.push(b.to_vec()));
+        assert_eq!(
+            chunks,
+            [
+                vec![0xB0, 7, 90],
+                vec![0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7],
+                vec![0xF0, 0x41, 0x10, 0xF7],
+                vec![0xB0, 10, 64, 0x90, 60, 100, 60, 0],
+            ]
+        );
+
+        // Seeking to tick 25: the volume came before the reset, so only the reset, the
+        // later SysEx and the pan are sent.
+        let s = Cursor::seek(&song, 25);
+        assert_eq!(s.controllers, [sysex_marker(0), sysex_marker(1), pack_short(0xB0, 10, 64)]);
+        assert_eq!(s.sysex.len(), 2);
+        assert_eq!(m.sysex(s.sysex[0].at, s.sysex[0].len), [0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        // At tick 15 only the reset is behind it; at tick 5 only the volume.
+        assert_eq!(Cursor::seek(&song, 15).controllers, [sysex_marker(0)]);
+        assert_eq!(Cursor::seek(&song, 5).controllers, [pack_short(0xB0, 7, 90)]);
+    }
+
+    /// How fast the playback thread(s) get through a song with no synth to wait for: plays
+    /// generated black MIDI unpaced on a closed output and prints what telemetry says.
+    /// `cargo test --release player_loop_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn player_loop_throughput() {
+        use crate::clock::PlaybackClock;
+        let path = std::env::temp_dir().join(format!("kimrashi_loop_{}.mid", std::process::id()));
+        std::fs::write(&path, crate::benchmark::midi_file(16, 2_000_000)).unwrap();
+        let song = SongData::load(&path, 127, &Default::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (tel_tx, tel_rx) = crossbeam_channel::unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(PlaybackClock::new());
+        clock.set_speed(std::env::var("SPEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1e9));
+        Player::new(None, OutputChoice::Kdmapi, cmd_rx, tel_tx, stop.clone(), clock);
+        let total = song.midi.note_count;
+        crate::output::SIM_SYNTH_NS.store(std::env::var("SYNTH_NS").ok().and_then(|s| s.parse().ok()).unwrap_or(0), Ordering::Relaxed);
+        cmd_tx.send(PlayerCommand::SetSkipping(false)).unwrap();
+        cmd_tx.send(PlayerCommand::Play(song)).unwrap();
+        // Unpaced (a huge speed): the song plays as fast as the player can get through it.
+        let start = Instant::now();
+        let (mut played, mut worst_lag) = (0, 0);
+        while start.elapsed() < Duration::from_secs(60) {
+            if let Ok(t) = tel_rx.recv_timeout(Duration::from_millis(100)) {
+                played = t.notes_played;
+                worst_lag = worst_lag.max(t.lag_us);
+                if !t.is_playing && played > 0 {
+                    break;
+                }
+            }
+        }
+        let secs = start.elapsed().as_secs_f64();
+        stop.store(true, Ordering::SeqCst);
+        println!("{played} of {total} notes in {secs:.2} s: {:.1} M notes/s, worst lag {worst_lag} us", played as f64 / secs / 1e6);
+    }
+
+    #[test]
+    fn the_player_sends_what_the_engine_makes_and_plays_it_again_after_a_seek() {
+        use crate::clock::PlaybackClock;
+        let (song, _) = load_random_song("pipeline");
+        let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
+        let mut want = vec![];
+        while let Some(tick) = eng.cur.next_tick() {
+            eng.process_tick(&song, tick, 0, 0.0, &mut want);
+        }
+        assert!(want.len() > 500);
+
+        *crate::output::CAPTURE.lock().unwrap() = Some(vec![]);
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (tel_tx, tel_rx) = crossbeam_channel::unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(PlaybackClock::new());
+        clock.set_speed(1e6); // the song is over in an instant
+        Player::new(None, OutputChoice::Kdmapi, cmd_rx, tel_tx, stop.clone(), clock.clone());
+        let finished = || {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(20) {
+                if let Ok(t) = tel_rx.recv_timeout(Duration::from_millis(50)) {
+                    if !t.is_playing && t.playback_time_us > 0 {
+                        return;
+                    }
+                }
+            }
+            panic!("the song did not finish");
+        };
+        let take = || std::mem::take(crate::output::CAPTURE.lock().unwrap().as_mut().unwrap());
+        // Everything a pass sends, minus the all-notes-off (2 messages x 16 channels) at its end.
+        let check = |got: Vec<u32>, lead: usize| {
+            assert_eq!(got.len(), lead + want.len() + 32);
+            assert!(got[lead..got.len() - 32] == want[..], "the messages differ");
+        };
+        cmd_tx.send(PlayerCommand::SetSkipping(false)).unwrap();
+        cmd_tx.send(PlayerCommand::Play(song)).unwrap();
+        finished();
+        check(take(), 0);
+
+        // Like the UI's seek: the clock runs from there, and the player is told.
+        clock.set_running(0);
+        cmd_tx.send(PlayerCommand::Seek(0)).unwrap();
+        finished();
+        check(take(), 32); // the seek's own all-notes-off first
+        stop.store(true, Ordering::SeqCst);
+        *crate::output::CAPTURE.lock().unwrap() = None;
+    }
+
+    /// Read a byte stream back into messages the way a synth would (running status, SysEx
+    /// as markers' worth of bytes), with note-offs as the note-ons of velocity 0 they were sent as.
+    fn read_stream(bytes: &[u8]) -> Vec<u32> {
+        let (mut out, mut i, mut running) = (vec![], 0, 0u8);
+        while i < bytes.len() {
+            if bytes[i] & 0x80 != 0 {
+                running = bytes[i];
+                i += 1;
+            }
+            assert!(running != 0, "data without a status");
+            let n = if matches!(running & 0xF0, 0xC0 | 0xD0) { 1 } else { 2 };
+            let d = &bytes[i..i + n];
+            assert!(d.iter().all(|&b| b < 0x80), "a status byte inside a message");
+            out.push(pack_short(running, d[0], *d.get(1).unwrap_or(&0)));
+            i += n;
+        }
+        out
+    }
+
+    #[test]
+    fn byte_streams_read_back_as_the_messages_they_were_made_from() {
+        let (song, _) = load_random_song("stream");
+        let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
+        let (mut batch, mut sent) = (vec![], 0);
+        while let Some(tick) = eng.cur.next_tick() {
+            eng.process_tick(&song, tick, 0, 0.0, &mut batch);
+        }
+        let batch = batch.repeat(20); // enough for several chunks
+        let mut chunks = vec![];
+        stream_chunks(&song, &batch, &[], &mut vec![], |b| {
+            assert!(b.len() < 4096 + 3);
+            chunks.push(b.to_vec());
+        });
+        assert!(chunks.len() > 1);
+        let got: Vec<u32> = chunks.iter().flat_map(|c| read_stream(c)).collect();
+        let want: Vec<u32> = batch
+            .iter()
+            .map(|&m| if m & 0xF0 == 0x80 { pack_short(m as u8 | 0x10, (m >> 8) as u8, 0) } else { m })
+            .collect();
+        assert_eq!(got, want);
+        // and it is shorter than the 4 bytes a message
+        sent += chunks.iter().map(|c| c.len()).sum::<usize>();
+        assert!(sent < batch.len() * 3, "{sent} bytes for {} messages", batch.len());
+    }
+
+    #[test]
+    fn timestamps_follow_the_song_clock_and_never_go_backwards() {
+        let (mut last, mut out) = (0, vec![]);
+        // A 10 MHz clock at 2x speed: a song microsecond is 5 ticks. Due 2000, 2500 and
+        // 2500 song us ahead of now.
+        stamp_slice(1_000_000, &[1_000, 1_500, 1_500], 999_000, 2.0, 5_000, 10_000_000, &mut last, &mut out);
+        assert_eq!(out, [15_000, 17_500, 17_500]);
+        // A later slice that is already late goes as of now, but not before what was sent.
+        stamp_slice(1_000_200, &[0], 1_001_000, 2.0, 5_100, 10_000_000, &mut last, &mut out);
+        assert_eq!((&out[..], last), (&[17_500][..], 17_500));
+        // On time and past the horizon: its own time.
+        stamp_slice(1_010_000, &[0], 1_001_000, 2.0, 5_100, 10_000_000, &mut last, &mut out);
+        assert_eq!(out, [5_100 + 45_000]);
     }
 
     #[test]

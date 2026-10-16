@@ -19,6 +19,7 @@ struct Globals {
     instance_count: u32,
     now_lo: u32,
     now_hi: u32,
+    time_shift: f32,
 };
 
 @group(0) @binding(0)
@@ -120,7 +121,7 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     // A GPU division may multiply by a rounded reciprocal. Include its low part
     // with one rounding, matching the CPU's f32 / 1_000_000 at raster boundaries.
     let seconds = fma(delta, 0.000001, delta * 2.52475729e-15);
-    let start = select(seconds, -seconds, negative);
+    let start = select(seconds, -seconds, negative) + globals.time_shift;
     let start_norm = clamp(start / safe_height, 0.0, 2.0);
     let end_norm = clamp((start + note_length) / safe_height, 0.0, 2.0);
 

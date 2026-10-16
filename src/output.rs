@@ -6,14 +6,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use winapi::um::mmeapi::{
-    midiOutClose, midiOutGetDevCapsW, midiOutGetNumDevs, midiOutOpen, midiOutReset,
-    midiOutShortMsg,
+    midiOutClose, midiOutGetDevCapsW, midiOutGetNumDevs, midiOutLongMsg, midiOutOpen,
+    midiOutPrepareHeader, midiOutReset, midiOutShortMsg, midiOutUnprepareHeader,
 };
-use winapi::um::mmsystem::{CALLBACK_NULL, HMIDIOUT, MIDIOUTCAPSW};
+use winapi::um::mmsystem::{CALLBACK_NULL, HMIDIOUT, MIDIHDR, MIDIOUTCAPSW};
+
+const MHDR_DONE: u32 = 1;
 
 use crate::clock::PlaybackClock;
 use crate::omnimidi::OmniMIDI;
 use crate::svms;
+
+/// Tests: what a closed output pretends each message costs the synth (ns).
+#[cfg(test)]
+pub static SIM_SYNTH_NS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Tests: what a closed output was sent, while this is `Some`.
+#[cfg(test)]
+pub static CAPTURE: Mutex<Option<Vec<u32>>> = Mutex::new(None);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutputChoice {
@@ -113,10 +123,87 @@ impl Output {
 }
 
 impl Output {
+    /// Whether events can be submitted with exact times (SVMS's native API).
+    pub fn can_timed(&self) -> bool {
+        matches!(self, Output::Kdmapi(_, Some(s)) if s.link.can_timestamp())
+    }
+
+    /// The synth's clock: (ticks now, ticks per second), the domain of event timestamps.
+    pub fn synth_clock(&self) -> Option<(u64, u64)> {
+        match self {
+            Output::Kdmapi(_, Some(s)) if s.link.can_timestamp() => Some(s.link.clock()),
+            _ => None,
+        }
+    }
+
+    /// Submit messages, each to sound at its timestamp (see `synth_clock`).
+    pub fn send_batch_at(&self, msgs: &[u32], stamps: &[u64]) {
+        if let Output::Kdmapi(_, Some(s)) = self {
+            let mut events = s.scratch.borrow_mut();
+            events.clear();
+            events.extend(msgs.iter().zip(stamps).map(|(&m, &t)| svms::short_event_at(m, t)));
+            s.link.send_batch(&events);
+        }
+    }
+
+    /// Whether long messages can carry batches of events: a KDMAPI synth with the long-data
+    /// exports, other than SVMS, whose `SendDirectLongData` only takes complete SysEx
+    /// (F0 .. F7) and quietly ignores anything else, a byte stream included.
+    pub fn can_long(&self) -> bool {
+        matches!(self, Output::Kdmapi(omni, _) if omni.has_long() && omni.svms_get_interface.is_none())
+    }
+
+    /// Send one SysEx (or other long) message, status byte included.
+    pub fn send_long(&self, bytes: &[u8]) {
+        match self {
+            Output::Closed => {}
+            Output::Kdmapi(_, Some(s)) if s.link.can_sysex() && bytes.first() == Some(&0xF0) => s.link.send_sysex(bytes),
+            Output::Kdmapi(omni, _) => unsafe { omni.send_long_msg(bytes) },
+            Output::WinMM(h) => unsafe {
+                // Boxed: a device that never finishes keeps the header (and its copy of
+                // the bytes), so then both are leaked instead of freed under it.
+                let mut data = bytes.to_vec().into_boxed_slice();
+                let mut hdr: Box<MIDIHDR> = Box::new(std::mem::zeroed());
+                hdr.lpData = data.as_mut_ptr() as *mut _;
+                hdr.dwBufferLength = bytes.len() as u32;
+                hdr.dwBytesRecorded = bytes.len() as u32;
+                let size = std::mem::size_of::<MIDIHDR>() as u32;
+                if midiOutPrepareHeader(*h, &mut *hdr, size) != 0 {
+                    return;
+                }
+                if midiOutLongMsg(*h, &mut *hdr, size) == 0 {
+                    // The device reads the buffer until it's done with it.
+                    let start = std::time::Instant::now();
+                    while std::ptr::addr_of!(hdr.dwFlags).read_unaligned() & MHDR_DONE == 0
+                        && start.elapsed() < std::time::Duration::from_millis(500)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                if midiOutUnprepareHeader(*h, &mut *hdr, size) != 0 {
+                    Box::leak(hdr);
+                    Box::leak(data);
+                }
+            },
+        }
+    }
+
     /// Send many messages: one call through SVMS's batch API (when enabled) or the
     /// synth's `SendDirectDataBatch` export, otherwise one call per message.
     #[inline]
     pub fn send_batch(&self, msgs: &[u32]) {
+        #[cfg(test)]
+        if matches!(self, Output::Closed) {
+            if let Some(v) = CAPTURE.lock().unwrap().as_mut() {
+                v.extend_from_slice(msgs);
+            }
+            let ns = SIM_SYNTH_NS.load(std::sync::atomic::Ordering::Relaxed) as u64 * msgs.len() as u64;
+            let start = std::time::Instant::now();
+            while (start.elapsed().as_nanos() as u64) < ns {
+                std::hint::spin_loop();
+            }
+            return;
+        }
         match self {
             Output::Kdmapi(_, Some(s)) if s.batch.get() => {
                 let mut events = s.scratch.borrow_mut();

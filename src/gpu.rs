@@ -229,6 +229,9 @@ struct GlobalsUniform {
     /// Instances drawn this frame (for per-instance depth).
     instance_count: u32,
     now_us: [u32; 2],
+    /// Seconds added to every note's start: negative song time (export lead-in).
+    time_shift: f32,
+    _pad: [f32; 3],
 }
 
 /// Depth buffer bits requested from eframe (see `NativeOptions::depth_buffer`), and
@@ -300,6 +303,8 @@ impl CallbackTrait for NotesCallback {
             flat_mode: if self.flat_notes { 1 } else { 0 },
             instance_count: 0, // set in `upload`
             now_us: [self.now_us as u32, (self.now_us >> 32) as u32],
+            time_shift: 0.0,
+            _pad: [0.0; 3],
         };
 
         let pipeline = resources
@@ -675,7 +680,7 @@ impl RenderBenchmark {
         self.pipeline.upload(&self.device, &self.queue, instances, keys, GlobalsUniform {
             height_time, win_width: self.width as f32, win_height: self.height as f32,
             direction_sign: 1.0, flat_mode: 0, instance_count: 0,
-            now_us: [now_us as u32, (now_us >> 32) as u32],
+            now_us: [now_us as u32, (now_us >> 32) as u32], time_shift: 0.0, _pad: [0.0; 3],
         });
         let upload = t0.elapsed();
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -738,6 +743,110 @@ impl RenderBenchmark {
         rx.recv().unwrap().unwrap();
         let data = buffer.slice(..).get_mapped_range();
         data.chunks(stride as usize).flat_map(|row| row[..self.width as usize * 4].iter().copied()).collect()
+    }
+}
+
+/// Offscreen notes for video export: the notes pipeline in the top `note_height` rows,
+/// the rest left to the caller (keyboard), read back as RGBA.
+pub struct Offscreen {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: NotePipeline,
+    color_texture: wgpu::Texture,
+    color: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    readback: wgpu::Buffer,
+    stride: u32,
+    width: u32,
+    height: u32,
+    note_height: u32,
+}
+
+impl Offscreen {
+    pub fn new(width: u32, height: u32, note_height: u32) -> Result<Self, String> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster_block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .map_err(|e| format!("no GPU adapter: {e}"))?;
+        let (device, queue) = pollster_block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(), ..Default::default()
+        })).map_err(|e| format!("GPU device: {e}"))?;
+        let texture = |format, label, usage| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[],
+        });
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let color_texture = texture(format, "export.color", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let color = color_texture.create_view(&Default::default());
+        let depth = texture(DEPTH_FORMAT, "export.depth", wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
+        let pipeline = NotePipeline::new(&device, format);
+        let stride = (width * 4).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export.readback"), size: stride as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+        Ok(Self { device, queue, pipeline, color_texture, color, depth, readback, stride, width, height, note_height })
+    }
+
+    /// Draws one frame and copies the whole target into `out` (width * height * 4 bytes).
+    pub fn render(&mut self, instances: &Arc<InstanceRing>, keys: &[KeyPosition; 256], height_time: f32,
+        now_us: u64, time_shift: f32, background: [u8; 3], direction_sign: f32, flat: bool, out: &mut Vec<u8>)
+    {
+        self.pipeline.upload(&self.device, &self.queue, instances, keys, GlobalsUniform {
+            height_time, win_width: self.width as f32, win_height: self.note_height as f32,
+            direction_sign, flat_mode: flat as u32, instance_count: 0,
+            now_us: [now_us as u32, (now_us >> 32) as u32], time_shift, _pad: [0.0; 3],
+        });
+        let bg = background.map(|c| c as f64 / 255.0);
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("export.notes"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: bg[0], g: bg[1], b: bg[2], a: 1.0 }), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None, occlusion_query_set: None,
+            }).forget_lifetime();
+            pass.set_viewport(0.0, 0.0, self.width as f32, self.note_height as f32, 0.0, 1.0);
+            self.pipeline.draw(&mut pass);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &self.color_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &self.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.stride), rows_per_image: None } },
+            wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::PollType::Wait).unwrap();
+        rx.recv().unwrap().unwrap();
+        let row = self.width as usize * 4;
+        out.clear();
+        {
+            let data = self.readback.slice(..).get_mapped_range();
+            for rows in data.chunks(self.stride as usize).take(self.height as usize) { out.extend_from_slice(&rows[..row]); }
+        }
+        self.readback.unmap();
+    }
+}
+
+fn pollster_block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::{sync::Arc, task::{Context, Poll, Wake, Waker}};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark { fn wake(self: Arc<Self>) { self.0.unpark(); } }
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::park(),
+        }
     }
 }
 

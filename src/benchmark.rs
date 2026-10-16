@@ -160,7 +160,7 @@ fn chunk(body: &[u8]) -> Vec<u8> {
 }
 
 /// A MIDI file of `tracks` tracks of `notes` notes each.
-fn midi_file(tracks: u32, notes: u32) -> Vec<u8> {
+pub(crate) fn midi_file(tracks: u32, notes: u32) -> Vec<u8> {
     let mut f = b"MThd".to_vec();
     f.extend_from_slice(&[0, 0, 0, 6, 0, 1]);
     f.extend_from_slice(&(tracks as u16).to_be_bytes());
