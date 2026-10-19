@@ -68,9 +68,11 @@ pub fn run_from_args() -> bool {
     if let Some(i) = args.iter().position(|a| a == "--engine") {
         // The playback engine alone (no synth, no clock) over a whole file.
         let song = SongData::load(&args[i + 1], 127, &crate::parser::Progress::default()).expect("load");
-        let t = std::time::Instant::now();
-        let (decoded, played, hash) = crate::player::bench_engine(&song);
-        let secs = t.elapsed().as_secs_f64();
+        let m = &song.midi;
+        let refs: usize = m.tracks.iter().map(|t| t.len()).sum();
+        println!("packed: {} tracks, {} chunk refs, {} distinct chunks, {} MB stored of {} MB before dedup",
+            m.tracks.len(), refs, m.chunks.len(), m.store.len() >> 20, m.logical_bytes >> 20);
+        let (decoded, played, hash, secs) = crate::player::bench_engine(&song);
         println!("engine: {secs:.2} s, {} distinct notes ({}/s), {} counting repeated tracks ({}/s)",
             crate::si(decoded as f64), crate::si(decoded as f64 / secs), crate::si(played as f64), crate::si(played as f64 / secs));
         println!("hash {hash:016x}");

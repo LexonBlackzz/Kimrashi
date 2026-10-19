@@ -15,6 +15,8 @@ use crate::output::{Output, OutputChoice, SvmsSetup};
 use crate::parser::{Record, TrackReader};
 use crate::song::SongData;
 
+mod par;
+
 pub enum PlayerCommand {
     Play(Arc<SongData>),
     Stop,
@@ -256,17 +258,47 @@ impl<T: Copy> RadixHeap<T> {
     fn min_key(&mut self) -> Option<u32> {
         if self.buckets[0].is_empty() {
             let b = (1..33).find(|&b| !self.buckets[b].is_empty())?;
-            let mut items = std::mem::take(&mut self.buckets[b]);
-            self.last = items.iter().map(|&(k, _)| k).min().unwrap();
-            // Every item now lands in a lower bucket, so bucket b stays empty.
-            for &(k, item) in &items {
-                let nb = self.bucket(k);
-                self.buckets[nb].push((k, item));
-            }
-            items.clear();
-            self.buckets[b] = items; // keep the allocation
+            self.gather(b);
         }
         Some(self.last)
+    }
+
+    /// Spread bucket `b` over the lower buckets, `last` becoming its smallest key.
+    fn gather(&mut self, b: usize) {
+        let mut items = std::mem::take(&mut self.buckets[b]);
+        self.last = items.iter().map(|&(k, _)| k).min().unwrap();
+        // Every item now lands in a lower bucket, so bucket b stays empty.
+        for &(k, item) in &items {
+            let nb = self.bucket(k);
+            self.buckets[nb].push((k, item));
+        }
+        items.clear();
+        self.buckets[b] = items; // keep the allocation
+    }
+
+    /// `min_key`, but only if it is below `limit`; otherwise None and `last` stays where
+    /// it was, so pushes at or after the caller's own position remain valid.
+    fn min_key_below(&mut self, limit: u32) -> Option<u32> {
+        if self.buckets[0].is_empty() {
+            let b = (1..33).find(|&b| !self.buckets[b].is_empty())?;
+            // The least key bucket b can hold (it differs from `last` first at bit b - 1).
+            if ((self.last >> (b - 1)) | 1) << (b - 1) >= limit
+                || self.buckets[b].iter().all(|&(k, _)| k >= limit)
+            {
+                return None;
+            }
+            self.gather(b);
+        }
+        (self.last < limit).then_some(self.last)
+    }
+
+    /// The smallest key without moving anything.
+    fn peek_min(&self) -> Option<u32> {
+        if !self.buckets[0].is_empty() {
+            return Some(self.last);
+        }
+        let b = (1..33).find(|&b| !self.buckets[b].is_empty())?;
+        self.buckets[b].iter().map(|&(k, _)| k).min()
     }
 
     /// Move the items with the smallest key into `out` (call `min_key` first).
@@ -744,11 +776,18 @@ struct Engine {
     /// Scratch: what's due this tick, and its tracks.
     due_buf: Vec<Due>,
     track_buf: Vec<u32>,
+    /// Notes' slots split over threads (see `par`); while set, note-offs and the skipper's
+    /// per-slot state live there instead of in `cur.due` and `skipper`.
+    par: Option<par::Parallel>,
+    /// Note-offs at the start of the last `process_tick`'s messages (they go first).
+    off_count: usize,
 }
 
 impl Engine {
     fn new(cur: Cursor, skipper: Skipper) -> Self {
         Self {
+            par: None,
+            off_count: 0,
             cur,
             skipper,
             notes_played: 0,
@@ -764,15 +803,25 @@ impl Engine {
         }
     }
 
+    /// The next tick with anything due, in either mode.
+    fn next_tick(&mut self) -> Option<u32> {
+        match &self.par {
+            None => self.cur.next_tick(),
+            Some(par) => par.next_tick(),
+        }
+    }
+
     /// Append the messages for `tick` (which plays at `target_us`, `us_per_tick` long)
     /// to `batch`: due note-offs first, so a key struck again on this tick isn't cut
     /// off, then every track's records at this tick.
     fn process_tick(&mut self, song: &SongData, tick: u32, target_us: u64, us_per_tick: f32, batch: &mut Vec<u32>) {
         let cur = &mut self.cur;
         let skipper = &mut self.skipper;
+        let first = batch.len();
 
         // Note-offs due now go first, so a key struck again on this tick isn't cut off.
         if cur.due.min_key() != Some(tick) {
+            self.off_count = 0;
             return;
         }
         cur.due.take_min(&mut self.due_buf);
@@ -794,6 +843,7 @@ impl Engine {
             }
         }
         self.due_buf.clear();
+        self.off_count = batch.len() - first;
 
         // Same order as the file within a tick (matters for e.g. a program change in
         // one track and a note in another on the same channel and tick).
@@ -849,18 +899,70 @@ impl Engine {
 /// Returns (notes decoded, notes counting repeated tracks, a hash of every message) so a
 /// change to the engine can be checked to leave its output as it was. `ENGINE_INTERVAL_US`
 /// runs it with note skipping at that interval, `ENGINE_HASH` computes the hash (it costs time).
-pub fn bench_engine(song: &SongData) -> (u64, u64, u64) {
-    let mut eng = Engine::new(Cursor::seek(song, 0).cursor, Skipper::new(0, true));
+pub fn bench_engine(song: &SongData) -> (u64, u64, u64, f64) {
+    let secs = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
+    let from = secs("ENGINE_FROM_S").map_or(0, |s| song.tempo.time_to_tick((s * 1e6) as u64));
+    let mut eng = Engine::new(Cursor::seek(song, from).cursor, Skipper::new(0, true));
+    if std::env::var_os("ENGINE_TRACKS").is_some() {
+        let n = song.midi.tracks.len();
+        let stop = secs("ENGINE_STOP_S").map_or(u32::MAX, |s| song.tempo.time_to_tick((s * 1e6) as u64));
+        let counts: Vec<(usize, u64)> = (0..n).into_par_iter().map(|i| {
+            let mut r = eng.cur.readers[i];
+            let d = song.midi.track(i);
+            let mut c = 0u64;
+            while let Some(_) = r.next_before(d, stop) { c += 1; }
+            (i, c)
+        }).collect();
+        eprintln!("{} tracks, copies {:?}", n, &song.midi.track_copies[..n.min(40)]);
+        let mut sorted = counts.clone(); sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
+        eprintln!("top: {:?}", &sorted[..sorted.len().min(40)]);
+        eprintln!("total {}", counts.iter().map(|x| x.1).sum::<u64>());
+    }
+    let started = Instant::now();
     eng.skipper.interval_us = std::env::var("ENGINE_INTERVAL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let hash = std::env::var_os("ENGINE_HASH").is_some();
     let (mut batch, mut h) = (Vec::new(), 0xcbf29ce484222325u64);
-    while let Some(tick) = eng.cur.next_tick() {
-        batch.clear();
-        // Time follows the tick (1 tick = 1 ms) so a skip interval means something.
-        eng.process_tick(song, tick, tick as u64 * 1000, 1000.0, &mut batch);
-        if hash { for &m in &batch { h = (h ^ m as u64).wrapping_mul(0x100000001b3); } }
+    // `ENGINE_THREADS=n` runs the engine of `par` on n threads, in windows of
+    // `ENGINE_WINDOW_TICKS` (or 6) ticks; its messages are the serial engine's, except that
+    // the note-offs of a tick are by slot (the hash puts the serial ones in that order too).
+    // `ENGINE_FROM_S` and `ENGINE_STOP_S` (seconds) run only part of the song.
+    let threads: usize = std::env::var("ENGINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let stop = secs("ENGINE_STOP_S").map_or(u32::MAX, |s| song.tempo.time_to_tick((s * 1e6) as u64));
+    let mut feed = |batch: &[u32]| {
+        if hash { for &m in batch { h = (h ^ m as u64).wrapping_mul(0x100000001b3); } }
+    };
+    if threads > 0 {
+        let span: u32 = std::env::var("ENGINE_WINDOW_TICKS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(6);
+        eng.enter_parallel(threads);
+        // Time follows the tick (1 tick = 1 ms), as below.
+        let time = |tick: u32, _seg: &mut usize| (tick as u64 * 1000, 1000.0f32);
+        let mut ends = Vec::new();
+        while let Some(first) = eng.next_tick().filter(|&t| t < stop) {
+            batch.clear();
+            ends.clear();
+            eng.process_window(song, first.saturating_add(span.max(1)), &time, &mut batch, &mut ends);
+            feed(&batch);
+        }
+    } else {
+        while let Some(tick) = eng.next_tick().filter(|&t| t < stop) {
+            batch.clear();
+            // Time follows the tick (1 tick = 1 ms) so a skip interval means something.
+            eng.process_tick(song, tick, tick as u64 * 1000, 1000.0, &mut batch);
+            if hash {
+                batch[..eng.off_count].sort_unstable_by_key(|&m| Skipper::slot(m as u8, (m >> 8) as u8));
+            }
+            feed(&batch);
+        }
     }
-    (eng.decoded, eng.notes_played, h)
+    let secs = started.elapsed().as_secs_f64();
+    if let Some(par) = &eng.par {
+        let t = &par.spent;
+        eprintln!("stages (s): parse {:.2}, decide {:.2}, collect {:.2}, emit {:.2}; sent {}",
+            t[0].as_secs_f64(), t[1].as_secs_f64(), t[2].as_secs_f64(), t[3].as_secs_f64(), eng.sent);
+        let (c, p) = eng.busy();
+        eprintln!("busy: chunks {:.2?}, partitions {:.2?}", c, p);
+    }
+    (eng.decoded, eng.notes_played, h, secs)
 }
 
 /// Messages due over a short stretch of song time, decoded ahead by the decoder thread
@@ -946,7 +1048,28 @@ struct Decoder {
     seg_idx: usize,
     /// The end of the song was reported (until the next seek).
     ended: bool,
+    /// Threads the engine may use when decoding falls behind the clock (0 = never), and how
+    /// many slices in a row it has been behind, or has had to wait for the clock.
+    threads: usize,
+    behind: u32,
+    waited: u32,
+    ends: Vec<(u32, u32)>,
 }
+
+/// Threads for the engine on this machine: it takes half the cores, which a weak machine
+/// can't spare. `KIM_ENGINE_THREADS` overrides (0 = never).
+fn engine_threads() -> usize {
+    if let Some(n) = std::env::var("KIM_ENGINE_THREADS").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    let cores = thread::available_parallelism().map_or(1, |n| n.get());
+    if cores >= 6 { (cores / 2).clamp(2, 8) } else { 0 }
+}
+
+/// Slices in a row the decoder is behind the clock before the engine goes parallel, and
+/// loops in a row it has to wait for the clock before it goes back.
+const GO_PARALLEL_AFTER: u32 = 16;
+const GO_SERIAL_AFTER: u32 = 400;
 
 /// How `Decoder::deliver` went.
 enum Delivery {
@@ -967,7 +1090,7 @@ impl Decoder {
         let (cmd_tx, cmds) = crossbeam_channel::unbounded();
         let (out, slices) = crossbeam_channel::bounded(SLICES_IN_FLIGHT);
         let (spare_tx, spare) = crossbeam_channel::bounded(SLICES_IN_FLIGHT * 2);
-        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false };
+        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), behind: 0, waited: 0, ends: Vec::new() };
         thread::Builder::new().name("player-decode".into()).spawn(move || d.run()).expect("spawn decoder");
         (cmd_tx, slices, spare_tx)
     }
@@ -977,6 +1100,8 @@ impl Decoder {
         match cmd {
             ToDecoder::Seek { epoch, cursor, chase, started, time_us } => {
                 self.epoch = epoch;
+                self.eng.par = None; // its tracks and slots are the old position's
+                self.behind = 0;
                 self.eng.cur = cursor;
                 self.eng.notes_played = started;
                 self.eng.polyphony = chase.len() as u32;
@@ -1057,7 +1182,7 @@ impl Decoder {
             if self.commands().is_err() {
                 return;
             }
-            let Some(tick) = self.eng.cur.next_tick() else {
+            let Some(tick) = self.eng.next_tick() else {
                 if !self.ended {
                     self.ended = true;
                     let mut slice = self.fresh();
@@ -1086,9 +1211,20 @@ impl Decoder {
                 continue;
             }
             if first_us > now_us.saturating_add(ahead) {
+                self.behind = 0;
+                self.waited += 1;
+                if self.waited >= GO_SERIAL_AFTER && self.eng.par.is_some() {
+                    self.eng.leave_parallel();
+                }
                 let wait = ((first_us - now_us - ahead) as f64 / speed) as u64;
                 thread::sleep(Duration::from_micros(wait.clamp(200, 2_000)));
                 continue;
+            }
+            // Behind the clock: the engine alone is not keeping up, so give it threads.
+            self.waited = 0;
+            self.behind = if first_us <= now_us { self.behind + 1 } else { 0 };
+            if self.behind >= GO_PARALLEL_AFTER && self.threads > 0 && self.eng.par.is_none() {
+                self.eng.enter_parallel(self.threads);
             }
 
             let start = Instant::now();
@@ -1096,13 +1232,27 @@ impl Decoder {
             self.costs.speed = speed;
             self.costs.synth_ns = f32::from_bits(self.feedback.synth_ns.load(Ordering::Relaxed));
             let lag_us = self.feedback.lag_us.load(Ordering::Relaxed);
-            self.eng.skipper.regulate(lag_us, start, self.costs);
+            self.eng.regulate(lag_us, start, self.costs);
             let (decoded0, sent0) = (self.eng.decoded, self.eng.sent);
             let timed = self.feedback.timed.load(Ordering::Relaxed);
             // Song time moves faster than wall time when sped up, and a slice is one send.
             let span = (SLICE_SPAN_US as f64 * speed.max(1.0)) as u64;
             slice.first_us = first_us;
             let (mut tick, mut tick_us) = (tick, first_us);
+            if self.eng.par.is_some() {
+                let limit_us = (first_us + span).min(now_us.saturating_add(ahead));
+                let end_tick = tempo.time_to_tick(limit_us).max(tick + 1);
+                let time = |t: u32, seg: &mut usize| (tempo.tick_to_time_approx(t, seg), tempo.us_per_tick(*seg));
+                self.ends.clear();
+                self.eng.process_window(&self.song, end_tick, &time, &mut slice.msgs, &mut self.ends);
+                slice.ticks += self.ends.len() as u32;
+                if timed {
+                    for &(t, end) in &self.ends {
+                        let off = (tempo.tick_to_time_approx(t, &mut self.seg_idx) - first_us).min(u32::MAX as u64) as u32;
+                        slice.offs.resize(end as usize, off);
+                    }
+                }
+            } else {
             loop {
                 self.eng.process_tick(&self.song, tick, tick_us, tempo.us_per_tick(self.seg_idx), &mut slice.msgs);
                 slice.ticks += 1;
@@ -1118,6 +1268,7 @@ impl Decoder {
                     break;
                 }
                 (tick, tick_us) = (next, next_us);
+            }
             }
             std::mem::swap(&mut self.eng.sysex, &mut slice.sysex);
             self.eng.sysex.clear();
@@ -2025,6 +2176,118 @@ mod tests {
         let asked = want.values().flat_map(|t| &t.1).filter(|&&m| m & 0xF0 == 0x90).count();
         assert!(sent > 0 && sent < asked, "{sent} of {asked}");
         assert_eq!(eng.polyphony, 0);
+    }
+
+    /// A song to compare engines on: `tracks` tracks of notes on few keys (so keys are
+    /// struck again while sounding), some of them zero-length, with controllers and SysEx
+    /// among them.
+    fn dense_song(name: &str, tracks: usize) -> Arc<SongData> {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut file = b"MThd".to_vec();
+        file.extend_from_slice(&[0, 0, 0, 6, 0, 1, 0, tracks as u8, 0, 96]);
+        for _ in 0..tracks {
+            let mut events: Vec<(u32, Vec<u8>)> = vec![];
+            let mut tick = 0u32;
+            for _ in 0..600 {
+                tick += rnd(4) as u32;
+                let (ch, key) = (rnd(3) as u8, 60 + rnd(6) as u8);
+                match rnd(12) {
+                    0 => events.push((tick, vec![0xB0 | ch, rnd(128) as u8, rnd(128) as u8])),
+                    1 => events.push((tick, vec![0xC0 | ch, rnd(128) as u8])),
+                    2 => events.push((tick, vec![0xF0, 3, 0x41, rnd(128) as u8, 0xF7])),
+                    _ => {
+                        let len = [0, 0, 1, 2, 5, 9, 20, 40][rnd(8) as usize];
+                        events.push((tick, vec![0x90 | ch, key, 1 + rnd(127) as u8]));
+                        events.push((tick + len, vec![0x80 | ch, key, 0]));
+                    }
+                }
+            }
+            events.sort_by_key(|e| e.0); // stable: a note-on stays before its own off
+            let (mut trk, mut last) = (vec![], 0);
+            for (t, data) in &events {
+                let mut delta = vec![((t - last) & 0x7F) as u8];
+                let mut d = (t - last) >> 7;
+                while d > 0 {
+                    delta.push((d & 0x7F) as u8 | 0x80);
+                    d >>= 7;
+                }
+                trk.extend(delta.iter().rev());
+                trk.extend_from_slice(data);
+                last = *t;
+            }
+            file.extend_from_slice(b"MTrk");
+            file.extend_from_slice(&(trk.len() as u32).to_be_bytes());
+            file.extend_from_slice(&trk);
+        }
+        let path = std::env::temp_dir().join(format!("kimrashi_{name}_{}.mid", std::process::id()));
+        std::fs::write(&path, file).unwrap();
+        let song = SongData::load(&path, 127, &Default::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        song
+    }
+
+    /// What the engine sends for the whole song, 100 us a tick, with a skip interval; the
+    /// parallel engine in windows of `span` ticks (0 = the serial one) and switching to the
+    /// other every `toggle` windows (0 = never). Note-offs of a tick are by slot, as the
+    /// parallel engine has them.
+    fn engine_stream(song: &SongData, interval: u64, threads: usize, span: u32, toggle: u32, eager: bool) -> (Vec<u32>, Vec<SysexRef>, u64, u32) {
+        let mut eng = Engine::new(Cursor::seek(song, 0).cursor, Skipper::new(0, true));
+        eng.skipper.interval_us = interval;
+        let (mut all, mut batch, mut ends) = (vec![], vec![], vec![]);
+        let time = |tick: u32, _: &mut usize| (tick as u64 * 100, 100.0f32);
+        if span > 0 && toggle == 0 {
+            eng.enter_parallel(threads);
+            eng.par.as_mut().unwrap().eager = eager;
+        }
+        let mut step = 0;
+        while let Some(first) = eng.next_tick() {
+            step += 1;
+            if toggle > 0 && step % toggle == 0 {
+                if eng.par.is_some() {
+                    eng.leave_parallel()
+                } else {
+                    eng.enter_parallel(threads);
+                    eng.par.as_mut().unwrap().eager = eager;
+                }
+            }
+            batch.clear();
+            if eng.par.is_some() {
+                ends.clear();
+                eng.process_window(song, first + span.max(1), &time, &mut batch, &mut ends);
+                assert!(ends.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1));
+                assert_eq!(ends.last().map_or(0, |e| e.1) as usize, batch.len());
+            } else {
+                eng.process_tick(song, first, first as u64 * 100, 100.0, &mut batch);
+                batch[..eng.off_count].sort_unstable_by_key(|&m| Skipper::slot(m as u8, (m >> 8) as u8));
+            }
+            all.extend_from_slice(&batch);
+        }
+        eng.leave_parallel();
+        (all, eng.sysex, eng.notes_played, eng.polyphony)
+    }
+
+    #[test]
+    fn the_parallel_engine_sends_what_the_serial_one_does() {
+        let song = dense_song("par", 7);
+        for interval in [0, 600, 2_000] {
+            let want = engine_stream(&song, interval, 1, 0, 0, false);
+            assert!(want.0.len() > 2_000 && !want.1.is_empty(), "{}", want.0.len());
+            if interval > 0 {
+                assert!(want.0.len() < engine_stream(&song, 0, 1, 0, 0, false).0.len(), "nothing was skipped");
+            }
+            for (threads, span, toggle) in [(1, 1, 0), (3, 1, 0), (3, 4, 0), (4, 25, 0), (8, 1000, 0), (3, 3, 5), (2, 20, 2)] {
+                for eager in [false, true] {
+                    let got = engine_stream(&song, interval, threads, span, toggle, eager);
+                    assert!(got == want, "interval {interval}, {threads} threads, windows of {span} ticks, toggling every {toggle}, eager {eager}");
+                }
+            }
+        }
     }
 
     #[test]
