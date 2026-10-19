@@ -1098,9 +1098,9 @@ struct VisibleNotes {
     total_len_us: u64,
     selected: Vec<usize>,
     selection: Vec<usize>,
-    selected_bits: Vec<u64>,
+    selected_bits: Vec<AtomicU64>,
     /// One bit per word of `selected_bits`, so a frame visits only words that were set.
-    selected_summary: Vec<u64>,
+    selected_summary: Vec<AtomicU64>,
     instance_dirty: bool,
     instance_ring_id: u64,
     instance_slots: SlotStore,
@@ -1447,13 +1447,13 @@ impl VisibleNotes {
         let base = self.window.live_base();
         let mut bits = std::mem::take(&mut self.selected_bits);
         let mut summary = std::mem::take(&mut self.selected_summary);
-        bits.resize(self.window.len().div_ceil(64) - base / 64, 0);
-        summary.resize(bits.len().div_ceil(64), 0);
+        bits.resize_with(self.window.len().div_ceil(64) - base / 64, AtomicU64::default);
+        summary.resize_with(bits.len().div_ceil(64), AtomicU64::default);
         // An ID below `base` would be an expired note; never index out of range for it.
-        let mark = |bits: &mut Vec<u64>, summary: &mut Vec<u64>, i: usize| if i >= base {
+        let mark = |bits: &[AtomicU64], summary: &[AtomicU64], i: usize| if i >= base {
             let word = (i - base) / 64;
-            bits[word] |= 1 << (i % 64);
-            summary[word / 64] |= 1 << (word % 64);
+            bits[word].fetch_or(1 << (i % 64), Ordering::Relaxed);
+            summary[word / 64].fetch_or(1 << (word % 64), Ordering::Relaxed);
         };
         let px_us = height_time as f64 * 1e6 / height_px.max(1) as f64;
         // Include uncertain edge samples as well: float rounding and the GPU's
@@ -1465,14 +1465,16 @@ impl VisibleNotes {
         let height = height_px.max(1) as usize;
         let times: Vec<_> = (0..height).map(|row|
             now_us.saturating_add(((row as f64 + 0.5) * px_us) as u64)).collect();
-        self.row_counts = [0; 2];
-        for key in &mut self.keys {
-            if key.indices.is_empty() { continue; }
+        // Keys are independent: each queries its own rows and sets bits atomically.
+        let window = &self.window;
+        let counts: Vec<[usize; 2]> = self.keys.par_iter_mut().map(|key| {
+            let mut counts = [0usize; 2];
+            if key.indices.is_empty() { return counts; }
             let last = *key.indices.last().unwrap();
-            if self.window.get(last).is_some_and(|n| n.start_us <= now_us && n.end_us >= window_end.saturating_add(guard)) {
-                mark(&mut bits, &mut summary, last);
+            if window.get(last).is_some_and(|n| n.start_us <= now_us && n.end_us >= window_end.saturating_add(guard)) {
+                mark(&bits, &summary, last);
                 key.rows.clear();
-                continue; // top note covers the whole viewport, including its borders
+                return counts; // top note covers the whole viewport, including its borders
             }
             let view = (height_time.to_bits(), guard);
             let mut rows = std::mem::take(&mut key.rows);
@@ -1495,35 +1497,32 @@ impl VisibleNotes {
                 let time = times[row];
                 cached.hi = cached.hi.min(key.added_start.saturating_sub(guard));
                 if cached.lo <= time && time < cached.hi && now_us < cached.expiry {
-                    self.row_counts[0] += 1;
+                    counts[0] += 1;
                 } else {
-                    key.query_row(&self.window, now_us, window_end, time, guard, cached);
-                    self.row_counts[1] += 1;
+                    key.query_row(window, now_us, window_end, time, guard, cached);
+                    counts[1] += 1;
                 }
-                if cached.first != usize::MAX {
-                    let i = cached.first;
-                    mark(&mut bits, &mut summary, i);
-                }
-                if cached.second != usize::MAX {
-                    let i = cached.second;
-                    mark(&mut bits, &mut summary, i);
-                }
-                for &i in &cached.rest { mark(&mut bits, &mut summary, i); }
+                if cached.first != usize::MAX { mark(&bits, &summary, cached.first); }
+                if cached.second != usize::MAX { mark(&bits, &summary, cached.second); }
+                for &i in &cached.rest { mark(&bits, &summary, i); }
             }
             key.rows = rows;
             key.row_time = now_us;
             key.row_view = view;
             key.added_start = u64::MAX;
-        }
+            counts
+        }).collect();
+        self.row_counts = counts.iter().fold([0; 2], |a, c| [a[0] + c[0], a[1] + c[1]]);
         self.build_profile[1] = t0.elapsed();
         let t0 = Instant::now();
         // The bitset deduplicates row winners and emits them in the original draw
         // order without sorting or walking every NoteSegment again.
         for (group, summary_word) in summary.iter_mut().enumerate() {
-            while *summary_word != 0 {
-                let block = group * 64 + summary_word.trailing_zeros() as usize;
-                *summary_word &= *summary_word - 1;
-                let mut word = std::mem::take(&mut bits[block]);
+            let mut summary_bits = std::mem::take(summary_word.get_mut());
+            while summary_bits != 0 {
+                let block = group * 64 + summary_bits.trailing_zeros() as usize;
+                summary_bits &= summary_bits - 1;
+                let mut word = std::mem::take(bits[block].get_mut());
                 while word != 0 {
                     self.selected.push(base + block * 64 + word.trailing_zeros() as usize);
                     word &= word - 1;
