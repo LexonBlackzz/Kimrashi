@@ -2,6 +2,8 @@
 //! synth with no window, printing player and synth numbers each second and writing
 //! the stats CSVs (plus SVMS's per-callback CSV when the synth is SVMS).
 //!
+//! `kimrashi --engine <file>` times the playback engine alone over the whole file.
+//!
 //! `kimrashi --play <file> [--from m:ss] [--to m:ss] [--dll <KDMAPI dll>]
 //!  [--batch] [--longdata] [--no-skip] [--limit <notes/s>] [--speed <x>]`
 
@@ -63,6 +65,17 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
 /// Run if the command line asks for headless playback; returns false otherwise.
 pub fn run_from_args() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = args.iter().position(|a| a == "--engine") {
+        // The playback engine alone (no synth, no clock) over a whole file.
+        let song = SongData::load(&args[i + 1], 127, &crate::parser::Progress::default()).expect("load");
+        let t = std::time::Instant::now();
+        let (decoded, played, hash) = crate::player::bench_engine(&song);
+        let secs = t.elapsed().as_secs_f64();
+        println!("engine: {secs:.2} s, {} distinct notes ({}/s), {} counting repeated tracks ({}/s)",
+            crate::si(decoded as f64), crate::si(decoded as f64 / secs), crate::si(played as f64), crate::si(played as f64 / secs));
+        println!("hash {hash:016x}");
+        return true;
+    }
     if !args.iter().any(|a| a == "--play" || a == "--analyze") {
         return false;
     }

@@ -845,13 +845,22 @@ impl Engine {
 
 /// For the benchmark: what the engine does with every note of `song`, offline and as fast
 /// as it goes (no synth, no clock).
-pub fn bench_engine(song: &SongData) {
+///
+/// Returns (notes decoded, notes counting repeated tracks, a hash of every message) so a
+/// change to the engine can be checked to leave its output as it was. `ENGINE_INTERVAL_US`
+/// runs it with note skipping at that interval, `ENGINE_HASH` computes the hash (it costs time).
+pub fn bench_engine(song: &SongData) -> (u64, u64, u64) {
     let mut eng = Engine::new(Cursor::seek(song, 0).cursor, Skipper::new(0, true));
-    let mut batch = Vec::new();
+    eng.skipper.interval_us = std::env::var("ENGINE_INTERVAL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let hash = std::env::var_os("ENGINE_HASH").is_some();
+    let (mut batch, mut h) = (Vec::new(), 0xcbf29ce484222325u64);
     while let Some(tick) = eng.cur.next_tick() {
         batch.clear();
-        eng.process_tick(song, tick, 0, 0.0, &mut batch);
+        // Time follows the tick (1 tick = 1 ms) so a skip interval means something.
+        eng.process_tick(song, tick, tick as u64 * 1000, 1000.0, &mut batch);
+        if hash { for &m in &batch { h = (h ^ m as u64).wrapping_mul(0x100000001b3); } }
     }
+    (eng.decoded, eng.notes_played, h)
 }
 
 /// Messages due over a short stretch of song time, decoded ahead by the decoder thread
