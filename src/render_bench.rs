@@ -246,7 +246,7 @@ pub fn run_from_args() -> bool {
         }
         if f >= 20 && cpu.as_secs_f64() > 0.025 {
             let b = visible.build_profile.map(|d| (d.as_secs_f64() * 1e3 * 10.0).round() / 10.0);
-            hitches.push(format!("f{f} cpu={:.1} adv={:.1} keys={} rows={} bits={} pack={} retire={} cap={} reused/queried={:?}", cpu.as_secs_f64()*1e3, (t1-t0).as_secs_f64()*1e3, b[0], b[1], b[2], b[3], b[4], b[5], visible.row_counts));
+            hitches.push(format!("f{f} dec={:.1} cull={:.1} cpu={:.1} adv={:.1} keys={} rows={} bits={} pack={} retire={} cap={} reused/queried={:?}", visible.timing.decode.as_secs_f64()*1e3, visible.timing.cull.as_secs_f64()*1e3, cpu.as_secs_f64()*1e3, (t1-t0).as_secs_f64()*1e3, b[0], b[1], b[2], b[3], b[4], b[5], visible.row_counts));
         }
         if f < 20 { continue; }
         let a = visible.timing;

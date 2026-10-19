@@ -734,7 +734,8 @@ fn decode_notes(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach
     decode_tracks(song, readers, now_us, reach, None)
 }
 
-fn decode_tracks(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> Decoded {
+/// Each enabled track's notes in `[now_us, reach)`, in track order.
+fn decode_parts(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> Vec<Decoded> {
     let tempo = &song.tempo;
     let now_tick = tempo.time_to_tick(now_us);
     let end_tick = tempo.time_to_tick(reach);
@@ -769,12 +770,49 @@ fn decode_tracks(song: &SongData, readers: &mut [TrackReader], now_us: u64, reac
             }
         }
     };
-    // Indexed collection preserves track order before the stable start sort.
-    let parts: Vec<_> = readers.par_iter_mut().enumerate().map(|(i, r)| {
+    // Indexed collection preserves track order.
+    readers.par_iter_mut().enumerate().map(|(i, r)| {
         let mut acc = Decoded::new(Vec::new());
         decode(i, r, &mut acc);
         acc
+    }).collect()
+}
+
+/// Notes per key (ascending start, covered ones absorbed) and records scanned. Groups of
+/// tracks are bucketed by key in parallel, then each key is joined in group order, so a
+/// key sees tracks in order.
+fn decode_keys(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> (Vec<Vec<NoteSegment>>, usize) {
+    let parts = decode_parts(song, readers, now_us, reach, enabled);
+    let scanned = parts.iter().map(|p| p.scanned).sum();
+    let group = parts.len().div_ceil(64).max(1);
+    let groups: Vec<Vec<Vec<NoteSegment>>> = parts.par_chunks(group).map(|tracks| {
+        let mut keys: Vec<Vec<NoteSegment>> = vec![Vec::new(); 128];
+        for t in tracks { for &n in &t.notes { keys[n.pitch as usize & 127].push(n); } }
+        keys
     }).collect();
+    drop(parts); // the per-key copies replace them; don't hold both
+    let keys = (0..128usize).into_par_iter().map(|k| {
+        let mut v = Vec::with_capacity(groups.iter().map(|g| g[k].len()).sum());
+        for g in &groups { v.extend_from_slice(&g[k]); }
+        v.sort_by_key(|n| n.start_us); // stable: ties keep track order
+        let (mut w, mut last) = (0, usize::MAX);
+        for r in 0..v.len() {
+            let note = v[r];
+            if last == usize::MAX || !note.absorb(&mut v[last]) {
+                v[w] = note;
+                last = w;
+                w += 1;
+            }
+        }
+        v.truncate(w);
+        v
+    }).collect();
+    (keys, scanned)
+}
+
+/// Every enabled track's notes in `[now_us, reach)`, sorted by start.
+fn decode_tracks(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> Decoded {
+    let parts = decode_parts(song, readers, now_us, reach, enabled);
     let mut out = Decoded::new(Vec::new());
     out.scanned = parts.iter().map(|p| p.scanned).sum();
     out.notes.reserve(parts.iter().map(|p| p.notes.len()).sum());
@@ -888,15 +926,20 @@ impl FlattenKey {
 /// Turn a chunk of decoded notes (sorted by start) into the visible segments of every key.
 fn flatten_chunk(keys: &mut [FlattenKey], decoded: Decoded, horizon: u64, now: u64) -> Decoded {
     let mut buckets: Vec<Vec<NoteSegment>> = vec![Vec::new(); keys.len()];
-    let first = decoded.notes.len();
     for note in decoded.notes { buckets[note.pitch as usize & 127].push(note); }
+    flatten_buckets(keys, buckets, decoded.scanned, horizon, now)
+}
+
+/// `flatten_chunk` for notes already split per key, each ascending in start.
+fn flatten_buckets(keys: &mut [FlattenKey], buckets: Vec<Vec<NoteSegment>>, scanned: usize, horizon: u64, now: u64) -> Decoded {
+    let first = buckets.iter().map(Vec::len).sum();
     let parts: Vec<_> = keys.par_iter_mut().zip(buckets.par_iter()).enumerate().map(|(key, (state, starts))| {
         let (mut notes, mut updates) = (Vec::new(), Vec::new());
         state.sweep(key as u8, starts, 0, horizon, now, &mut notes, &mut updates);
         (notes, updates)
     }).collect();
     let mut out = Decoded::new(Vec::with_capacity(first));
-    out.scanned = decoded.scanned;
+    out.scanned = scanned;
     for (notes, updates) in parts { out.notes.extend(notes); out.updates.extend(updates); }
     out.notes.par_sort_by_key(|n| n.start_us);
     out
@@ -959,8 +1002,13 @@ impl DecodeWorker {
                 }
                 let decoded = decode_pool.install(|| {
                     let now = worker_now.load(Ordering::Acquire);
-                    let decoded = decode_tracks(&worker_song, &mut readers, now, reach, Some(&enabled));
-                    match &mut flatten { Some(keys) => flatten_chunk(keys, decoded, reach, now), None => decoded }
+                    match &mut flatten {
+                        Some(keys) => {
+                            let (buckets, scanned) = decode_keys(&worker_song, &mut readers, now, reach, Some(&enabled));
+                            flatten_buckets(keys, buckets, scanned, reach, now)
+                        }
+                        None => decode_tracks(&worker_song, &mut readers, now, reach, Some(&enabled)),
+                    }
                 });
                 if worker_stop.load(Ordering::Acquire) { break; }
                 let mut updates = decoded.updates.into_iter().peekable();
