@@ -255,6 +255,31 @@ impl TrackReader {
         Some(self.body(t.store, v, p))
     }
 
+    /// Right after a note record: the 16 records that follow it, if they are all plain notes
+    /// at the same tick (two bytes each: no delay, velocity or duration of their own).
+    /// Consumes them, puts their keys in `keys`, and returns their channel, velocity and
+    /// duration. Otherwise None, and nothing is consumed. Dense black MIDI is mostly this.
+    #[inline]
+    pub fn same_tick_run(&mut self, t: Track, keys: &mut [u8; 16]) -> Option<(u8, u8, Option<u32>)> {
+        if self.running & 0xF0 != 0x90 || self.pos + 32 > self.end {
+            return None;
+        }
+        let b = &t.store[self.pos..self.pos + 32];
+        // Even bytes (delta and flags) all zero, odd bytes (keys) without the high bit.
+        let mut bad = 0u64;
+        for w in b.chunks_exact(8) {
+            bad |= u64::from_le_bytes(w.try_into().unwrap()) & 0x80FF_80FF_80FF_80FF;
+        }
+        if bad != 0 {
+            return None;
+        }
+        for (i, k) in keys.iter_mut().enumerate() {
+            *k = b[2 * i + 1];
+        }
+        self.pos += 32;
+        Some((self.running & 0x0F, self.vel, self.dur.checked_sub(1)))
+    }
+
     /// Decode the next record and its absolute tick.
     #[inline]
     pub fn next(&mut self, t: Track) -> Option<(u32, Record)> {

@@ -853,29 +853,41 @@ impl Engine {
             let r = &mut cur.readers[i as usize];
             // A track standing for identical ones counts them; they are not played again.
             let copies = song.midi.track_copies[i as usize];
+            macro_rules! note {
+                ($ch:expr, $key:expr, $vel:expr, $dur:expr) => {{
+                    let (ch, key, vel, dur): (u8, u8, u8, Option<u32>) = ($ch, $key, $vel, $dur);
+                    self.notes_played += copies;
+                    self.repeats_skipped += copies - 1;
+                    self.decoded += 1;
+                    self.notes_this_second += copies;
+                    let end = dur.map(|d| tick + d);
+                    let dur_us = match dur {
+                        Some(d) if skipper.interval_us > 0 => (d as f32 * us_per_tick) as u64,
+                        _ => 0,
+                    };
+                    // A skipped note leaves nothing behind: no note-off, no polyphony.
+                    if skipper.note_on(Skipper::slot(ch, key), target_us, end, dur_us) {
+                        self.sent += 1;
+                        self.polyphony += 1;
+                        self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
+                        if let Some(e) = end {
+                            // A zero-length note's off lands on this tick: it's taken on
+                            // the next call, after this note-on, as in the file.
+                            cur.due.push(e, Due::Off((ch, key)));
+                        }
+                        batch.push(pack_short(0x90 | ch, key, vel));
+                    }
+                }};
+            }
+            let mut keys = [0u8; 16];
             while let Some(rec) = r.next_at(data, tick) {
                 match rec {
                     Record::Note { ch, key, vel, dur } => {
-                        self.notes_played += copies;
-                        self.repeats_skipped += copies - 1;
-                        self.decoded += 1;
-                        self.notes_this_second += copies;
-                        let end = dur.map(|d| tick + d);
-                        let dur_us = match dur {
-                            Some(d) if skipper.interval_us > 0 => (d as f32 * us_per_tick) as u64,
-                            _ => 0,
-                        };
-                        // A skipped note leaves nothing behind: no note-off, no polyphony.
-                        if skipper.note_on(Skipper::slot(ch, key), target_us, end, dur_us) {
-                            self.sent += 1;
-                            self.polyphony += 1;
-                            self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
-                            if let Some(e) = end {
-                                // A zero-length note's off lands on this tick: it's taken on
-                                // the next call, after this note-on, as in the file.
-                                cur.due.push(e, Due::Off((ch, key)));
+                        note!(ch, key, vel, dur);
+                        while let Some((ch, vel, dur)) = r.same_tick_run(data, &mut keys) {
+                            for &key in &keys {
+                                note!(ch, key, vel, dur);
                             }
-                            batch.push(pack_short(0x90 | ch, key, vel));
                         }
                     }
                     Record::Other { status, d1, d2 } => batch.push(pack_short(status, d1, d2)),
@@ -2288,6 +2300,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Many notes at one tick with the same velocity and length (the plain two-byte records
+    /// `same_tick_run` takes 16 at a time), broken up now and then by other notes and controllers.
+    #[test]
+    fn bulk_reads_of_plain_notes_match_one_by_one() {
+        use crate::parser::{MidiFile, Plain, Progress};
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut events: Vec<(u32, Vec<u8>)> = vec![];
+        let mut tick = 0;
+        for _ in 0..400 {
+            tick += rnd(5) as u32 * 3;
+            let (ch, vel, len) = (rnd(2) as u8, 90 + rnd(3) as u8, 5);
+            for k in 0..rnd(70) as u8 {
+                let (vel, len) = if rnd(40) == 0 { (1 + rnd(127) as u8, rnd(30) as u32) } else { (vel, len) };
+                events.push((tick, vec![0x90 | ch, 20 + k, vel]));
+                events.push((tick + len, vec![0x80 | ch, 20 + k, 0]));
+            }
+            if rnd(6) == 0 {
+                events.push((tick, vec![0xB0, rnd(128) as u8, rnd(128) as u8]));
+            }
+        }
+        events.sort_by_key(|e| e.0);
+        let (mut trk, mut last) = (vec![], 0);
+        for (t, data) in &events {
+            let mut delta = vec![((t - last) & 0x7F) as u8];
+            let mut d = (t - last) >> 7;
+            while d > 0 {
+                delta.push((d & 0x7F) as u8 | 0x80);
+                d >>= 7;
+            }
+            trk.extend(delta.iter().rev());
+            trk.extend_from_slice(data);
+            last = *t;
+        }
+        let mut file = b"MThd".to_vec();
+        file.extend_from_slice(&[0, 0, 0, 6, 0, 0, 0, 1, 0, 96]);
+        file.extend_from_slice(b"MTrk");
+        file.extend_from_slice(&(trk.len() as u32).to_be_bytes());
+        file.extend_from_slice(&trk);
+        let m = MidiFile::parse_stream(Box::new(Plain(std::io::Cursor::new(file))), 127, &Progress::default()).unwrap();
+
+        let t = m.track(0);
+        let (mut one, mut r) = (vec![], TrackReader::default());
+        while let Some(x) = r.next(t) {
+            one.push(x);
+        }
+        let (mut bulk, mut runs, mut r, mut keys) = (vec![], 0, TrackReader::default(), [0u8; 16]);
+        while let Some((tick, rec)) = r.next(t) {
+            bulk.push((tick, rec));
+            if matches!(rec, Record::Note { .. }) {
+                while let Some((ch, vel, dur)) = r.same_tick_run(t, &mut keys) {
+                    runs += 1;
+                    bulk.extend(keys.iter().map(|&key| (tick, Record::Note { ch, key, vel, dur })));
+                }
+            }
+        }
+        assert!(runs > 100, "only {runs} bulk reads");
+        assert!(one == bulk, "the records differ");
     }
 
     #[test]

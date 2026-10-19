@@ -462,19 +462,34 @@ impl Chunk {
                 let local = i as usize - self.first;
                 let before = seq;
                 let r = &mut self.readers[local];
+                macro_rules! note {
+                    ($ch:expr, $key:expr, $vel:expr, $dur:expr) => {{
+                        let (ch, key, vel, dur): (u8, u8, u8, Option<u32>) = ($ch, $key, $vel, $dur);
+                        let slot = Skipper::slot(ch, key);
+                        self.msgs.push(pack_short(0x90 | ch, key, vel));
+                        self.buckets[part_of[slot] as usize].push(NoteEv {
+                            dur: dur.unwrap_or(NO_DUR),
+                            seq,
+                            at: rel << 11 | slot as u32,
+                        });
+                    }};
+                }
+                let mut keys = [0u8; 16];
                 while let Some(rec) = r.next_at(data, t) {
                     match rec {
                         Record::Note { ch, key, vel, dur } => {
-                            self.decoded += 1;
-                            self.played += copies;
-                            self.repeats += copies - 1;
-                            let slot = Skipper::slot(ch, key);
-                            self.msgs.push(pack_short(0x90 | ch, key, vel));
-                            self.buckets[part_of[slot] as usize].push(NoteEv {
-                                dur: dur.unwrap_or(NO_DUR),
-                                seq,
-                                at: rel << 11 | slot as u32,
-                            });
+                            let mut n = 1;
+                            note!(ch, key, vel, dur);
+                            while let Some((ch, vel, dur)) = r.same_tick_run(data, &mut keys) {
+                                for &key in &keys {
+                                    seq += 1;
+                                    note!(ch, key, vel, dur);
+                                }
+                                n += 16;
+                            }
+                            self.decoded += n;
+                            self.played += n * copies;
+                            self.repeats += n * (copies - 1);
                         }
                         Record::Other { status, d1, d2 } => {
                             self.msgs.push(pack_short(status, d1, d2));

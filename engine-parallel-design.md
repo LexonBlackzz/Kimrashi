@@ -181,3 +181,8 @@ uses it when behind. Not tested with a real synth.
 Ideas checked and dropped: levels of pre-thinned notes (Nuker 3 keeps ~35% of notes at any
 interval up to 8 ms, so a level is as big as the song) and caching decoded chunks (decoding is
 under half the per-note cost; chunks are already stored once, 7-24 uses each).
+
+Bulk reads (`TrackReader::same_tick_run`): after a note, 16 plain two-byte records at the same tick
+are checked and read at once (99.8% of Funky Stars' notes and 90.6% of Nuker 3's are two-byte
+records). Serial engine on the Nuker dense stretch: 73M -> 100M notes/s. The threaded engine did
+not speed up (parse was no longer its limit). Message hashes unchanged on both files.
