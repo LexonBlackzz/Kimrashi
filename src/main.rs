@@ -867,6 +867,9 @@ struct OpenSegment {
 struct FlattenKey {
     active: std::collections::BinaryHeap<Layer>,
     open: Option<OpenSegment>,
+    /// Latest start and end ever pushed to `active`: upper bounds for what is still in it.
+    max_start: u64,
+    max_end: u64,
 }
 
 impl OpenSegment {
@@ -902,7 +905,14 @@ impl FlattenKey {
             if t >= horizon { break; }
             while let Some(n) = starts.get(i).filter(|n| n.start_us == t) {
                 // A note of no length is still drawn, at the shader's minimum length.
-                self.active.push(Layer { note: NoteSegment { end_us: rendered_end(n), ..*n }, seq: seq + i as u32 });
+                let end = rendered_end(n);
+                // Starting later and ending no sooner than everything in the heap covers all of
+                // it for good. Dead layers otherwise sit under a long note until it ends, then
+                // pop in one go (hundreds of ms in a dense passage) and hold memory meanwhile.
+                if n.start_us > self.max_start && end >= self.max_end { self.active.clear(); self.max_end = 0; }
+                self.max_start = self.max_start.max(n.start_us);
+                self.max_end = self.max_end.max(end);
+                self.active.push(Layer { note: NoteSegment { end_us: end, ..*n }, seq: seq + i as u32 });
                 i += 1;
             }
             while self.active.peek().is_some_and(|l| l.note.end_us <= t) { self.active.pop(); }
