@@ -33,7 +33,7 @@ use song::SongData;
 use ui::{draw_piano_roll, format_timestamp, si, secs, wrap_for_slider, load_info, loading_details, key_columns, is_black_key};
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::io::Write as _;
@@ -601,6 +601,10 @@ const DECODE_AHEAD_US: u64 = 10_000_000;
 /// at most `WORKER_CHUNK_US` of song at a time (it all sits in memory until sent).
 const SYNC_AHEAD_US: u64 = 250_000;
 const WORKER_CHUNK_US: u64 = 50_000;
+/// The worker pauses while this many notes wait unread in its channel. Bounding notes, not
+/// messages, lets quiet passages build a long lead (up to `DECODE_AHEAD_US`) for dense ones,
+/// which a message count did not: a chunk is one message however few notes it holds.
+const MAX_QUEUED_NOTES: usize = 4_000_000;
 
 const NOTE_BLOCK: usize = 64;
 
@@ -968,6 +972,8 @@ struct DecodeWorker {
     target: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     receiver: std::sync::mpsc::Receiver<NoteBatch>,
+    /// Notes sent and not yet received (see `MAX_QUEUED_NOTES`).
+    queued: Arc<AtomicUsize>,
     pending: Option<NoteBatch>,
     song: Arc<SongData>,
     thread: std::thread::Thread,
@@ -986,17 +992,23 @@ impl DecodeWorker {
         let now = Arc::new(AtomicU64::new(0));
         let target = Arc::new(AtomicU64::new(through));
         let stop = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let worker_queued = queued.clone();
         let (worker_now, worker_target, worker_stop, worker_song) =
             (now.clone(), target.clone(), stop.clone(), song.clone());
         let enabled = render_tracks(&song);
         let handle = std::thread::Builder::new().name("note-decode".into()).spawn(move || {
             let mut through = through;
             let mut prepared = prepared.into_iter().peekable();
+            let push = |batch: NoteBatch| {
+                worker_queued.fetch_add(batch.notes.len() + batch.updates.len(), Ordering::AcqRel);
+                sender.send(batch)
+            };
             loop {
                 let notes = prepared.by_ref().take(NOTE_BATCH).collect();
                 let watermark = prepared.peek().map_or(through, |n| n.start_us);
-                if sender.send(NoteBatch { generation, notes, updates: Vec::new(), decoded_end: through, through: watermark }).is_err() { return; }
+                if push(NoteBatch { generation, notes, updates: Vec::new(), decoded_end: through, through: watermark }).is_err() { return; }
                 if prepared.peek().is_none() { break; }
                 if worker_stop.load(Ordering::Acquire) { return; }
             }
@@ -1006,7 +1018,7 @@ impl DecodeWorker {
                 .build().expect("note decode pool");
             while !worker_stop.load(Ordering::Acquire) {
                 let reach = worker_target.load(Ordering::Acquire).min(through.saturating_add(WORKER_CHUNK_US));
-                if reach <= through {
+                if reach <= through || worker_queued.load(Ordering::Acquire) > MAX_QUEUED_NOTES {
                     std::thread::park_timeout(Duration::from_millis(2));
                     continue;
                 }
@@ -1024,20 +1036,20 @@ impl DecodeWorker {
                 let mut updates = decoded.updates.into_iter().peekable();
                 while updates.peek().is_some() {
                     let batch = updates.by_ref().take(NOTE_BATCH).collect();
-                    if sender.send(NoteBatch { generation, notes: Vec::new(), updates: batch, decoded_end: reach, through }).is_err() { return; }
+                    if push(NoteBatch { generation, notes: Vec::new(), updates: batch, decoded_end: reach, through }).is_err() { return; }
                 }
                 let mut notes = decoded.notes.into_iter().peekable();
                 loop {
                     let batch: Vec<_> = notes.by_ref().take(NOTE_BATCH).collect();
                     let watermark = notes.peek().map_or(reach, |n| n.start_us);
-                    if sender.send(NoteBatch { generation, notes: batch, updates: Vec::new(), decoded_end: reach, through: watermark }).is_err() { return; }
+                    if push(NoteBatch { generation, notes: batch, updates: Vec::new(), decoded_end: reach, through: watermark }).is_err() { return; }
                     if notes.peek().is_none() { break; }
                     if worker_stop.load(Ordering::Acquire) { return; }
                 }
                 through = reach;
             }
         }).expect("note decode worker");
-        Self { now, target, stop, receiver, pending: None, song, thread: handle.thread().clone() }
+        Self { now, target, stop, receiver, queued, pending: None, song, thread: handle.thread().clone() }
     }
 }
 
@@ -1230,7 +1242,9 @@ impl VisibleNotes {
         while self.last_batch == 0 || self.through < window_end {
             let urgent = self.through < now_us.saturating_add(100_000).min(window_end);
             let batch = worker.pending.take().or_else(|| {
-                if urgent { worker.receiver.recv().ok() } else { worker.receiver.try_recv().ok() }
+                let batch = if urgent { worker.receiver.recv().ok() } else { worker.receiver.try_recv().ok() };
+                if let Some(b) = &batch { worker.queued.fetch_sub(b.notes.len() + b.updates.len(), Ordering::AcqRel); }
+                batch
             });
             let Some(mut batch) = batch else { break };
             if batch.generation != self.generation { continue; }
