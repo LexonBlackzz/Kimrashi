@@ -16,6 +16,12 @@ pub struct PlaybackClock {
     speed: AtomicU64,
     /// Keeps writers apart.
     writer: Mutex<()>,
+    /// How far behind its schedule the synth is rendering events (wall µs), as the SVMS
+    /// monitor sees it; 0 if on time or unknown. Taking events instantly says nothing
+    /// about rendering them, so the skipper learns the synth's real price per note from it.
+    pub synth_late_us: AtomicU64,
+    /// Counts reports of `synth_late_us`, so the skipper acts once per report.
+    pub synth_late_seq: AtomicU64,
 }
 
 const PAUSED: u64 = u64::MAX;
@@ -36,6 +42,8 @@ impl PlaybackClock {
             offset_us: AtomicU64::new(0),
             speed: AtomicU64::new(1f64.to_bits()),
             writer: Mutex::new(()),
+            synth_late_us: AtomicU64::new(0),
+            synth_late_seq: AtomicU64::new(0),
         }
     }
 

@@ -405,6 +405,7 @@ fn run(
     let mut log: Option<CsvLog> = None;
     let mut w = Window::default();
     let mut window_start = Instant::now();
+    let mut prev_late_us = 0u64;
     // SVMS_STATS_SECS shortens the stats row period (default 1 s) for burst analysis.
     let stats_window: f64 = std::env::var("SVMS_STATS_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
 
@@ -435,9 +436,11 @@ fn run(
         let speed = if clock.is_paused() { 0.0 } else { clock.speed() };
         let rate = telemetry.sample_rate.max(1) as f64;
 
+        let mut poll_late_frames = 0u64;
         loop {
             let n = link.read_trace(&mut cursor, &mut buf);
             for r in &buf[..n] {
+                poll_late_frames = poll_late_frames.max(r.max_lateness_frames as u64);
                 let lost = prev.map_or(0, |p| r.index.saturating_sub(p.index + 1));
                 let (ons, steals, wait_ns) = prev.map_or((0, 0, 0), |p| {
                     (
@@ -534,6 +537,20 @@ fn run(
         if let Some(l) = &mut log {
             let _ = l.file.flush();
         }
+        // Tell the skipper how late the synth is. Late and still growing counts in full;
+        // late but catching up is reported as "hold" (inside the skipper's dead band), so
+        // it doesn't keep cutting while a backlog it already cut for drains.
+        let late_us = (poll_late_frames as f64 * 1e6 / rate) as u64;
+        let reported = if late_us == 0 {
+            0
+        } else if late_us < prev_late_us {
+            1_500
+        } else {
+            late_us
+        };
+        prev_late_us = late_us;
+        clock.synth_late_us.store(reported, Ordering::Relaxed);
+        clock.synth_late_seq.fetch_add(1, Ordering::Release);
 
         let secs = window_start.elapsed().as_secs_f64();
         if secs >= stats_window {

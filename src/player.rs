@@ -1067,6 +1067,12 @@ struct Decoder {
     behind: u32,
     waited: u32,
     ends: Vec<(u32, u32)>,
+    /// What the synth really charges per message (ns), learned from how late it renders:
+    /// a synth can take events in a few ns each and still need microseconds to sound them.
+    render_ns: f32,
+    synth_seq: u64,
+    /// `KIM_SYNTH_FEEDBACK=0` turns the learning off.
+    learn_render: bool,
 }
 
 /// Threads for the engine on this machine: it takes half the cores, which a weak machine
@@ -1103,7 +1109,7 @@ impl Decoder {
         let (cmd_tx, cmds) = crossbeam_channel::unbounded();
         let (out, slices) = crossbeam_channel::bounded(SLICES_IN_FLIGHT);
         let (spare_tx, spare) = crossbeam_channel::bounded(SLICES_IN_FLIGHT * 2);
-        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), behind: 0, waited: 0, ends: Vec::new() };
+        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), behind: 0, waited: 0, ends: Vec::new(), render_ns: 0.0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
         thread::Builder::new().name("player-decode".into()).spawn(move || d.run()).expect("spawn decoder");
         (cmd_tx, slices, spare_tx)
     }
@@ -1189,6 +1195,25 @@ impl Decoder {
         }
     }
 
+    /// Once per report from the synth's monitor: late and getting later means each message
+    /// costs more than we thought (up quickly); on time lets the price drift back down.
+    fn learn_render_cost(&mut self) {
+        let seq = self.clock.synth_late_seq.load(Ordering::Acquire);
+        if !self.learn_render || seq == self.synth_seq {
+            return;
+        }
+        self.synth_seq = seq;
+        let sender = self.costs.synth_ns;
+        let from = self.render_ns.max(sender);
+        self.render_ns = match self.clock.synth_late_us.load(Ordering::Relaxed) {
+            0 => self.render_ns * 0.99,
+            1..=2_000 => self.render_ns, // late but catching up: leave the price alone
+            2_001..=8_000 => from * 1.05,
+            _ => from * 1.3,
+        }
+        .min(200_000.0);
+    }
+
     fn run(mut self) {
         let tempo = self.song.tempo.clone();
         loop {
@@ -1245,6 +1270,8 @@ impl Decoder {
             self.costs.speed = speed;
             self.costs.synth_ns = f32::from_bits(self.feedback.synth_ns.load(Ordering::Relaxed));
             let lag_us = self.feedback.lag_us.load(Ordering::Relaxed);
+            self.learn_render_cost();
+            self.costs.synth_ns = self.costs.synth_ns.max(self.render_ns);
             self.eng.regulate(lag_us, start, self.costs);
             let (decoded0, sent0) = (self.eng.decoded, self.eng.sent);
             let timed = self.feedback.timed.load(Ordering::Relaxed);
