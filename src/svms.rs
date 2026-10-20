@@ -5,7 +5,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -15,11 +15,13 @@ use crate::clock::PlaybackClock;
 const ABI_VERSION_1: u32 = 1;
 const STRUCT_VERSION_1: u32 = 1;
 const RESULT_OK: i32 = 0;
+const RESULT_UNSUPPORTED: i32 = 3;
 const CAP_EXACT_QPC_TIMESTAMPS: u64 = 1 << 0;
 const CAP_SHORT_EVENT_BATCH: u64 = 1 << 1;
 const CAP_SYSTEM_EXCLUSIVE: u64 = 1 << 2;
 const CAP_TELEMETRY_V2: u64 = 1 << 15;
 const CAP_CALLBACK_TRACE: u64 = 1 << 16;
+const CAP_DIRECT_PAGES: u64 = 1 << 18;
 
 pub type GetInterfaceFn = unsafe extern "C" fn(u32, u32, *mut Interface) -> i32;
 type Session = u64;
@@ -53,6 +55,10 @@ pub struct Interface {
     enable_callback_trace: Option<unsafe extern "C" fn(Session, u32) -> i32>,
     read_callback_trace:
         Option<unsafe extern "C" fn(Session, *mut u64, *mut CallbackTrace, u32, *mut u32) -> i32>,
+    _send_midi_stream: usize,
+    /// Same arguments as `send_short_batch`; compiles the batch into the synth's event pages
+    /// on this thread. UNSUPPORTED (nothing consumed) when the synth's setup can't take that.
+    send_short_batch_direct: Option<unsafe extern "C" fn(Session, *const ShortEvent, u32) -> i32>,
 }
 
 /// `SVMS_TelemetryV2` (280 bytes).
@@ -155,6 +161,9 @@ const _: () = assert!(std::mem::size_of::<CallbackTrace>() == 208);
 pub struct Link {
     api: Interface,
     session: Session,
+    /// Batches left to send the ordinary way after the direct entry declined one.
+    direct_skip: AtomicU32,
+    direct_on: bool,
 }
 
 // The interface is a table of plain function pointers into the DLL.
@@ -183,7 +192,10 @@ impl Link {
         if unsafe { create(std::ptr::null(), &mut session) } != RESULT_OK {
             return None;
         }
-        Some(Link { api, session })
+        let direct_on = api.capabilities & CAP_DIRECT_PAGES != 0
+            && api.send_short_batch_direct.is_some()
+            && std::env::var("KIM_SVMS_DIRECT").map_or(true, |v| v != "0");
+        Some(Link { api, session, direct_skip: AtomicU32::new(0), direct_on })
     }
 
     pub fn can_batch(&self) -> bool {
@@ -209,10 +221,21 @@ impl Link {
 
     /// Submit messages in one call, each with its own timestamp (0 = at submission).
     pub fn send_batch(&self, events: &[ShortEvent]) {
-        if let Some(f) = self.api.send_short_batch {
-            for chunk in events.chunks(u32::MAX as usize) {
-                unsafe { f(self.session, chunk.as_ptr(), chunk.len() as u32) };
+        let Some(f) = self.api.send_short_batch else { return };
+        for chunk in events.chunks(u32::MAX as usize) {
+            if self.direct_on {
+                let skip = self.direct_skip.load(Ordering::Relaxed);
+                if skip > 0 {
+                    self.direct_skip.store(skip - 1, Ordering::Relaxed);
+                } else {
+                    let d = self.api.send_short_batch_direct.unwrap();
+                    match unsafe { d(self.session, chunk.as_ptr(), chunk.len() as u32) } {
+                        RESULT_UNSUPPORTED => self.direct_skip.store(256, Ordering::Relaxed),
+                        _ => continue,
+                    }
+                }
             }
+            unsafe { f(self.session, chunk.as_ptr(), chunk.len() as u32) };
         }
     }
 
