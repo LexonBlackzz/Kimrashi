@@ -133,6 +133,7 @@ fn main() {
 
     let _ = cmd_tx.send(PlayerCommand::SetSkipping(cfg.skip_notes));
     let _ = cmd_tx.send(PlayerCommand::SetSvmsBatch(cfg.svms_batch));
+    let _ = cmd_tx.send(PlayerCommand::SetSvmsDirect(cfg.svms_direct));
     let _ = cmd_tx.send(PlayerCommand::SetLongData(cfg.long_data));
     if cfg.synth_limit < SYNTH_LIMIT_OFF {
         let _ = cmd_tx.send(PlayerCommand::SetSynthLimit(cfg.synth_limit as u32));

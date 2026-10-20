@@ -32,6 +32,7 @@ pub enum PlayerCommand {
     SetStatsLog(bool),
     /// Submit through SVMS's native batch API instead of one `SendDirectData` per message.
     SetSvmsBatch(bool),
+    SetSvmsDirect(bool),
     /// Send each slice as raw MIDI bytes (running status) in long messages instead of one
     /// short message at a time (KDMAPI synths that understand it, e.g. OmniMIDI).
     SetLongData(bool),
@@ -1355,7 +1356,7 @@ impl Player {
                 cmd_rx,
                 telemetry_tx,
                 stop,
-                svms: SvmsSetup { clock: clock.clone(), log: Default::default(), batch: false },
+                svms: SvmsSetup { clock: clock.clone(), log: Default::default(), batch: false, direct: true },
                 clock,
             };
             player.run_loop();
@@ -1404,6 +1405,10 @@ impl Player {
                     }
                     Ok(PlayerCommand::SetSvmsBatch(on)) => {
                         self.svms.batch = on;
+                        continue;
+                    }
+                    Ok(PlayerCommand::SetSvmsDirect(on)) => {
+                        self.svms.direct = on;
                         continue;
                     }
                     // No song loaded yet; nothing to pause, resume or seek.
@@ -1540,6 +1545,10 @@ impl Player {
                     PlayerCommand::SetSvmsBatch(on) => {
                         self.svms.batch = on;
                         self.out.set_svms_batch(on);
+                    }
+                    PlayerCommand::SetSvmsDirect(on) => {
+                        self.svms.direct = on;
+                        self.out.set_svms_direct(on);
                     }
                 }
             }

@@ -56,6 +56,8 @@ pub struct SvmsSetup {
     pub clock: Arc<PlaybackClock>,
     pub log: Arc<Mutex<Option<PathBuf>>>,
     pub batch: bool,
+    /// Use SVMS's direct page feed when it has one.
+    pub direct: bool,
 }
 
 /// The SVMS side of a KDMAPI output, when the DLL is SVMS.
@@ -80,6 +82,7 @@ impl Output {
                 Some(omni) if unsafe { omni.init_stream() } => {
                     let svms = omni.svms_get_interface.and_then(svms::Link::open).map(|link| {
                         let link = Arc::new(link);
+                        link.set_direct(setup.direct);
                         Svms {
                             monitor: svms::Monitor::start(link.clone(), setup.clock.clone(), setup.log.clone()),
                             batch: Cell::new(setup.batch && link.can_batch()),
@@ -237,6 +240,13 @@ impl Output {
         }
     }
 
+    /// Let SVMS take batches straight into its event pages (if it can).
+    pub fn set_svms_direct(&self, on: bool) {
+        if let Output::Kdmapi(_, Some(s)) = self {
+            s.link.set_direct(on);
+        }
+    }
+
     /// The synth's own numbers over the last second (SVMS only).
     pub fn svms_stats(&self) -> Option<svms::Stats> {
         match self {
@@ -278,7 +288,7 @@ mod tests {
         let _ = std::fs::remove_file(&log);
         let clock = Arc::new(PlaybackClock::new());
         clock.set_running(0);
-        let setup = SvmsSetup { clock, log: Arc::new(Mutex::new(Some(log.clone()))), batch: true };
+        let setup = SvmsSetup { clock, log: Arc::new(Mutex::new(Some(log.clone()))), batch: true, direct: true };
         let out = Output::open(&OutputChoice::Kdmapi, Some(&omni), &setup);
         assert!(matches!(&out, Output::Kdmapi(_, Some(s)) if s.batch.get()), "not SVMS, or no batch API");
         for i in 0..150u32 {

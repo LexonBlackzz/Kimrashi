@@ -43,6 +43,8 @@ pub struct Settings {
     /// Max note-ons/s to the synth; `SYNTH_LIMIT_OFF` = no limit.
     pub synth_limit: f64,
     pub svms_batch: bool,
+    /// SVMS only: hand batches straight to its event pages (needs a build that has the feed).
+    pub svms_direct: bool,
     pub long_data: bool,
     // Loading
     pub velocity_levels: u8,
@@ -74,6 +76,7 @@ impl Default for Settings {
             skip_notes: true,
             synth_limit: SYNTH_LIMIT_OFF,
             svms_batch: false,
+            svms_direct: true,
             long_data: false,
             velocity_levels: 127,
             verify_repeats: false,

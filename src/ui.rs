@@ -326,6 +326,21 @@ impl AppState {
                             let _ = self.cmd_tx.send(PlayerCommand::SetSvmsBatch(c.svms_batch));
                         }
                         ui.end_row();
+                        ui.label("");
+                        if ui
+                            .checkbox(&mut c.svms_direct, "Direct event pages")
+                            .on_hover_text(
+                                "SuperVirtualMIDISynth builds with the direct page feed only: batches \
+                                 go straight into the synth's event pages instead of through its ring \
+                                 and compiler thread, which costs the sender and compiler less per \
+                                 note. Falls back by itself when the synth's settings can't take it \
+                                 (minimum note length, note-on coalescing, shards).",
+                            )
+                            .changed()
+                        {
+                            let _ = self.cmd_tx.send(PlayerCommand::SetSvmsDirect(c.svms_direct));
+                        }
+                        ui.end_row();
                         shown += 1;
                     }
 

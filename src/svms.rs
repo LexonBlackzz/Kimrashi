@@ -163,7 +163,9 @@ pub struct Link {
     session: Session,
     /// Batches left to send the ordinary way after the direct entry declined one.
     direct_skip: AtomicU32,
-    direct_on: bool,
+    direct_on: AtomicBool,
+    /// The synth has the entry point (and `KIM_SVMS_DIRECT` isn't 0).
+    direct_able: bool,
 }
 
 // The interface is a table of plain function pointers into the DLL.
@@ -192,10 +194,10 @@ impl Link {
         if unsafe { create(std::ptr::null(), &mut session) } != RESULT_OK {
             return None;
         }
-        let direct_on = api.capabilities & CAP_DIRECT_PAGES != 0
+        let direct_able = api.capabilities & CAP_DIRECT_PAGES != 0
             && api.send_short_batch_direct.is_some()
             && std::env::var("KIM_SVMS_DIRECT").map_or(true, |v| v != "0");
-        Some(Link { api, session, direct_skip: AtomicU32::new(0), direct_on })
+        Some(Link { api, session, direct_skip: AtomicU32::new(0), direct_on: AtomicBool::new(direct_able), direct_able })
     }
 
     pub fn can_batch(&self) -> bool {
@@ -219,11 +221,16 @@ impl Link {
         }
     }
 
+    /// Turn the direct page feed on or off (it stays off if the synth doesn't have it).
+    pub fn set_direct(&self, on: bool) {
+        self.direct_on.store(on && self.direct_able, Ordering::Relaxed);
+    }
+
     /// Submit messages in one call, each with its own timestamp (0 = at submission).
     pub fn send_batch(&self, events: &[ShortEvent]) {
         let Some(f) = self.api.send_short_batch else { return };
         for chunk in events.chunks(u32::MAX as usize) {
-            if self.direct_on {
+            if self.direct_on.load(Ordering::Relaxed) {
                 let skip = self.direct_skip.load(Ordering::Relaxed);
                 if skip > 0 {
                     self.direct_skip.store(skip - 1, Ordering::Relaxed);
