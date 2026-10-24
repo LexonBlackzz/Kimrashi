@@ -7,6 +7,7 @@ mod render_bench;
 mod export;
 mod export_ui;
 mod clock;
+mod diagnose;
 mod gpu;
 mod parser;
 mod player;
@@ -211,6 +212,7 @@ fn main() {
                 log_stats: false,
                 benchmark: None,
                 loading: None,
+                diagnose: None,
                 show_settings: false,
                 settings_tab: SettingsTab::Display,
                 settings_search: String::new(),
@@ -1575,6 +1577,15 @@ struct BenchRun {
 }
 
 /// A file being loaded on a worker thread.
+/// "Diagnose MIDI" running on a worker thread, or its result.
+struct DiagRun {
+    name: String,
+    rx: Receiver<Result<diagnose::Report, String>>,
+    progress: Arc<parser::Progress>,
+    report: Option<Result<diagnose::Report, String>>,
+    started: Instant,
+}
+
 struct Loading {
     name: String,
     rx: Receiver<Result<Arc<SongData>, String>>,
@@ -1607,6 +1618,7 @@ struct AppState {
     /// The benchmark window (see `benchmark`).
     benchmark: Option<BenchRun>,
     loading: Option<Loading>,
+    diagnose: Option<DiagRun>,
     show_settings: bool,
     settings_tab: SettingsTab,
     settings_search: String,
@@ -1877,6 +1889,7 @@ impl eframe::App for AppState {
         self.export.window(ctx);
         self.benchmark_window(ctx);
 
+        self.diagnose_window(ctx);
         if let Some(log) = &mut self.frame_log {
             log.record(frame_start.elapsed(), &self.frame_times);
         }

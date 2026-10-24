@@ -30,6 +30,14 @@ impl AppState {
         }
 
         if ui
+            .button("Diagnose MIDI…")
+            .on_hover_text("Pick a file to get its note count, tracks, size, memory, length, PPQN, tempo, max NPS and polyphony, without playing it")
+            .clicked()
+        {
+            self.start_diagnose(ui.ctx());
+        }
+
+        if ui
             .add_enabled(has_song, egui::Button::new("Export video…"))
             .on_hover_text("Render the song to an MP4 with ffmpeg")
             .clicked()
@@ -117,6 +125,92 @@ impl AppState {
             });
         if !open {
             self.benchmark = None;
+        }
+    }
+
+    /// Pick a file and diagnose it on a worker thread; it is parsed like a load but never played.
+    fn start_diagnose(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("MIDI file or archive", &["mid", "midi", "zip", "7z", "rar", "xz", "gz", "zst", "tar", "tgz", "txz"])
+            .add_filter("All files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+        if let Some(d) = self.diagnose.take() {
+            d.progress.cancel();
+        }
+        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let progress = Arc::new(parser::Progress::default());
+        progress.verify_all.store(self.cfg.verify_repeats, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (ctx, vel_levels, p) = (ctx.clone(), self.cfg.velocity_levels, progress.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(SongData::load(&path, vel_levels, &p).map(|s| diagnose::run(&s)).map_err(|e| e.to_string()));
+            ctx.request_repaint();
+        });
+        self.diagnose = Some(DiagRun { name, rx, progress, report: None, started: Instant::now() });
+    }
+
+    pub(crate) fn diagnose_window(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.diagnose else { return };
+        if let Ok(r) = d.rx.try_recv() {
+            d.report = Some(r);
+        }
+        let mut open = true;
+        egui::Window::new(format!("Diagnose · {}", d.name))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let r = match &d.report {
+                    None => {
+                        ui.label(format!("Reading {}… {}", d.name, secs(d.started.elapsed().as_secs_f64())));
+                        ctx.request_repaint_after(Duration::from_millis(250));
+                        return;
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(Color32::from_rgb(255, 110, 100), format!("⚠ {e}"));
+                        return;
+                    }
+                    Some(Ok(r)) => r,
+                };
+                let size = match r.archive_bytes {
+                    Some(a) => format!("{} ({} in the archive)", bytes(r.file_bytes as f64), bytes(a as f64)),
+                    None => bytes(r.file_bytes as f64),
+                };
+                let tempo = if r.tempo_changes > 1 {
+                    format!("{:.2} BPM at start ({:.2}–{:.2}, {} changes)", r.first_bpm, r.min_bpm, r.max_bpm, r.tempo_changes)
+                } else {
+                    format!("{:.2} BPM", r.first_bpm)
+                };
+                let rows = [
+                    ("Notes", format!("{} ({})", commas(r.notes), si(r.notes as f64))),
+                    ("Tracks", commas(r.tracks as u64)),
+                    ("File size", size),
+                    ("Memory to open", bytes(r.packed_bytes as f64)),
+                    ("Time", format_timestamp(r.duration_us)),
+                    ("PPQN", r.ppqn.to_string()),
+                    ("Tempo", tempo),
+                    ("Max NPS", format!("{} ({})", commas(r.max_nps), si(r.max_nps as f64))),
+                    ("Max polyphony", format!("{} ({})", commas(r.max_polyphony), si(r.max_polyphony as f64))),
+                ];
+                egui::Grid::new("diagnose_results").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                    for (k, v) in &rows {
+                        ui.label(*k);
+                        ui.monospace(v);
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(6.0);
+                if ui.button("Copy").clicked() {
+                    ctx.copy_text(rows.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"));
+                }
+            });
+        if !open {
+            d.progress.cancel(); // a file still parsing stops at its next read
+            self.diagnose = None;
         }
     }
 
@@ -1011,6 +1105,19 @@ pub(crate) fn load_info(song: &SongData) -> (String, String) {
         bytes(st.other_bytes as f64),
     );
     (summary, details)
+}
+
+/// 2294213080 -> "2,294,213,080"
+pub(crate) fn commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 1234567 -> "1.23M"
