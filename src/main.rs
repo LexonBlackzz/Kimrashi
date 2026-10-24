@@ -9,6 +9,7 @@ mod export_ui;
 mod clock;
 mod diagnose;
 mod gpu;
+mod pfa;
 mod parser;
 mod player;
 mod settings;
@@ -211,8 +212,8 @@ fn main() {
                 tempo: 1.0,
                 log_stats: false,
                 benchmark: None,
-                loading: None,
                 diagnose: None,
+                loading: None,
                 show_settings: false,
                 settings_tab: SettingsTab::Display,
                 settings_search: String::new(),
@@ -361,14 +362,14 @@ impl VisualSong {
         let channel_rank = std::array::from_fn(|c| (used & ((1u16 << c) - 1)).count_ones() as u8);
         let channels = used.count_ones().max(1) as usize;
         let mut song = Self { data, colors: Vec::new(), channel_rank, channels, palette: theme::NotePalette::default(), pitch_min, pitch_max };
-        song.set_palette(theme::NotePalette::default(), &theme::default_custom());
+        song.set_palette(theme::NotePalette::default(), &theme::default_custom(), 7);
         song
     }
 
-    fn set_palette(&mut self, palette: theme::NotePalette, custom: &[[u8; 3]]) {
+    fn set_palette(&mut self, palette: theme::NotePalette, custom: &[[u8; 3]], rainbow: usize) {
         // ponytail: capped; past 65k pairs the colors just repeat.
         let pairs = (self.data.midi.source_tracks.max(1) * self.channels).min(65_536);
-        self.colors = palette.colors(pairs, custom);
+        self.colors = palette.colors(pairs, custom, rainbow);
         self.palette = palette;
     }
 
@@ -1576,7 +1577,6 @@ struct BenchRun {
     started: Instant,
 }
 
-/// A file being loaded on a worker thread.
 /// "Diagnose MIDI" running on a worker thread, or its result.
 struct DiagRun {
     name: String,
@@ -1586,6 +1586,7 @@ struct DiagRun {
     started: Instant,
 }
 
+/// A file being loaded on a worker thread.
 struct Loading {
     name: String,
     rx: Receiver<Result<Arc<SongData>, String>>,
@@ -1603,7 +1604,7 @@ struct AppState {
     last_telemetry: PlayerTelemetry,
     current_song: Option<VisualSong>,
     /// The look last pushed to egui and the song; `None` forces a re-apply.
-    applied_look: Option<(theme::UiTheme, theme::NotePalette, Vec<[u8; 3]>)>,
+    applied_look: Option<(theme::UiTheme, theme::NotePalette, Vec<[u8; 3]>, usize)>,
     playback_time_us: u64,
     slider_override_us: Option<u64>,
     slider_grabbed: bool,
@@ -1617,8 +1618,8 @@ struct AppState {
     log_stats: bool,
     /// The benchmark window (see `benchmark`).
     benchmark: Option<BenchRun>,
-    loading: Option<Loading>,
     diagnose: Option<DiagRun>,
+    loading: Option<Loading>,
     show_settings: bool,
     settings_tab: SettingsTab,
     settings_search: String,
@@ -1850,13 +1851,13 @@ impl eframe::App for AppState {
             ui.add_space(4.0);
         });
 
-        let look = (self.cfg.ui_theme, self.cfg.note_palette, self.cfg.custom_colors.clone());
+        let look = (self.cfg.ui_theme, self.cfg.note_palette, self.cfg.custom_colors.clone(), self.cfg.rainbow_size);
         if self.applied_look.as_ref() != Some(&look) {
             if self.applied_look.as_ref().map(|l| l.0) != Some(look.0) {
                 look.0.apply(ctx);
             }
             if let Some(song) = &mut self.current_song {
-                song.set_palette(look.1, &look.2);
+                song.set_palette(look.1, &look.2, look.3);
                 self.visible.instance_ring_id = u64::MAX; // drops the cached note colors
             }
             self.applied_look = Some(look);
@@ -1876,7 +1877,7 @@ impl eframe::App for AppState {
                     self.fps,
                     self.cfg.note_speed,
                     self.cfg.notes_rise,
-                    self.cfg.flat_notes,
+                    self.cfg.note_mode(),
                     self.cfg.piano_layout,
                     (self.cfg.stats, self.cfg.synth_stats),
                     &mut self.visible,
@@ -1888,8 +1889,8 @@ impl eframe::App for AppState {
         self.settings_window(ctx);
         self.export.window(ctx);
         self.benchmark_window(ctx);
-
         self.diagnose_window(ctx);
+
         if let Some(log) = &mut self.frame_log {
             log.record(frame_start.elapsed(), &self.frame_times);
         }
@@ -2837,7 +2838,7 @@ mod tests {
         build_note_instances(&song, &mut visible, 4000, 14_000, 0.01, 100, false, &mut instances);
         assert_eq!(instances.len(), 1);
         let old_colour = instances[0].key_color;
-        song.set_palette(theme::NotePalette::Pitch, &[]);
+        song.set_palette(theme::NotePalette::Pitch, &[], 7);
         visible.instance_ring_id = u64::MAX; // what the UI does on a palette change
         let (active, colours) = build_note_instances(&song, &mut visible, 6000, 16_000, 0.01, 100, false, &mut instances);
         assert_ne!(old_colour, instances[0].key_color);

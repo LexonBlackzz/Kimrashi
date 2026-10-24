@@ -247,7 +247,8 @@ pub struct NotesCallback {
     height_time: f32,
     now_us: u64,
     direction_sign: f32,
-    flat_notes: bool,
+    /// 0 shaded, 1 flat, 2 Piano From Above.
+    flat_mode: u32,
 }
 
 impl NotesCallback {
@@ -259,7 +260,7 @@ impl NotesCallback {
         height_time: f32,
         now_us: u64,
         direction_sign: f32,
-        flat_notes: bool,
+        flat_mode: u32,
     ) -> egui::PaintCallback {
         Callback::new_paint_callback(
             viewport,
@@ -271,7 +272,7 @@ impl NotesCallback {
                 height_time: height_time.max(1e-6),
                 now_us,
                 direction_sign,
-                flat_notes,
+                flat_mode,
             },
         )
     }
@@ -300,7 +301,7 @@ impl CallbackTrait for NotesCallback {
             win_width,
             win_height,
             direction_sign: self.direction_sign,
-            flat_mode: if self.flat_notes { 1 } else { 0 },
+            flat_mode: self.flat_mode,
             instance_count: 0, // set in `upload`
             now_us: [self.now_us as u32, (self.now_us >> 32) as u32],
             time_shift: 0.0,
@@ -789,11 +790,11 @@ impl Offscreen {
 
     /// Draws one frame and copies the whole target into `out` (width * height * 4 bytes).
     pub fn render(&mut self, instances: &Arc<InstanceRing>, keys: &[KeyPosition; 256], height_time: f32,
-        now_us: u64, time_shift: f32, background: [u8; 3], direction_sign: f32, flat: bool, out: &mut Vec<u8>)
+        now_us: u64, time_shift: f32, background: [u8; 3], direction_sign: f32, flat_mode: u32, out: &mut Vec<u8>)
     {
         self.pipeline.upload(&self.device, &self.queue, instances, keys, GlobalsUniform {
             height_time, win_width: self.width as f32, win_height: self.note_height as f32,
-            direction_sign, flat_mode: flat as u32, instance_count: 0,
+            direction_sign, flat_mode, instance_count: 0,
             now_us: [now_us as u32, (now_us >> 32) as u32], time_shift, _pad: [0.0; 3],
         });
         let bg = background.map(|c| c as f64 / 255.0);

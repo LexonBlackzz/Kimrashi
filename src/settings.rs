@@ -24,8 +24,12 @@ pub struct Settings {
     pub notes_rise: bool,
     pub piano_layout: bool,
     pub flat_notes: bool,
+    /// Piano From Above's notes and keyboard (overrides `flat_notes`).
+    pub pfa_style: bool,
     pub ui_theme: UiTheme,
     pub note_palette: NotePalette,
+    /// Steps in the Rainbow palette.
+    pub rainbow_size: usize,
     pub custom_colors: Vec<[u8; 3]>,
     /// The PNG the custom colors came from; Randomize draws from it.
     pub palette_image: String,
@@ -62,8 +66,10 @@ impl Default for Settings {
             notes_rise: false,
             piano_layout: false,
             flat_notes: false,
+            pfa_style: false,
             ui_theme: UiTheme::default(),
             note_palette: NotePalette::default(),
+            rainbow_size: 7,
             custom_colors: default_custom(),
             palette_image: String::new(),
             collapse_overlaps: true,
@@ -92,6 +98,9 @@ fn dir() -> Option<std::path::PathBuf> {
 }
 
 impl Settings {
+    /// The note shader's `flat_mode`: 0 shaded, 1 flat, 2 Piano From Above.
+    pub fn note_mode(&self) -> u32 { if self.pfa_style { 2 } else { self.flat_notes as u32 } }
+
     pub fn load() -> Self {
         let Some(dir) = dir() else { return Self::default() };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.json")) {

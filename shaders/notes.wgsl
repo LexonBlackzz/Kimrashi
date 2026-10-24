@@ -185,5 +185,17 @@ fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // Piano From Above: a border of the color at 20% brightness (key-width scaled, 1-3 px),
+    // inside it a gradient from the full color on the left to 60% on the right.
+    if (globals.flat_mode == 2u) {
+        let size_px = input.note_size * 0.5 * input.win_size;
+        let d = clamp(round(size_px.x * 0.075), 1.0, 3.0);
+        let p = input.uv * size_px;
+        let border = p.x < d || p.x > size_px.x - d ||
+            ((input.edges & 1u) != 0u && p.y < d) ||
+            ((input.edges & 2u) != 0u && p.y > size_px.y - d);
+        color = select(input.color * mix(1.0, 0.6, input.uv.x), input.color * 0.2, border || input.thin != 0u);
+    }
+
     return vec4<f32>(color, 1.0);
 }

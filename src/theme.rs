@@ -70,13 +70,17 @@ impl NotePalette {
         (Self::Golden, "Golden"), (Self::Rainbow, "Rainbow"), (Self::Fixed, "Fixed list"), (Self::Pitch, "By pitch"), (Self::Custom, "Custom"),
     ];
 
-    /// `count` colors, one per (track, channel) pair.
-    pub fn colors(self, count: usize, custom: &[[u8; 3]]) -> Vec<Color32> {
+    /// `count` colors, one per (track, channel) pair. `rainbow` is how many steps the rainbow has.
+    pub fn colors(self, count: usize, custom: &[[u8; 3]], rainbow: usize) -> Vec<Color32> {
         match self {
             // Pitch colors come from `pitch_color`; these only back the unused by-channel/track paths.
             Self::Golden | Self::Pitch => generate_palette(count),
-            // The 7 rainbow colors, looped over however many channels or tracks there are.
-            Self::Rainbow => looped(&RAINBOW, count),
+            // `rainbow` steps from red to violet (7 is the hand-picked set), looped over however many channels or tracks there are.
+            Self::Rainbow if rainbow == RAINBOW.len() => looped(&RAINBOW, count),
+            Self::Rainbow => {
+                let n = rainbow.max(2);
+                looped(&(0..n).map(|i| color_from_hsv(0.8 * i as f32 / (n - 1) as f32, 0.75, 1.0)).collect::<Vec<_>>(), count)
+            }
             Self::Fixed => looped(&generate_palette(8), count),
             Self::Custom if custom.is_empty() => generate_palette(count),
             Self::Custom => looped(&custom.iter().map(|&[r, g, b]| Color32::from_rgb(r, g, b)).collect::<Vec<_>>(), count),
@@ -96,6 +100,9 @@ pub fn pitch_color(pitch: u8, lo: u8, hi: u8) -> Color32 {
     let t = (pitch.saturating_sub(lo)) as f32 / (hi.saturating_sub(lo)).max(1) as f32;
     color_from_hsv(0.78 * (1.0 - t.min(1.0)), 0.65, 0.95)
 }
+
+/// Choices for the rainbow's number of steps.
+pub const RAINBOW_SIZES: [usize; 8] = [7, 12, 16, 24, 32, 48, 64, 128];
 
 pub const MAX_CUSTOM: usize = 256;
 
@@ -159,12 +166,14 @@ mod tests {
         let custom = random_colors(5);
         for (p, _) in NotePalette::ALL {
             for n in [1, 8, 16, 40] {
-                assert_eq!(p.colors(n, &custom).len(), n);
+                assert_eq!(p.colors(n, &custom, 7).len(), n);
             }
         }
-        let r = NotePalette::Rainbow.colors(40, &custom);
+        let r = NotePalette::Rainbow.colors(40, &custom, 7);
         assert_eq!(r[7], r[1]); // each lap shifts one along
         assert_ne!(r[0], r[1]);
+        let big = NotePalette::Rainbow.colors(64, &custom, 64);
+        assert_eq!(big.iter().collect::<std::collections::HashSet<_>>().len(), 64); // every step its own hue
         let mut data = Vec::new();
         {
             let mut enc = png::Encoder::new(&mut data, 3, 1);

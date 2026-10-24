@@ -166,8 +166,8 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     let duration_us = song.tempo.duration_us();
     let first_us = first_note_us(&song);
     let mut visual = VisualSong::new(song);
-    visual.set_palette(cfg.look.note_palette, &cfg.look.custom_colors);
-    let keyboard_h = (height as f32 * 0.12) as u32;
+    visual.set_palette(cfg.look.note_palette, &cfg.look.custom_colors, cfg.look.rainbow_size);
+    let keyboard_h = if cfg.look.pfa_style { crate::pfa::key_height(height as f32, width as f32, visual.pitch_min, visual.pitch_max) as u32 } else { (height as f32 * 0.12) as u32 };
     let note_h = height - keyboard_h;
     let mut gpu = gpu::Offscreen::new(width, height, note_h)?;
 
@@ -221,7 +221,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         let (mut active, colors) = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, note_h, piano, &mut instances);
         if deficit > 0.0 { active = [false; 128]; }
         let mut frame = free_rx.try_recv().unwrap_or_default();
-        gpu.render(&instances, &keys, speed, now_us, deficit, [20, 20, 24], if look.notes_rise { 1.0 } else { -1.0 }, look.flat_notes, &mut frame);
+        gpu.render(&instances, &keys, speed, now_us, deficit, [20, 20, 24], if look.notes_rise { 1.0 } else { -1.0 }, look.note_mode(), &mut frame);
         if cfg.title && cfg.lead >= 1.0 {
             // Half-dark band behind the title, fading with it (the text itself is drawn by ffmpeg).
             let dim = 1.0 - 0.5 * intro_fade(f as f64 / cfg.fps as f64, cfg.lead as f64);
@@ -233,7 +233,14 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         }
         fill(&mut frame, width, 0.0, width as f32, note_h, note_h + 1, [200, 200, 210]);
         fill(&mut frame, width, 0.0, width as f32, note_h + 1, height, [235, 235, 240]);
-        keyboard(&mut frame, width, note_h + 1, height, lo, hi, piano.then_some(&columns), &active, &colors);
+        if look.pfa_style {
+            let (whites, sharps) = crate::pfa::layout(piano.then_some(&columns), lo, hi, 0.0, width as f32);
+            let lit = |p: u8| active[p as usize].then(|| { let c = colors[p as usize]; if c == egui::Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] } });
+            let quads = crate::pfa::keyboard(0.0, note_h as f32, width as f32, keyboard_h as f32, [20, 20, 24], &whites, &sharps, &lit);
+            crate::pfa::fill(&mut frame, width, &quads);
+        } else {
+            keyboard(&mut frame, width, note_h + 1, height, lo, hi, piano.then_some(&columns), &active, &colors);
+        }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };
         if !on_frame(&report) { result = Err("cancelled".into()); break; }
         if full_tx.send(frame).is_err() { break; }

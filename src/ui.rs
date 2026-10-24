@@ -275,8 +275,11 @@ impl AppState {
                     if show(Display, "Shading flat shaded") {
                         ui.label("Shading");
                         ui.horizontal(|ui| {
-                            ui.selectable_value(&mut c.flat_notes, false, "Shaded");
-                            ui.selectable_value(&mut c.flat_notes, true, "Flat");
+                            let mut style = if c.pfa_style { 2 } else { c.flat_notes as u8 };
+                            ui.selectable_value(&mut style, 0, "Shaded");
+                            ui.selectable_value(&mut style, 1, "Flat");
+                            ui.selectable_value(&mut style, 2, "PFA").on_hover_text("Piano From Above's notes and keyboard");
+                            (c.pfa_style, c.flat_notes) = (style == 2, style == 1);
                         });
                         ui.end_row();
                         shown += 1;
@@ -299,6 +302,16 @@ impl AppState {
                                 .show_ui(ui, |ui| {
                                     for (p, name) in crate::theme::NotePalette::ALL { ui.selectable_value(&mut c.note_palette, p, name); }
                                 });
+                            if c.note_palette == crate::theme::NotePalette::Rainbow {
+                                ui.horizontal(|ui| {
+                                    ui.label("Steps");
+                                    egui::ComboBox::from_id_salt("rainbow_size")
+                                        .selected_text(c.rainbow_size.to_string())
+                                        .show_ui(ui, |ui| {
+                                            for n in crate::theme::RAINBOW_SIZES { ui.selectable_value(&mut c.rainbow_size, n, n.to_string()); }
+                                        });
+                                });
+                            }
                             if c.note_palette == crate::theme::NotePalette::Custom {
                                 use crate::theme::{colors_from_png, random_colors, random_from_png, MAX_CUSTOM};
                                 ui.horizontal_wrapped(|ui| {
@@ -661,7 +674,7 @@ pub(crate) fn draw_piano_roll(
     fps: f32,
     note_speed_seconds: f32,
     notes_upwards: bool,
-    flat_notes: bool,
+    note_mode: u32,
     piano_layout: bool,
     (stats_mode, synth_stats): (StatsMode, bool),
     visible: &mut VisibleNotes,
@@ -671,7 +684,18 @@ pub(crate) fn draw_piano_roll(
     let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
     let rect = response.rect;
 
-    let keyboard_height = (rect.height() * 0.12).clamp(36.0, 120.0);
+    let (pitch_min, pitch_max) = if let Some(song) = song {
+        (song.pitch_min, song.pitch_max)
+    } else {
+        (DEFAULT_PITCH_MIN, DEFAULT_PITCH_MAX)
+    };
+
+    // The keyboard grows to PFA's size and back, easing out in both directions.
+    let pfa = note_mode == 2;
+    let linear = ui.ctx().animate_bool_with_time(egui::Id::new("pfa_keyboard"), pfa, 0.4);
+    let eased = if pfa { egui::emath::easing::cubic_out(linear) } else { 1.0 - egui::emath::easing::cubic_out(1.0 - linear) };
+    let classic_height = (rect.height() * 0.12).clamp(36.0, 120.0);
+    let keyboard_height = classic_height + (crate::pfa::key_height(rect.height(), rect.width(), pitch_min, pitch_max) - classic_height) * eased;
     let note_area = Rect::from_min_max(
         Pos2::new(rect.left(), rect.top()),
         Pos2::new(rect.right(), rect.bottom() - keyboard_height),
@@ -694,12 +718,6 @@ pub(crate) fn draw_piano_roll(
     let window_end = now_us
         .saturating_add(future_us)
         .min(duration_us.max(now_us));
-
-    let (pitch_min, pitch_max) = if let Some(song) = song {
-        (song.pitch_min, song.pitch_max)
-    } else {
-        (DEFAULT_PITCH_MIN, DEFAULT_PITCH_MAX)
-    };
 
     let pitch_span_i = (pitch_max as i32 - pitch_min as i32 + 1).max(1);
 
@@ -759,7 +777,7 @@ pub(crate) fn draw_piano_roll(
                     speed,
                     now_us,
                     if notes_upwards { 1.0 } else { -1.0 },
-                    flat_notes,
+                    note_mode,
                 ));
             }
         }
@@ -773,15 +791,22 @@ pub(crate) fn draw_piano_roll(
         );
     }
 
-    draw_keyboard(
-        &painter,
-        keyboard_rect,
-        pitch_min,
-        pitch_max,
-        piano_layout.then_some(&columns),
-        &active_keys,
-        &active_colors,
-    );
+    if eased > 0.0 {
+        let mut over = painter.clone();
+        over.multiply_opacity(eased);
+        draw_pfa_keyboard(&over, keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors);
+    }
+    if eased < 1.0 {
+        draw_keyboard(
+            &painter,
+            keyboard_rect,
+            pitch_min,
+            pitch_max,
+            piano_layout.then_some(&columns),
+            &active_keys,
+            &active_colors,
+        );
+    }
 
     let detailed_stats = stats_mode == StatsMode::Detailed;
     let mut stats_text = if detailed_stats {
@@ -899,6 +924,23 @@ pub(crate) fn key_columns(piano: bool, pitch_min: u8, pitch_max: u8) -> [(f32, f
         out[p as usize] = (left, left + white_cx * width);
     }
     out
+}
+
+/// `draw_keyboard` in Piano From Above's style (see `pfa`).
+fn draw_pfa_keyboard(painter: &egui::Painter, rect: Rect, lo: u8, hi: u8, columns: Option<&[(f32, f32); 128]>,
+    active: &[bool; 128], colors: &[Color32; 128])
+{
+    if lo > hi { return; }
+    let (whites, sharps) = crate::pfa::layout(columns, lo, hi, rect.left(), rect.width());
+    let lit = |p: u8| active[p as usize].then(|| { let c = colors[p as usize]; if c == Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] } });
+    let mut mesh = egui::Mesh::default();
+    for q in crate::pfa::keyboard(rect.left(), rect.top(), rect.width(), rect.height(), [20, 20, 24], &whites, &sharps, &lit) {
+        let base = mesh.vertices.len() as u32;
+        for (p, c) in q.p.iter().zip(q.c) { mesh.colored_vertex(Pos2::new(p[0], p[1]), Color32::from_rgb(c[0], c[1], c[2])); }
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base, base + 2, base + 3);
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 pub(crate) fn draw_keyboard(
