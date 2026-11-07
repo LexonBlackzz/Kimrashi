@@ -213,7 +213,7 @@ pub fn run_from_args() -> bool {
         let build = t1.elapsed();
         let cpu = t0.elapsed();
         let (upload, gpu) = renderer.frame(&instances, &keys, speed, now);
-        let times = FrameTimes { advance: visible.timing, build, instances: instances.len(), decoded: visible.last_batch };
+        let times = FrameTimes { advance: visible.timing, build, instances: instances.len(), decoded: visible.last_batch, ..Default::default() };
         if let Some(log) = &mut log { log.record(cpu, &times); }
         if verify_every.is_some_and(|every| f % every == 0) || (verify && (f == 0 || f == 20 || f == frames + 19)) {
             let pixels = renderer.pixels();

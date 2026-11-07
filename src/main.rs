@@ -223,6 +223,7 @@ fn main() {
                 status_message: None,
                 fps: 0.0,
                 last_frame: None,
+                last_update_end: None,
                 timer_guard,
                 updater: {
                     let mut updater = update::Updater::new(cfg.check_updates, cfg.last_update_check);
@@ -253,6 +254,16 @@ struct FrameTimes {
     instances: usize,
     /// Notes decoded this frame.
     decoded: usize,
+    /// Time between the previous `update` returning and this one starting: tessellation,
+    /// the notes callback, submit, present and any wait on the swap chain or GPU.
+    outside: Duration,
+    /// Inside that: CPU time of the notes callback's `prepare` (upload) and `paint` (draw call).
+    prepare: Duration,
+    paint: Duration,
+    /// Inside `prepare`: what the upload did (see `gpu::UploadStats`).
+    upload: gpu::UploadStats,
+    /// Inside `build`: keyboard, rows, bitset, packing, retire, cap (`VisibleNotes::build_profile`).
+    profile: [Duration; 6],
 }
 
 /// With `KIM_FRAMELOG=path` set, one line per second of average frame numbers.
@@ -264,6 +275,10 @@ struct FrameLog {
     worst: Duration,
     /// Retain, decode, sort, cull, build.
     parts: [Duration; 5],
+    /// Outside `update`, callback prepare, callback paint (see `FrameTimes`).
+    outside: [Duration; 3],
+    upload: gpu::UploadStats,
+    profile: [Duration; 6],
     instances: usize,
     decoded: usize,
 }
@@ -273,7 +288,7 @@ impl FrameLog {
         let mut file = std::fs::File::create(std::env::var_os("KIM_FRAMELOG")?).ok()?;
         let _ = writeln!(
             file,
-            "fps,update_ms,worst_update_ms,retain_ms,decode_ms,sort_ms,cull_ms,build_ms,instances,new_per_frame"
+            "fps,update_ms,worst_update_ms,retain_ms,decode_ms,sort_ms,cull_ms,build_ms,instances,new_per_frame,outside_ms,prepare_ms,paint_ms,up_slots_ms,up_order_ms,up_writes,up_kb,bp_keyboard,bp_rows,bp_bitset,bp_packing,bp_retire,bp_cap"
         );
         Some(Self::new(file))
     }
@@ -286,6 +301,9 @@ impl FrameLog {
             update: Duration::ZERO,
             worst: Duration::ZERO,
             parts: [Duration::ZERO; 5],
+            outside: [Duration::ZERO; 3],
+            upload: Default::default(),
+            profile: [Duration::ZERO; 6],
             instances: 0,
             decoded: 0,
         }
@@ -308,6 +326,14 @@ impl FrameLog {
         for (sum, d) in self.parts.iter_mut().zip([a.retain, a.decode, a.sort, a.cull, t.build]) {
             *sum += d;
         }
+        for (sum, d) in self.outside.iter_mut().zip([t.outside, t.prepare, t.paint]) {
+            *sum += d;
+        }
+        for (sum, d) in self.profile.iter_mut().zip(t.profile) {
+            *sum += d;
+        }
+        let u = &mut self.upload;
+        (u.slots, u.order, u.writes, u.bytes) = (u.slots + t.upload.slots, u.order + t.upload.order, u.writes + t.upload.writes, u.bytes + t.upload.bytes);
         self.instances = self.instances.max(t.instances);
         self.decoded += t.decoded;
         if self.since.elapsed() >= Duration::from_secs(1) { self.flush(); }
@@ -320,7 +346,7 @@ impl FrameLog {
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
             let _ = writeln!(
                 self.file,
-                "{:.1},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{}",
+                "{:.1},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
                 self.frames as f64 / wall.as_secs_f64(),
                 ms(self.update) / n,
                 ms(self.worst),
@@ -330,7 +356,20 @@ impl FrameLog {
                 ms(self.parts[3]) / n,
                 ms(self.parts[4]) / n,
                 self.instances,
-                (self.decoded as f64 / n) as u64
+                (self.decoded as f64 / n) as u64,
+                ms(self.outside[0]) / n,
+                ms(self.outside[1]) / n,
+                ms(self.outside[2]) / n,
+                ms(self.upload.slots) / n,
+                ms(self.upload.order) / n,
+                (self.upload.writes as f64 / n) as u64,
+                (self.upload.bytes as f64 / n / 1024.0) as u64,
+                ms(self.profile[0]) / n,
+                ms(self.profile[1]) / n,
+                ms(self.profile[2]) / n,
+                ms(self.profile[3]) / n,
+                ms(self.profile[4]) / n,
+                ms(self.profile[5]) / n
             );
             let _ = self.file.flush();
             if let Ok(file) = self.file.try_clone() {
@@ -1186,7 +1225,10 @@ impl VisibleNotes {
     }
 
     fn advance(&mut self, song: &Arc<SongData>, now_us: u64, window_end: u64, _px_us: u64) {
-        let reset = now_us < self.time_us || now_us.saturating_sub(self.time_us) > 1_000_000
+        // Only a rewind or another song starts over. A forward jump, or a frame that stalled for
+        // over a second, is just a big step: the worker skips what has already ended. Rescanning
+        // from the song's start on every such frame made each rescan stall the next one too.
+        let reset = now_us < self.time_us
             || self.worker.as_ref().is_some_and(|w| !Arc::ptr_eq(&w.song, song));
         if reset {
             let generation = self.generation.wrapping_add(1);
@@ -1632,6 +1674,8 @@ struct AppState {
     status_message: Option<String>,
     fps: f32,
     last_frame: Option<Instant>,
+    /// When the previous `update` returned (see `FrameTimes::outside`).
+    last_update_end: Option<Instant>,
     #[allow(dead_code)]
     timer_guard: TimerGuard,
     updater: update::Updater,
@@ -1653,6 +1697,8 @@ enum SettingsTab {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Before the frame limiter's sleep, so that sleep is not counted as time outside.
+        let outside = self.last_update_end.map_or(Duration::ZERO, |end| end.elapsed());
         match self.updater.poll() {
             update::Outcome::Restart => {
                 self.save_settings();
@@ -1892,11 +1938,14 @@ impl eframe::App for AppState {
         self.diagnose_window(ctx);
 
         if let Some(log) = &mut self.frame_log {
-            log.record(frame_start.elapsed(), &self.frame_times);
+            let t = &mut self.frame_times;
+            (t.outside, t.prepare, t.paint, t.upload) = (outside, gpu::take_prepare(), gpu::take_paint(), gpu::take_upload());
+            log.record(frame_start.elapsed(), t);
         }
 
         // Always keep egui's animation loop active.
         ctx.request_repaint();
+        self.last_update_end = Some(Instant::now());
     }
 
     fn on_exit(&mut self) {
@@ -2457,6 +2506,12 @@ mod tests {
         stepped.advance(&song.data, 2_000_000, 5_000_000, 3000); // jumped parallel path
         let mut fresh = VisibleNotes::default();
         fresh.advance(&song.data, 2_000_000, 5_000_000, 3000);
+        // A jump no longer starts over, so a held note's real end arrives as an update a frame later.
+        for _ in 0..200 {
+            if stepped.window == fresh.window { break; }
+            std::thread::sleep(Duration::from_millis(5));
+            stepped.advance(&song.data, 2_000_000, 5_000_000, 3000);
+        }
         assert_eq!(stepped.window, fresh.window);
         let mut a = Arc::new(gpu::InstanceRing::default());
         let mut b = Arc::new(gpu::InstanceRing::default());
@@ -2700,6 +2755,7 @@ mod tests {
         assert!(visible.collapse_overlaps);
         let speed = 0.5f32;
         let mut now = 0u64;
+        let mut jumped = false;
         while now < 5_400_000 {
             let end = now + (speed as f64 * 1e6) as u64;
             visible.advance(&song.data, now, end, 5000);
@@ -2730,8 +2786,10 @@ mod tests {
  exact: {:?}", near(&flat), near(&exact));
                 }
             }
-            now += 33_000;
+            // One step of 1.7 s (a seek, or a stall) in the middle: no rescan, same pixels.
+            now += if now >= 1_000_000 && !jumped { jumped = true; 1_700_000 } else { 33_000 };
         }
+        assert!(jumped);
     }
 
     #[test]

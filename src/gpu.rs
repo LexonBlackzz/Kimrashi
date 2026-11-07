@@ -1,6 +1,30 @@
-use std::{mem, sync::{Arc, Weak}, collections::BTreeMap};
+use std::{mem, sync::{Arc, OnceLock, Weak, atomic::{AtomicU64, Ordering}}, collections::BTreeMap};
 
 use std::time::{Duration, Instant};
+
+static PREPARE_NS: AtomicU64 = AtomicU64::new(0);
+static PAINT_NS: AtomicU64 = AtomicU64::new(0);
+/// Instance-slot diff + writes (ns), draw-order build + diff + write (ns), `write_buffer` calls, bytes.
+static UPLOAD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// What `upload` did since the last `take_upload`, for `KIM_FRAMELOG`.
+#[derive(Default, Clone, Copy)]
+pub struct UploadStats { pub slots: Duration, pub order: Duration, pub writes: u64, pub bytes: u64 }
+
+pub fn take_upload() -> UploadStats {
+    let take = |i: usize| UPLOAD[i].swap(0, Ordering::Relaxed);
+    UploadStats { slots: Duration::from_nanos(take(0)), order: Duration::from_nanos(take(1)), writes: take(2), bytes: take(3) }
+}
+
+/// CPU time the notes callback spent in `prepare` (upload) since the last call, for `KIM_FRAMELOG`.
+pub fn take_prepare() -> Duration { Duration::from_nanos(PREPARE_NS.swap(0, Ordering::Relaxed)) }
+/// The same for `paint` (recording the draw call).
+pub fn take_paint() -> Duration { Duration::from_nanos(PAINT_NS.swap(0, Ordering::Relaxed)) }
+
+/// Debug switches for finding where a frame goes: `KIM_NO_DRAW` uploads the notes but does
+/// not draw them; `KIM_NO_NOTES` leaves the notes callback out altogether.
+pub fn no_draw() -> bool { static F: OnceLock<bool> = OnceLock::new(); *F.get_or_init(|| std::env::var_os("KIM_NO_DRAW").is_some()) }
+pub fn no_notes() -> bool { static F: OnceLock<bool> = OnceLock::new(); *F.get_or_init(|| std::env::var_os("KIM_NO_NOTES").is_some()) }
 
 use bytemuck::{Pod, Zeroable};
 use eframe::{egui, wgpu};
@@ -58,14 +82,23 @@ pub struct InstanceRing {
     created: [usize; 2],
     free: Vec<u32>,
     revision: u64,
+    /// Every slot pushed, oldest first; `pushed_first` pushes came before `pushed[0]`. A pipeline
+    /// that remembers how many pushes it has uploaded visits only the newer ones instead of
+    /// comparing every slot ever allocated (a table that never shrinks) on every frame.
+    pushed: Vec<u32>,
+    pushed_first: u64,
 }
+
+/// Pushes kept beyond one per slot before the oldest half is dropped.
+const PUSH_HISTORY: usize = 1 << 16;
 
 impl Default for InstanceRing {
     fn default() -> Self {
         static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self { id: ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), now: 0, draw_epoch: 0, slots: Vec::new(),
             meta: Vec::new(), order: Vec::new(), tail: Vec::new(), tail_mode: false,
-            expiry: BTreeMap::new(), expiry_records: 0, created: [0; 2], free: Vec::new(), revision: 0 }
+            expiry: BTreeMap::new(), expiry_records: 0, created: [0; 2], free: Vec::new(), revision: 0,
+            pushed: Vec::new(), pushed_first: 0 }
     }
 }
 
@@ -86,7 +119,19 @@ impl InstanceRing {
     pub fn iter(&self) -> impl Iterator<Item = &NoteInstance> {
         self.order.iter().map(|&slot| &self.slots[slot as usize])
     }
+    /// How many pushes this ring has seen (see `pushed_since`).
+    fn pushes(&self) -> u64 { self.pushed_first + self.pushed.len() as u64 }
+    /// The slots pushed after the first `cursor` pushes, or `None` if that is older than the
+    /// history kept (the caller then compares every slot).
+    fn pushed_since(&self, cursor: u64) -> Option<&[u32]> {
+        self.pushed.get(cursor.checked_sub(self.pushed_first)? as usize..)
+    }
     pub fn begin(&mut self, now: u64) {
+        if self.pushed.len() > self.slots.len() + PUSH_HISTORY {
+            let cut = self.pushed.len() / 2;
+            self.pushed.drain(..cut);
+            self.pushed_first += cut as u64;
+        }
         self.order.clear();
         self.tail.clear();
         self.tail_mode = false;
@@ -154,6 +199,7 @@ impl InstanceRing {
             self.slots.len() as u32 - 1
         };
         self.created[0] += 1;
+        self.pushed.push(slot);
         self.expiry.entry(expiry >> EXPIRY_SHIFT).or_default().push(slot);
         self.expiry_records += 1;
         self.push_slot(slot);
@@ -287,6 +333,7 @@ impl CallbackTrait for NotesCallback {
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        let started = Instant::now();
         let viewport_px = ViewportInPixels::from_points(
             &self.viewport,
             screen.pixels_per_point,
@@ -315,6 +362,7 @@ impl CallbackTrait for NotesCallback {
         pipeline.ensure_format(device, self.target_format);
         pipeline.upload(device, queue, &self.instances, &self.key_positions, globals);
 
+        PREPARE_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Vec::new()
     }
 
@@ -324,10 +372,14 @@ impl CallbackTrait for NotesCallback {
         render_pass: &mut wgpu::RenderPass<'static>,
         resources: &CallbackResources,
     ) {
+        let started = Instant::now();
         let Some(pipeline) = resources.get::<NotePipeline>() else {
             return;
         };
-        pipeline.draw(render_pass);
+        if !no_draw() {
+            pipeline.draw(render_pass);
+        }
+        PAINT_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -340,6 +392,9 @@ struct NotePipeline {
     instance_count: u32,
     uploaded: Option<Weak<InstanceRing>>,
     versions: Vec<u64>,
+    /// The ring (0 = none) and how many of its pushes `versions` is up to date through.
+    ring_id: u64,
+    cursor: u64,
     order: Vec<u32>,
     order_buffer: wgpu::Buffer,
     order_capacity: usize,
@@ -503,7 +558,7 @@ impl NotePipeline {
             instance_capacity: 16,
             instance_count: 0,
             uploaded: None,
-            versions: Vec::new(), order: Vec::new(), order_buffer, order_capacity: 64, relative,
+            versions: Vec::new(), ring_id: 0, cursor: 0, order: Vec::new(), order_buffer, order_capacity: 64, relative,
             key_buffer,
             globals_buffer,
             target_format,
@@ -548,32 +603,47 @@ impl NotePipeline {
                 // Coalesce changed slots into few writes: reused slots are scattered, so runs
                 // separated by up to 64 unchanged slots go out together (the gap is rewritten
                 // with the data already there).
+                let t_slots = Instant::now();
+                // Only slots pushed since the last upload can differ, so visit just those; a new
+                // ring, a regrown buffer or a gap in the history compares every slot instead.
+                let pushed = if self.ring_id == data.id() && self.versions.len() <= needed { data.pushed_since(self.cursor) } else { None };
                 self.versions.resize(needed, 0);
-                let mut i = 0;
-                while i < needed {
-                    if self.versions[i] == data.meta[i].version { i += 1; continue; }
-                    let first = i;
-                    let mut end;
-                    loop {
-                        while i < needed && self.versions[i] != data.meta[i].version {
-                            self.versions[i] = data.meta[i].version;
-                            i += 1;
-                        }
-                        end = i;
-                        let next = (i..needed.min(i + 64)).find(|&j| self.versions[j] != data.meta[j].version);
-                        match next { Some(j) => i = j, None => break }
-                    }
+                let differs = |s: usize| self.versions[s] != data.meta[s].version;
+                let mut changed: Vec<u32> = match pushed {
+                    Some(pushed) => pushed.iter().copied().filter(|&s| (s as usize) < needed && differs(s as usize)).collect(),
+                    None => (0..needed).filter(|&s| differs(s)).map(|s| s as u32).collect(),
+                };
+                changed.sort_unstable();
+                changed.dedup();
+                let mut k = 0;
+                while k < changed.len() {
+                    let first = changed[k] as usize;
+                    let mut end = first + 1;
+                    k += 1;
+                    // Coalesce into few writes: reused slots are scattered, so runs separated by
+                    // up to 64 unchanged slots go out together (the gap is rewritten with the
+                    // data already there).
+                    while k < changed.len() && (changed[k] as usize) < end + 64 { end = changed[k] as usize + 1; k += 1; }
+                    for s in first..end { self.versions[s] = data.meta[s].version; }
                     queue.write_buffer(&self.instance_buffer, (first * mem::size_of::<NoteInstance>()) as u64,
                         bytemuck::cast_slice(&data.slots[first..end]));
+                    UPLOAD[2].fetch_add(1, Ordering::Relaxed);
+                    UPLOAD[3].fetch_add(((end - first) * mem::size_of::<NoteInstance>()) as u64, Ordering::Relaxed);
                 }
+                (self.ring_id, self.cursor) = (data.id(), data.pushes());
+                UPLOAD[0].fetch_add(t_slots.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let t_order = Instant::now();
                 let order: Vec<_> = data.order.iter().copied().filter(|&slot| (slot as usize) < needed).collect();
                 if self.order != order {
                     let first = self.order.iter().zip(&order).take_while(|(a,b)| a == b).count();
                     if first < order.len() {
                         queue.write_buffer(&self.order_buffer, (first * 4) as u64, bytemuck::cast_slice(&order[first..]));
+                        UPLOAD[2].fetch_add(1, Ordering::Relaxed);
+                        UPLOAD[3].fetch_add(((order.len() - first) * 4) as u64, Ordering::Relaxed);
                     }
                     self.order = order;
                 }
+                UPLOAD[1].fetch_add(t_order.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 self.instance_count = self.order.len() as u32;
             }
             self.uploaded = Some(source);
@@ -595,6 +665,7 @@ impl NotePipeline {
         self.instance_capacity = capacity;
         self.uploaded = None;
         self.versions.clear();
+        self.ring_id = 0;
         if !self.relative {
             self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("notes.bind_group.grow"), layout: &self.pipeline.get_bind_group_layout(0),
@@ -895,6 +966,26 @@ mod tests {
         ring.begin(100);
         for slot in 0..5 { ring.push_slot(slot); }
         assert_eq!(ring.len(), 5);
+    }
+
+    #[test]
+    fn pushed_since_lists_only_newer_slots_and_none_once_trimmed() {
+        let n = NoteInstance { start_us: [0, 0], len: 1.0, key_color: 60 };
+        let (mut ring, end) = (InstanceRing::default(), 1u64 << 40);
+        ring.begin(0);
+        let a = ring.push(n, end);
+        let cursor = ring.pushes();
+        let (b, c) = (ring.push(n, end), ring.push(n, end));
+        assert_eq!(ring.pushed_since(cursor), Some(&[b, c][..]));
+        assert_eq!(ring.pushed_since(0), Some(&[a, b, c][..]));
+        assert_eq!(ring.pushed_since(ring.pushes()), Some(&[][..]));
+        // Reusing three slots over and over keeps the table small but the history long: trimmed.
+        for _ in 0..3 * PUSH_HISTORY { let s = ring.push(n, end); ring.retire(s); }
+        let total = ring.pushes();
+        ring.begin(1);
+        assert_eq!(ring.pushes(), total, "trimming drops old pushes, it does not forget how many there were");
+        assert_eq!(ring.pushed_since(0), None);
+        assert_eq!(ring.pushed_since(total), Some(&[][..]));
     }
 
     #[test]

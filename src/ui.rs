@@ -766,9 +766,10 @@ pub(crate) fn draw_piano_roll(
         );
 
         times.build = t0.elapsed();
+        times.profile = visible.build_profile;
         times.instances = instances.len();
         if let Some(state) = frame.wgpu_render_state() {
-            if !instances.is_empty() {
+            if !instances.is_empty() && !gpu::no_notes() {
                 painter.add(gpu::NotesCallback::new(
                     note_area,
                     state.target_format,
