@@ -196,6 +196,8 @@ pub struct SongData {
     pub tempo: Arc<TempoMap>,
     /// Wall time of the whole load (open, parse, tempo map).
     pub load_time: std::time::Duration,
+    /// Built in the background after loading, for files big enough to need it (see `seek`).
+    pub seek: std::sync::OnceLock<crate::seek::SeekIndex>,
 }
 
 impl SongData {
@@ -209,12 +211,20 @@ impl SongData {
         let path_ref = path.as_ref();
         let midi = Arc::new(MidiFile::open_and_parse(path_ref, vel_levels, progress)?);
         let tempo = Arc::new(TempoMap::from_midi(&midi));
-        Ok(Arc::new(SongData {
+        let song = Arc::new(SongData {
             path: path_ref.to_string_lossy().into_owned(),
             midi,
             tempo,
             load_time: start.elapsed(),
-        }))
+            seek: Default::default(),
+        });
+        if song.midi.note_count >= crate::seek::MIN_NOTES && std::env::var_os("KIM_NO_SEEK_INDEX").is_none() {
+            let song = song.clone();
+            let _ = std::thread::Builder::new().name("seek-index".into()).spawn(move || {
+                if let Some(index) = crate::seek::SeekIndex::build(&song) { let _ = song.seek.set(index); }
+            });
+        }
+        Ok(song)
     }
 }
 

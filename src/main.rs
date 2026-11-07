@@ -4,6 +4,7 @@ mod archive;
 mod bench;
 mod benchmark;
 mod render_bench;
+mod seek;
 mod export;
 mod export_ui;
 mod clock;
@@ -94,7 +95,7 @@ const NOTE_HOLD_MICROS: u64 = 1_000; // keep notes visible 1ms after Note Off to
 
 fn main() {
     let _timer = create_timer_guard();
-    if bench::run_from_args() || export::run_from_args() || render_bench::run_from_args() || benchmark::run_from_args() || update::run_from_args() {
+    if bench::run_from_args() || export::run_from_args() || render_bench::run_from_args() || render_bench::run_seek_from_args() || benchmark::run_from_args() || update::run_from_args() {
         return;
     }
     update::cleanup_old();
@@ -224,6 +225,12 @@ fn main() {
                 fps: 0.0,
                 last_frame: None,
                 last_update_end: None,
+                // Debug: `KIM_SEEK_SCRIPT=10=9:00,20=3:00` seeks to 9:00 ten seconds after the song opens, and so on.
+                seek_script: std::env::var("KIM_SEEK_SCRIPT").ok().map(|s| s.split(',').filter_map(|e| {
+                    let (at, to) = e.split_once('=')?;
+                    Some((Duration::from_secs_f64(at.parse().ok()?), bench::parse_time(to).ok()?))
+                }).collect()).unwrap_or_default(),
+                script_start: None,
                 timer_guard,
                 updater: {
                     let mut updater = update::Updater::new(cfg.check_updates, cfg.last_update_check);
@@ -644,6 +651,10 @@ const DECODE_AHEAD_US: u64 = 10_000_000;
 /// at most `WORKER_CHUNK_US` of song at a time (it all sits in memory until sent).
 const SYNC_AHEAD_US: u64 = 250_000;
 const WORKER_CHUNK_US: u64 = 50_000;
+/// The most a worker far behind the clock steps at once.
+const CATCH_UP_US: u64 = 60_000_000;
+/// A jump forward of more than this restarts from the seek index instead of catching up.
+const SEEK_RESET_US: u64 = 5_000_000;
 /// The worker pauses while this many notes wait unread in its channel. Bounding notes, not
 /// messages, lets quiet passages build a long lead (up to `DECODE_AHEAD_US`) for dense ones,
 /// which a message count did not: a chunk is one message however few notes it holds.
@@ -781,26 +792,23 @@ fn decode_notes(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach
     decode_tracks(song, readers, now_us, reach, None)
 }
 
-/// Each enabled track's notes in `[now_us, reach)`, in track order.
-fn decode_parts(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> Vec<Decoded> {
+fn decode_tracks(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> Decoded {
+    decode_tracks_from(song, readers, now_us, reach, enabled, None)
+}
+
+/// Each enabled track's notes in `[now_us, reach)`, in track order. With `resume`, `readers` start at
+/// a seek index snapshot and the long notes from before it are taken from the index.
+fn decode_parts(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>, resume: Option<&seek::Resume>) -> Vec<Decoded> {
     let tempo = &song.tempo;
     let now_tick = tempo.time_to_tick(now_us);
     let end_tick = tempo.time_to_tick(reach);
     let decode = |track: usize, r: &mut TrackReader, acc: &mut Decoded| {
         if enabled.is_some_and(|mask| !mask[track]) { return; }
         let data = song.midi.track(track);
-        if r.peek_tick(data).map_or(true, |t| t >= end_tick) {
-            return; // nothing new in this track (most of the 60,000 in some files)
-        }
         let mut tempo_cache = 0;
+        let mut run = [0u8; 16];
         let base = acc.notes.len();
-        while let Some((tick, rec)) = r.next_before(data, end_tick) {
-            acc.scanned += 1;
-            let Record::Note { ch, key, dur, .. } = rec else { continue };
-            // Cheap tick check first so fast-forwarding skips finished notes.
-            if dur.is_some_and(|d| tick + d < now_tick) {
-                continue;
-            }
+        let mut keep = |acc: &mut Decoded, tick: u32, ch: u8, key: u8, dur: Option<u32>| {
             let end_us = match dur {
                 Some(d) => tempo.tick_to_time_approx(tick + d, &mut tempo_cache),
                 None => tempo.duration_us(),
@@ -815,6 +823,27 @@ fn decode_parts(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach
                 };
                 push_culled(&mut acc.notes, &mut acc.last, base, note);
             }
+        };
+        if let Some(resume) = resume {
+            for long in resume.long[track].iter().take_while(|n| n.tick < resume.before) {
+                if long.dur.is_some_and(|d| long.tick + d < now_tick) { continue; }
+                keep(acc, long.tick, long.ch, long.key, long.dur);
+            }
+        }
+        if r.peek_tick(data).map_or(true, |t| t >= end_tick) {
+            return; // nothing new in this track (most of the 60,000 in some files)
+        }
+        while let Some((tick, rec)) = r.next_before(data, end_tick) {
+            acc.scanned += 1;
+            let Record::Note { ch, key, dur, .. } = rec else { continue };
+            // Cheap tick check first so fast-forwarding skips finished notes.
+            if dur.is_some_and(|d| tick + d < now_tick) {
+                // The plain notes right behind it share its tick and length (most of a dense
+                // black MIDI), so they are finished too: skip them together.
+                if r.same_tick_run(data, &mut run).is_some() { acc.scanned += 16; }
+                continue;
+            }
+            keep(acc, tick, ch, key, dur);
         }
     };
     // Indexed collection preserves track order.
@@ -829,7 +858,7 @@ fn decode_parts(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach
 /// tracks are bucketed by key in parallel, then each key is joined in group order, so a
 /// key sees tracks in order.
 fn decode_keys(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> (Vec<Vec<NoteSegment>>, usize) {
-    let parts = decode_parts(song, readers, now_us, reach, enabled);
+    let parts = decode_parts(song, readers, now_us, reach, enabled, None);
     let scanned = parts.iter().map(|p| p.scanned).sum();
     let group = parts.len().div_ceil(64).max(1);
     let groups: Vec<Vec<Vec<NoteSegment>>> = parts.par_chunks(group).map(|tracks| {
@@ -858,8 +887,8 @@ fn decode_keys(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach:
 }
 
 /// Every enabled track's notes in `[now_us, reach)`, sorted by start.
-fn decode_tracks(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>) -> Decoded {
-    let parts = decode_parts(song, readers, now_us, reach, enabled);
+fn decode_tracks_from(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach: u64, enabled: Option<&[bool]>, resume: Option<&seek::Resume>) -> Decoded {
+    let parts = decode_parts(song, readers, now_us, reach, enabled, resume);
     let mut out = Decoded::new(Vec::new());
     out.scanned = parts.iter().map(|p| p.scanned).sum();
     out.notes.reserve(parts.iter().map(|p| p.notes.len()).sum());
@@ -1060,13 +1089,18 @@ impl DecodeWorker {
                 .thread_name(|i| format!("note-decode-{i}"))
                 .build().expect("note decode pool");
             while !worker_stop.load(Ordering::Acquire) {
-                let reach = worker_target.load(Ordering::Acquire).min(through.saturating_add(WORKER_CHUNK_US));
+                let now = worker_now.load(Ordering::Acquire);
+                // Behind the clock (after a seek or a stall) what has ended is dropped, so one big
+                // step to the clock costs no memory and skips the per-chunk work of ~1 ms on a
+                // file with thousands of tracks.
+                let mut reach = through.saturating_add(WORKER_CHUNK_US);
+                if reach < now { reach = now.min(through.saturating_add(CATCH_UP_US)); }
+                let reach = reach.min(worker_target.load(Ordering::Acquire));
                 if reach <= through || worker_queued.load(Ordering::Acquire) > MAX_QUEUED_NOTES {
                     std::thread::park_timeout(Duration::from_millis(2));
                     continue;
                 }
                 let decoded = decode_pool.install(|| {
-                    let now = worker_now.load(Ordering::Acquire);
                     match &mut flatten {
                         Some(keys) => {
                             let (buckets, scanned) = decode_keys(&worker_song, &mut readers, now, reach, Some(&enabled));
@@ -1228,7 +1262,9 @@ impl VisibleNotes {
         // Only a rewind or another song starts over. A forward jump, or a frame that stalled for
         // over a second, is just a big step: the worker skips what has already ended. Rescanning
         // from the song's start on every such frame made each rescan stall the next one too.
+        // With a seek index a restart is cheap, so a big jump takes it; without one, catching up costs less.
         let reset = now_us < self.time_us
+            || (song.seek.get().is_some() && now_us - self.time_us > SEEK_RESET_US)
             || self.worker.as_ref().is_some_and(|w| !Arc::ptr_eq(&w.song, song));
         if reset {
             let generation = self.generation.wrapping_add(1);
@@ -1244,11 +1280,12 @@ impl VisibleNotes {
         self.timing.sort = Duration::ZERO;
         self.last_batch = 0;
         if self.worker.is_none() {
-            let mut readers = vec![TrackReader::default(); song.midi.tracks.len()];
+            let resume = song.seek.get().and_then(|index| index.resume(song.tempo.time_to_tick(now_us)));
+            let mut readers = resume.as_ref().map_or_else(|| vec![TrackReader::default(); song.midi.tracks.len()], |r| r.readers.to_vec());
             let enabled = render_tracks(song);
             let mut flatten = self.collapse_overlaps.then(|| (0..128).map(|_| FlattenKey::default()).collect::<Vec<_>>());
             let reach = window_end.saturating_add(SYNC_AHEAD_US);
-            let mut decoded = decode_tracks(song, &mut readers, now_us, reach, Some(&enabled));
+            let mut decoded = decode_tracks_from(song, &mut readers, now_us, reach, Some(&enabled), resume.as_ref());
             if let Some(keys) = &mut flatten { decoded = flatten_chunk(keys, decoded, reach, now_us); }
             let cutoff = song.tempo.tick_to_time_approx(song.tempo.time_to_tick(window_end), &mut 0);
             let first_future = decoded.notes.partition_point(|n| n.start_us < cutoff);
@@ -1676,6 +1713,8 @@ struct AppState {
     last_frame: Option<Instant>,
     /// When the previous `update` returned (see `FrameTimes::outside`).
     last_update_end: Option<Instant>,
+    seek_script: Vec<(Duration, u64)>,
+    script_start: Option<Instant>,
     #[allow(dead_code)]
     timer_guard: TimerGuard,
     updater: update::Updater,
@@ -1699,6 +1738,13 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Before the frame limiter's sleep, so that sleep is not counted as time outside.
         let outside = self.last_update_end.map_or(Duration::ZERO, |end| end.elapsed());
+        if self.current_song.is_some() && !self.seek_script.is_empty() {
+            let start = *self.script_start.get_or_insert_with(Instant::now);
+            if start.elapsed() >= self.seek_script[0].0 {
+                let (_, target) = self.seek_script.remove(0);
+                self.seek(target);
+            }
+        }
         match self.updater.poll() {
             update::Outcome::Restart => {
                 self.save_settings();
@@ -2321,7 +2367,7 @@ mod tests {
             Box::new(parser::Plain(std::io::Cursor::new(file))), 127, &parser::Progress::default(),
         ).unwrap());
         let tempo = Arc::new(song::TempoMap::from_midi(&midi));
-        VisualSong::new(Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO }))
+        VisualSong::new(Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO, seek: Default::default() }))
     }
 
     fn indexed(mut notes: Vec<NoteSegment>, force_pixels: bool) -> VisibleNotes {
@@ -2561,7 +2607,7 @@ mod tests {
         let midi = Arc::new(parser::MidiFile::parse_stream(Box::new(parser::Plain(std::io::Cursor::new(file))),
             127, &parser::Progress::default()).unwrap());
         let tempo = Arc::new(song::TempoMap::from_midi(&midi));
-        let data = SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO };
+        let data = SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO, seek: Default::default() };
         let enabled = render_tracks(&data);
         assert_eq!(enabled, [false, true, true]);
         let readers = vec![TrackReader::default(); data.midi.tracks.len()];
@@ -2742,7 +2788,7 @@ mod tests {
             Box::new(parser::Plain(std::io::Cursor::new(file))), 127, &parser::Progress::default(),
         ).unwrap());
         let tempo = Arc::new(song::TempoMap::from_midi(&midi));
-        VisualSong::new(Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO }))
+        VisualSong::new(Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO, seek: Default::default() }))
     }
 
     #[test]

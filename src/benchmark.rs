@@ -343,7 +343,7 @@ pub fn run(scale: Scale, mut step: impl FnMut(usize, &str)) -> Report {
     step(5, REFERENCE[5].0);
     let midi = std::sync::Arc::new(song.unwrap());
     let tempo = std::sync::Arc::new(TempoMap::from_midi(&midi));
-    let song = SongData { path: String::new(), midi, tempo, load_time: Default::default() };
+    let song = SongData { path: String::new(), midi, tempo, load_time: Default::default(), seek: Default::default() };
     rates.push(rate(scale.reps, || {
         crate::player::bench_engine(&song);
         song.midi.note_count as f64

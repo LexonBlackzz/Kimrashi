@@ -323,7 +323,7 @@ enum Due {
 /// Playback position: a reader per track plus everything still due. Tracks and
 /// note-offs share one queue so its position is always the tick being played, which
 /// keeps every push at or after it (what a radix heap needs).
-struct Cursor {
+pub(crate) struct Cursor {
     readers: Vec<TrackReader>,
     due: RadixHeap<Due>,
 }
@@ -414,12 +414,21 @@ fn is_reset(payload: &[u8]) -> bool {
 /// Most SysEx messages replayed on a seek (the latest ones).
 const CHASE_SYSEX: usize = 1024;
 
-struct SeekResult {
+impl SeekResult {
+    /// Whether both leave playback in the same state.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        let due = |c: &Cursor| { let mut v: Vec<_> = c.due.buckets.iter().flatten().copied().collect(); v.sort(); v };
+        self.started == other.started && self.chase == other.chase && self.controllers == other.controllers && self.sysex == other.sysex
+            && format!("{:?}", self.cursor.readers) == format!("{:?}", other.cursor.readers) && due(&self.cursor) == due(&other.cursor)
+    }
+}
+
+pub(crate) struct SeekResult {
     cursor: Cursor,
     /// Note-ons for notes that are sounding at the seek point.
     chase: Vec<u32>,
     /// Notes that started before the seek point.
-    started: u64,
+    pub(crate) started: u64,
     /// SysEx, then program, controller, bend and pressure state at the seek point, to send
     /// before `chase` (SysEx as markers into `sysex`).
     controllers: Vec<u32>,
@@ -450,7 +459,13 @@ fn controller_rank(msg: u32) -> u8 {
 impl Cursor {
     /// Position every track at `tick` (records before it are consumed), scanning
     /// tracks in parallel.
-    fn seek(song: &SongData, tick: u32) -> SeekResult {
+    pub(crate) fn seek(song: &SongData, tick: u32) -> SeekResult {
+        let resume = song.seek.get().and_then(|index| index.resume(tick)).filter(|r| r.other.is_some());
+        Self::seek_from(song, tick, resume.as_ref())
+    }
+
+    /// `seek`, starting from a seek index snapshot if given (which must have its `other` records).
+    pub(crate) fn seek_from(song: &SongData, tick: u32, resume: Option<&crate::seek::Resume>) -> SeekResult {
         let midi = &song.midi;
         let per_track: Vec<_> = (0..midi.tracks.len())
             .into_par_iter()
@@ -462,6 +477,24 @@ impl Cursor {
                 let mut sx = Vec::new();
                 let mut seq = 0u32;
                 let mut started = 0u64;
+                let mut run = [0u8; 16];
+                if let Some(resume) = resume {
+                    r = resume.readers[i];
+                    // Long notes from before the snapshot that are still sounding, then what it
+                    // did to the controllers.
+                    for long in resume.long[i].iter().take_while(|n| n.tick < resume.before) {
+                        let end = long.dur.map(|d| long.tick + d);
+                        if end.map_or(true, |e| e > tick) { active.push((long.ch, long.key, long.vel, end)); }
+                    }
+                    for &(t, rec) in resume.other.unwrap()[i].iter().take_while(|(t, _)| *t < resume.before) {
+                        seq += 1;
+                        match rec {
+                            Record::Sysex { status, at, len } => sx.push((t, seq, SysexRef { status, at, len })),
+                            Record::Other { status, d1, d2 } => { ctl.insert(controller_key(status, d1, t), (t, seq, pack_short(status, d1, d2))); }
+                            Record::Note { .. } => {}
+                        }
+                    }
+                }
                 loop {
                     let mut n = r;
                     match n.next(data) {
@@ -472,6 +505,8 @@ impl Cursor {
                                 let end = dur.map(|d| t + d);
                                 if end.map_or(true, |e| e > tick) {
                                     active.push((ch, key, vel, end));
+                                } else if r.same_tick_run(data, &mut run).is_some() {
+                                    started += 16; // the plain notes behind it share its tick and length
                                 }
                             } else if let Record::Sysex { status, at, len } = rec {
                                 seq += 1;
@@ -494,7 +529,7 @@ impl Cursor {
                 due: RadixHeap::new(),
             },
             chase: Vec::new(),
-            started: 0,
+            started: resume.map_or(0, |r| r.started),
             controllers: Vec::new(),
             sysex: Vec::new(),
         };

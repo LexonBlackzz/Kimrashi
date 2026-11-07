@@ -59,7 +59,7 @@ fn generated(polyphony: bool) -> Arc<SongData> {
     }
     let midi = Arc::new(MidiFile::parse_stream(Box::new(Plain(Cursor::new(file))), 127, &Progress::default()).unwrap());
     let tempo = Arc::new(TempoMap::from_midi(&midi));
-    Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO })
+    Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO, seek: Default::default() })
 }
 
 /// ~100k notes held at once at only 1000 notes/s: random pitch, lengths of 50-150 s, 32 tracks.
@@ -92,7 +92,7 @@ fn held() -> Arc<SongData> {
     }
     let midi = Arc::new(MidiFile::parse_stream(Box::new(Plain(Cursor::new(file))), 127, &Progress::default()).unwrap());
     let tempo = Arc::new(TempoMap::from_midi(&midi));
-    Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO })
+    Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO, seek: Default::default() })
 }
 
 /// Twelve million notes in five milliseconds, following ten seconds of music.
@@ -131,7 +131,7 @@ fn wall() -> Arc<SongData> {
     }
     let midi = Arc::new(MidiFile::parse_stream(Box::new(Plain(Cursor::new(file))), 127, &Progress::default()).unwrap());
     let tempo = Arc::new(TempoMap::from_midi(&midi));
-    Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO })
+    Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO, seek: Default::default() })
 }
 
 /// Very old notes ending in a close zoom, across the low timestamp word's wrap.
@@ -148,7 +148,7 @@ fn precision_song(from_us: u64) -> Arc<SongData> {
     }
     let midi = Arc::new(MidiFile::parse_stream(Box::new(Plain(Cursor::new(file))), 127, &Progress::default()).unwrap());
     let tempo = Arc::new(TempoMap::from_midi(&midi));
-    Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO })
+    Arc::new(SongData { path: String::new(), midi, tempo, load_time: Duration::ZERO, seek: Default::default() })
 }
 
 pub fn run_from_args() -> bool {
@@ -284,4 +284,112 @@ fn reference_instances(song: &VisualSong, window: &[crate::NoteSegment], now: u6
                 len: f32::from_bits(packed), key_color: 1,
             }
         })))
+}
+
+/// `--benchmark-seek <file> --jumps m:ss,m:ss,... [--window seconds] [--frames n] [--verify]`
+/// Plays `frames` frames at 60 Hz from each jump target in turn, as a seek would, and times the
+/// first frame. `--verify` replays each target from a cold start and compares the instances.
+pub fn run_seek_from_args() -> bool {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let Some(i) = args.iter().position(|a| a == "--benchmark-seek") else { return false };
+    let path = args.get(i + 1).expect("--benchmark-seek needs a file");
+    let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
+    let jumps: Vec<u64> = value("--jumps").expect("--jumps m:ss,m:ss,...").split(',')
+        .map(|s| crate::bench::parse_time(s).unwrap()).collect();
+    let speed = value("--window").map_or(0.25, |s| s.parse::<f32>().unwrap()).clamp(0.01, 15.0);
+    let frames = value("--frames").map_or(60, |s| s.parse::<usize>().unwrap()).max(2);
+    let verify = args.iter().any(|a| a == "--verify");
+    if args.iter().any(|a| a == "--no-index") { std::env::set_var("KIM_NO_SEEK_INDEX", "1"); }
+    let started = Instant::now();
+    let visual = VisualSong::new(SongData::load(path, 127, &Progress::default()).unwrap());
+    println!("loaded in {:.1} s, {} packed tracks", started.elapsed().as_secs_f64(), visual.data.midi.tracks.len());
+    if visual.data.midi.note_count >= crate::seek::MIN_NOTES && !args.iter().any(|a| a == "--no-index") {
+        let built = Instant::now();
+        while visual.data.seek.get().is_none() && built.elapsed() < Duration::from_secs(300) { std::thread::sleep(Duration::from_millis(50)); }
+        println!("seek index: {} after {:.1} s", visual.data.seek.get().map_or("not built".into(), |i| i.summary()), built.elapsed().as_secs_f64());
+    }
+    let (mut visible, mut instances) = (VisibleNotes::default(), Arc::new(gpu::InstanceRing::default()));
+    for (n, &target) in jumps.iter().enumerate() {
+        let (first, worst) = play_from(&visual, &mut visible, &mut instances, target, frames, speed);
+        let tick = visual.data.tempo.time_to_tick(target);
+        let audio = {
+            let t = Instant::now();
+            let res = crate::player::Cursor::seek(&visual.data, tick);
+            (t.elapsed().as_secs_f64() * 1e3, res)
+        };
+        let mut line = format!("jump {n} to {}: first frame {first:.1} ms, slowest after {worst:.1} ms, {} instances",
+            crate::format_timestamp(target), instances.len());
+        line += &format!(" | audio seek {:.0} ms", audio.0);
+        if verify {
+            let t = Instant::now();
+            let plain = crate::player::Cursor::seek_from(&visual.data, tick, None);
+            line += &format!(" (from the start {:.0} ms, same state: {})", t.elapsed().as_secs_f64() * 1e3, audio.1.same_as(&plain));
+        }
+        if verify {
+            let (mut cold, mut ring) = (VisibleNotes::default(), Arc::new(gpu::InstanceRing::default()));
+            // Cold start from the file's beginning: the same song without its seek index.
+            let plain = VisualSong::new(Arc::new(SongData { path: String::new(), midi: visual.data.midi.clone(),
+                tempo: visual.data.tempo.clone(), load_time: Duration::ZERO, seek: Default::default() }));
+            let (first, worst) = play_from(&plain, &mut cold, &mut ring, target, frames, speed);
+            // A note running past the window is cut where the worker's latest chunk ended, which
+            // differs between runs; the picture inside the window does not.
+            let edge = target + (frames as u64 - 1) * 1_000_000 / 60 + (speed * 1e6) as u64;
+            let (a, b): (Vec<_>, Vec<_>) = (instances.iter().map(|i| inside(i, edge)).collect(), ring.iter().map(|i| inside(i, edge)).collect());
+            let differ = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+            line += &format!(" | cold start {first:.1} / {worst:.1} ms, {} instances, differ from cold: {differ}", ring.len());
+            if a.len() != b.len() || differ > 0 {
+                line += &format!("\n  first differences: {:?}", a.iter().zip(&b).filter(|(x, y)| x != y).take(3).collect::<Vec<_>>());
+            }
+        }
+        println!("{line}");
+    }
+    true
+}
+
+/// What an instance draws inside the window ending at `edge`: start, end (None if cut by the edge), colour.
+fn inside(i: &gpu::NoteInstance, edge: u64) -> (u64, Option<u64>, u32, u16) {
+    let start = i.start_us[0] as u64 | (i.start_us[1] as u64 & 0xFFFF) << 32;
+    let end = start + (i.len.abs() as f64 * 1e6).round() as u64;
+    (start, (end < edge).then_some(end), i.key_color, (i.start_us[1] >> 16) as u16)
+}
+
+/// Frames at 60 Hz from `from`; the first frame's milliseconds and the slowest later one's. The
+/// last frame waits for the worker to cover its window so rings can be compared.
+fn play_from(visual: &VisualSong, visible: &mut VisibleNotes, instances: &mut Arc<gpu::InstanceRing>,
+             from: u64, frames: usize, speed: f32) -> (f64, f64) {
+    let future_us = (speed * 1e6) as u64;
+    let (mut first, mut worst) = (0.0, 0.0f64);
+    let start = Instant::now();
+    for f in 0..frames {
+        let now = from + f as u64 * 1_000_000 / 60;
+        let end = now + future_us;
+        let t = Instant::now();
+        visible.advance(&visual.data, now, end, future_us / 900);
+        if f + 1 == frames {
+            for _ in 0..5000 {
+                if visible.through >= end { break; }
+                std::thread::sleep(Duration::from_millis(1));
+                visible.advance(&visual.data, now, end, future_us / 900);
+            }
+        }
+        crate::build_note_instances(visual, visible, now, end, speed, 900, true, instances);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        if f == 0 {
+            first = ms;
+            let a = visible.timing;
+            eprintln!("  first frame: decode {:.0} ms (scanned {} records, {} notes), retain {:.0}, sort {:.0}, cull/index {:.0}, build {:.0}",
+                a.decode.as_secs_f64() * 1e3, visible.last_scanned, visible.last_batch, a.retain.as_secs_f64() * 1e3,
+                a.sort.as_secs_f64() * 1e3, a.cull.as_secs_f64() * 1e3, (ms - (a.decode + a.cull).as_secs_f64() * 1e3).max(0.0));
+        } else if f + 1 < frames {
+            worst = worst.max(ms); // the last frame waits for the worker, so it is not timed
+            if ms > 500.0 {
+                let a = visible.timing;
+                eprintln!("  slow frame {f}: {ms:.0} ms = decode {:.0} + retain {:.0} + sort {:.0} + cull/index {:.0}; {} notes in, window {} live, through {:.2} s, now {:.2} s",
+                    a.decode.as_secs_f64() * 1e3, a.retain.as_secs_f64() * 1e3, a.sort.as_secs_f64() * 1e3, a.cull.as_secs_f64() * 1e3,
+                    visible.last_batch, visible.window.live, visible.through as f64 / 1e6, now as f64 / 1e6);
+            }
+        }
+        if let Some(wait) = Duration::from_micros((f as u64 + 1) * 1_000_000 / 60).checked_sub(start.elapsed()) { std::thread::sleep(wait); }
+    }
+    (first, worst)
 }
