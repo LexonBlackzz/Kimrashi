@@ -15,6 +15,14 @@ impl AppState {
         }
 
         if ui
+            .add_enabled(has_song, egui::Button::new("⏹ Stop"))
+            .on_hover_text("Silence every note and go back to the start")
+            .clicked()
+        {
+            self.stop();
+        }
+
+        if ui
             .add_enabled(has_song, egui::Button::new("Unload"))
             .on_hover_text("Close the song and free its memory")
             .clicked()

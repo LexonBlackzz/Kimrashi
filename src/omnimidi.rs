@@ -28,6 +28,7 @@ type Fn_IsKDMAPIAvailable = unsafe extern "system" fn() -> BOOL;
 type Fn_InitializeKDMAPIStream = unsafe extern "system" fn() -> BOOL;
 type Fn_TerminateKDMAPIStream = unsafe extern "system" fn();
 type Fn_GetDriverDebugInfo = unsafe extern "system" fn() -> *mut DebugInfo;
+type Fn_ResetKDMAPIStream = unsafe extern "system" fn();
 type Fn_SendDirectData = unsafe extern "system" fn(DWORD);
 /// Optional extension (not in stock OmniMIDI): send `count` short messages in one call.
 /// `void WINAPI SendDirectDataBatch(const DWORD* msgs, DWORD count);`
@@ -41,6 +42,8 @@ pub struct OmniMIDI {
     pub is_av: Option<Fn_IsKDMAPIAvailable>,
     pub init: Option<Fn_InitializeKDMAPIStream>,
     pub term: Option<Fn_TerminateKDMAPIStream>,
+    /// Drops the events the synth has queued and cuts its voices.
+    reset: Option<Fn_ResetKDMAPIStream>,
     #[allow(dead_code)] // optional KDMAPI diagnostics entry point
     pub getdbg: Option<Fn_GetDriverDebugInfo>,
     pub send_direct: Option<Fn_SendDirectData>,
@@ -68,6 +71,10 @@ impl OmniMIDI {
             .map(|s| *s);
         let term = lib
             .get::<Fn_TerminateKDMAPIStream>(b"TerminateKDMAPIStream")
+            .ok()
+            .map(|s| *s);
+        let reset = lib
+            .get::<Fn_ResetKDMAPIStream>(b"ResetKDMAPIStream")
             .ok()
             .map(|s| *s);
         let getdbg = lib
@@ -98,6 +105,7 @@ impl OmniMIDI {
             is_av,
             init,
             term,
+            reset,
             getdbg,
             send_direct,
             send_batch,
@@ -111,6 +119,11 @@ impl OmniMIDI {
     }
     pub unsafe fn term_stream(&self) {
         if let Some(f) = self.term {
+            f();
+        }
+    }
+    pub unsafe fn reset_stream(&self) {
+        if let Some(f) = self.reset {
             f();
         }
     }

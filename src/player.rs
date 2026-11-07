@@ -19,7 +19,10 @@ mod par;
 
 pub enum PlayerCommand {
     Play(Arc<SongData>),
+    /// Close the song (unload).
     Stop,
+    /// Silence everything the synth is doing or has queued, and wait at the start of the song.
+    Halt,
     Pause,
     Resume,
     Seek(u64), // absolute time in microseconds
@@ -1474,6 +1477,10 @@ impl Player {
                         continue;
                     }
                     // No song loaded yet; nothing to pause, resume or seek.
+                    Ok(PlayerCommand::Halt) => {
+                        self.panic();
+                        continue;
+                    }
                     Ok(PlayerCommand::Pause | PlayerCommand::Resume | PlayerCommand::Seek(_)) => {
                         continue
                     }
@@ -1563,6 +1570,13 @@ impl Player {
                         self.all_notes_off();
                         self.clock.reset();
                         return None;
+                    }
+                    PlayerCommand::Halt => {
+                        // The seek waits for the next Resume, which then starts at the top.
+                        self.clock.set_paused(0);
+                        abs_time_us = 0;
+                        pending_seek = Some(0);
+                        self.panic();
                     }
                     PlayerCommand::Pause => {
                         if !self.clock.is_paused() {
@@ -1831,6 +1845,16 @@ impl Player {
         }
     }
 
+    /// Silence everything now: throw away what the synth has queued, cut its voices (All Sound
+    /// Off, which also ends release tails) and release the notes and controllers.
+    fn panic(&self) {
+        self.wait_for_horizon();
+        self.out.reset();
+        let sound_off: Vec<u32> = (0..16).map(|ch| pack_short(0xB0 | ch, 120, 0)).collect();
+        self.out.send_batch(&sound_off);
+        self.all_notes_off();
+    }
+
     fn all_notes_off(&self) {
         self.wait_for_horizon();
         let msgs: Vec<u32> = (0..16)
@@ -2000,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn the_player_sends_what_the_engine_makes_and_plays_it_again_after_a_seek() {
+    fn the_player_sends_what_the_engine_makes_and_plays_it_again_after_a_seek_or_halt() {
         use crate::clock::PlaybackClock;
         let (song, _) = load_random_song("pipeline");
         let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
@@ -2044,6 +2068,26 @@ mod tests {
         cmd_tx.send(PlayerCommand::Seek(0)).unwrap();
         finished();
         check(take(), 32); // the seek's own all-notes-off first
+
+        // Halt: All Sound Off, then the usual all-notes-off, and the clock parked at the start.
+        cmd_tx.send(PlayerCommand::Halt).unwrap();
+        let mut silence: Vec<u32> = (0..16).map(|ch| pack_short(0xB0 | ch, 120, 0)).collect();
+        silence.extend((0..16).flat_map(|ch| [pack_short(0xB0 | ch, 123, 0), pack_short(0xB0 | ch, 121, 0)]));
+        let (start, mut got) = (Instant::now(), vec![]);
+        while got.len() < silence.len() && start.elapsed() < Duration::from_secs(5) {
+            got.extend(take());
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(50)); // anything more would show here
+        got.extend(take());
+        assert!(got == silence, "halt sent {got:?}");
+        let (paused, now_us, _) = clock.snapshot();
+        assert!(paused && now_us == 0, "the clock is not parked at the start");
+        // Playing again starts the whole song over.
+        cmd_tx.send(PlayerCommand::Resume).unwrap();
+        clock.set_running(0);
+        finished();
+        check(take(), 32);
         stop.store(true, Ordering::SeqCst);
         *crate::output::CAPTURE.lock().unwrap() = None;
     }

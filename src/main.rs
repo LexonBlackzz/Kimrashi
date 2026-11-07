@@ -1837,6 +1837,23 @@ impl eframe::App for AppState {
             }
         }
 
+        // Drop a file on the window to open it (the first one, if there are several).
+        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+            self.start_loading(path);
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hint")));
+            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(170));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop a MIDI file or archive to open it",
+                egui::FontId::proportional(28.0),
+                Color32::WHITE,
+            );
+        }
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             // Wraps onto a second line instead of clipping when the window is narrow.
@@ -2015,6 +2032,16 @@ impl AppState {
         } else {
             self.clock.set_paused(target_us);
         }
+    }
+
+    /// Stop playing, silence every note and go back to the start; the song stays loaded.
+    fn stop(&mut self) {
+        let _ = self.cmd_tx.send(PlayerCommand::Halt);
+        self.last_telemetry.is_playing = false;
+        self.playback_time_us = 0;
+        self.slider_override_us = None;
+        self.slider_grabbed = false;
+        self.clock.set_paused(0);
     }
 
     fn toggle_play(&mut self, current_time_us: u64) {

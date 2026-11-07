@@ -126,6 +126,18 @@ impl Output {
 }
 
 impl Output {
+    /// Throw away what the synth has queued and cut its voices, where it can. SVMS is left
+    /// to the controllers sent after (its queue is the timed events, which play out first).
+    pub fn reset(&self) {
+        match self {
+            Output::Kdmapi(omni, None) => unsafe { omni.reset_stream() },
+            Output::WinMM(h) => unsafe {
+                midiOutReset(*h);
+            },
+            _ => {}
+        }
+    }
+
     /// Whether events can be submitted with exact times (SVMS's native API).
     pub fn can_timed(&self) -> bool {
         matches!(self, Output::Kdmapi(_, Some(s)) if s.link.can_timestamp())
