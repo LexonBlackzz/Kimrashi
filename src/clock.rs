@@ -167,6 +167,8 @@ mod tests {
     fn readers_never_see_a_torn_state() {
         // Every write keeps offset == 2 * speed's integer part; a reader mixing two writes would break it.
         let c = std::sync::Arc::new(PlaybackClock::new());
+        // The starting state (offset 0, speed 1) doesn't keep it: start from one that does.
+        c.write(|s| State { offset_us: 0, speed: 0.0, ..s });
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let readers: Vec<_> = (0..3)
             .map(|_| {
