@@ -650,6 +650,9 @@ struct Skipper {
     window_start: Instant,
     /// Scales the time budget: lower when behind the clock.
     gain: f32,
+    /// The lag at the last update, and updates in a row on time (recovery speeds up with it).
+    prev_lag_us: u64,
+    calm: u32,
     /// Skipped since the telemetry last took it.
     skipped: u32,
 }
@@ -673,6 +676,8 @@ impl Skipper {
             limit_nps,
             window_start: Instant::now(),
             gain: 1.0,
+            prev_lag_us: 0,
+            calm: 0,
             skipped: 0,
         }
     }
@@ -743,10 +748,16 @@ impl Skipper {
             *n = 0;
             asked += *rate;
         }
+        // Cut only while the lag grows: a backlog that is draining was already cut for,
+        // and cutting on until it's gone winds the budget far below what the synth takes.
+        // On time, recovery speeds up the longer it lasts (to x1.05 per step after 0.1 s).
+        let growing = lag_us > self.prev_lag_us;
+        self.prev_lag_us = lag_us;
+        self.calm = if lag_us < 1_000 { self.calm + 1 } else { 0 };
         self.gain = match lag_us {
-            8_001.. => (self.gain * 0.85).max(0.05),
-            2_001.. => self.gain * 0.98,
-            0..1_000 => (self.gain * 1.01).min(1.3),
+            8_001.. if growing => (self.gain * 0.85).max(0.05),
+            2_001.. if growing => self.gain * 0.98,
+            0..1_000 => (self.gain * (1.0 + 0.002 * self.calm.min(25) as f32)).min(1.3),
             _ => self.gain,
         };
         let budget_ns = 1e9 * Self::UTILIZATION * self.gain - asked * costs.engine_ns;
@@ -1108,6 +1119,8 @@ struct Decoder {
     /// What the synth really charges per message (ns), learned from how late it renders:
     /// a synth can take events in a few ns each and still need microseconds to sound them.
     render_ns: f32,
+    /// Monitor reports in a row on time.
+    render_calm: u32,
     synth_seq: u64,
     /// `KIM_SYNTH_FEEDBACK=0` turns the learning off.
     learn_render: bool,
@@ -1147,7 +1160,7 @@ impl Decoder {
         let (cmd_tx, cmds) = crossbeam_channel::unbounded();
         let (out, slices) = crossbeam_channel::bounded(SLICES_IN_FLIGHT);
         let (spare_tx, spare) = crossbeam_channel::bounded(SLICES_IN_FLIGHT * 2);
-        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), behind: 0, waited: 0, ends: Vec::new(), render_ns: 0.0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
+        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), behind: 0, waited: 0, ends: Vec::new(), render_ns: 0.0, render_calm: 0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
         thread::Builder::new().name("player-decode".into()).spawn(move || d.run()).expect("spawn decoder");
         (cmd_tx, slices, spare_tx)
     }
@@ -1243,8 +1256,13 @@ impl Decoder {
         self.synth_seq = seq;
         let sender = self.costs.synth_ns;
         let from = self.render_ns.max(sender);
-        self.render_ns = match self.clock.synth_late_us.load(Ordering::Relaxed) {
-            0 => self.render_ns * 0.99,
+        let late = self.clock.synth_late_us.load(Ordering::Relaxed);
+        self.render_calm = if late == 0 { self.render_calm + 1 } else { 0 };
+        self.render_ns = match late {
+            // On time: the longer it lasts, the faster the price comes down (x0.99 per
+            // report at first, x0.8 after a second), so skipping eases off in about a
+            // second instead of drifting down over ten.
+            0 => self.render_ns * (1.0 - 0.01 * self.render_calm.min(20) as f32),
             1..=2_000 => self.render_ns, // late but catching up: leave the price alone
             2_001..=8_000 => from * 1.05,
             _ => from * 1.3,
@@ -2514,11 +2532,27 @@ mod tests {
         s.regulate(0, s.window_start + Duration::from_millis(5), fast);
         assert_eq!(s.interval_us, 0);
 
-        // Falling behind the clock shrinks the budget even if the model says all is well.
-        for _ in 0..20 {
-            ask(&mut s);
-            s.regulate(50_000, s.window_start + Duration::from_millis(5), fast);
+        // Falling further behind the clock shrinks the budget even if the model says all is well.
+        let step = |s: &mut Skipper, lag| {
+            ask(s);
+            s.regulate(lag, s.window_start + Duration::from_millis(5), fast);
+        };
+        for i in 1..=20 {
+            step(&mut s, 10_000 + i * 2_000);
         }
         assert!(s.interval_us > 0 && s.gain < 0.2, "{} {}", s.interval_us, s.gain);
+
+        // A backlog that drains is not cut for again.
+        let gain = s.gain;
+        for i in (1..=20).rev() {
+            step(&mut s, 10_000 + i * 2_000);
+        }
+        assert_eq!(s.gain, gain);
+
+        // Back on time, the full budget returns within 0.4 s of 4 ms steps (not 1.2 s).
+        for _ in 0..100 {
+            step(&mut s, 0);
+        }
+        assert!(s.gain >= 1.0 && s.interval_us == 0, "{} {}", s.gain, s.interval_us);
     }
 }
