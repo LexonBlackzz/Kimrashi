@@ -105,6 +105,9 @@ pub struct Progress {
     /// Notes found so far in the big track being read on its own (0 between tracks).
     pub live_notes: std::sync::atomic::AtomicU64,
     pub scan_unit: std::sync::atomic::AtomicU64,
+    /// Which file to load from an archive holding several (see `archive::choices`);
+    /// `None` loads the largest.
+    pub entry: std::sync::Mutex<Option<String>>,
 }
 
 impl Progress {

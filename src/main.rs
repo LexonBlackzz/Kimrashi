@@ -215,6 +215,7 @@ fn main() {
                 benchmark: None,
                 diagnose: None,
                 loading: None,
+                choosing: None,
                 show_settings: false,
                 settings_tab: SettingsTab::Display,
                 settings_search: String::new(),
@@ -1699,6 +1700,8 @@ struct AppState {
     benchmark: Option<BenchRun>,
     diagnose: Option<DiagRun>,
     loading: Option<Loading>,
+    /// An archive holding several MIDIs, and its (name, size) entries, while the user picks one.
+    choosing: Option<(std::path::PathBuf, Vec<(String, u64)>)>,
     show_settings: bool,
     settings_tab: SettingsTab,
     settings_search: String,
@@ -1853,6 +1856,8 @@ impl eframe::App for AppState {
                 Color32::WHITE,
             );
         }
+
+        self.choose_entry(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -2087,15 +2092,67 @@ impl AppState {
         }
     }
 
-    /// Load `path` on a worker thread; `poll_loading` picks up the result.
+    /// Open `path`, first asking which MIDI to load if it's an archive holding several.
     fn start_loading(&mut self, path: std::path::PathBuf) {
-        let name = path
+        let list = archive::choices(&path);
+        self.choosing = None;
+        if list.is_empty() {
+            self.load_entry(path, None);
+        } else {
+            self.choosing = Some((path, list));
+        }
+    }
+
+    /// The archive picker: one row per MIDI in the archive, click to load it.
+    fn choose_entry(&mut self, ctx: &egui::Context) {
+        let Some((path, list)) = &self.choosing else { return };
+        let (mut chosen, mut open) = (None, true);
+        let title = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        egui::Window::new(format!("Open from {title}"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(520.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("{} MIDI files in this archive. Pick one:", list.len()));
+                egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                    egui::Grid::new("entries").striped(true).num_columns(3).show(ui, |ui| {
+                        for (i, (name, size)) in list.iter().enumerate() {
+                            if ui.selectable_label(false, name).clicked() {
+                                chosen = Some(i);
+                            }
+                            ui.label(ui::bytes(*size as f64));
+                            // ponytail: ~6 bytes per note (on + off with running status) in a
+                            // plain MIDI; wrong for compressed entries, so those get none.
+                            let plain = [".mid", ".midi", ".smf", ".kar"].iter().any(|e| name.to_ascii_lowercase().ends_with(e));
+                            ui.label(if plain { format!("~{} notes", si(*size as f64 / 6.0)) } else { String::new() });
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+        if let Some(i) = chosen {
+            let (path, mut list) = self.choosing.take().unwrap();
+            self.load_entry(path, Some(list.swap_remove(i).0));
+        } else if !open {
+            self.choosing = None;
+        }
+    }
+
+    /// Load `path` (and the file `entry` inside it, if an archive) on a worker thread;
+    /// `poll_loading` picks up the result.
+    fn load_entry(&mut self, path: std::path::PathBuf, entry: Option<String>) {
+        let mut name = path
             .file_name()
             .map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        if let Some(e) = &entry {
+            name = format!("{name} › {e}");
+        }
         let total = std::fs::metadata(&path).map_or(1, |m| m.len());
         self.cancel_loading();
         let progress = Arc::new(parser::Progress::default());
         progress.verify_all.store(self.cfg.verify_repeats, std::sync::atomic::Ordering::Relaxed);
+        *progress.entry.lock().unwrap() = entry;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (vel_levels, p) = (self.cfg.velocity_levels, progress.clone());
         std::thread::spawn(move || {

@@ -154,14 +154,59 @@ fn is_candidate(name: &str) -> bool {
         .any(|ext| name.ends_with(ext))
 }
 
-/// Pick the largest candidate among (id, name, size) entries.
-fn pick<T>(entries: impl IntoIterator<Item = (T, String, u64)>) -> Result<T, ParseError> {
-    entries
+/// Pick the candidate named `wanted` if there is one, else the largest, among
+/// (id, name, size) entries.
+fn pick<T>(entries: impl IntoIterator<Item = (T, String, u64)>, wanted: Option<&str>) -> Result<T, ParseError> {
+    let mut cands: Vec<_> = entries.into_iter().filter(|(_, name, _)| is_candidate(name)).collect();
+    if let Some(i) = wanted.and_then(|w| cands.iter().position(|(_, name, _)| name == w)) {
+        return Ok(cands.swap_remove(i).0);
+    }
+    cands
         .into_iter()
-        .filter(|(_, name, _)| is_candidate(name))
         .max_by_key(|&(_, _, size)| size)
         .map(|(id, _, _)| id)
         .ok_or_else(|| "No MIDI file (.mid/.midi) in the archive".into())
+}
+
+/// The (name, uncompressed size) of every file in the zip, 7z or rar at `path`, from its
+/// directory alone (nothing is decompressed).
+fn entries(path: &Path) -> Result<Vec<(String, u64)>, ParseError> {
+    let mut out = Vec::new();
+    match Kind::sniff(&read_head(path)?) {
+        Some(Kind::Zip) => {
+            let mut zip = zip::ZipArchive::new(BufReader::new(File::open(path)?)).map_err(err)?;
+            for i in 0..zip.len() {
+                let f = zip.by_index_raw(i).map_err(err)?;
+                if f.is_file() {
+                    out.push((f.name().map_err(err)?.into_owned(), f.size()));
+                }
+            }
+        }
+        Some(Kind::SevenZ) => {
+            let archive = sevenz_rust2::Archive::open(path).map_err(err)?;
+            out.extend(archive.files.iter().filter(|f| !f.is_directory()).map(|f| (f.name().to_owned(), f.size)));
+        }
+        Some(Kind::Rar) => {
+            for header in unrar::Archive::new(path).open_for_listing().map_err(err)? {
+                let header = header.map_err(err)?;
+                if header.is_file() {
+                    out.push((header.filename.to_string_lossy().into_owned(), header.unpacked_size));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// The MIDI candidates in the zip, 7z or rar at `path`, largest first, when there are
+/// at least two to choose from. Reads only the archive's directory.
+pub fn choices(path: &Path) -> Vec<(String, u64)> {
+    let Ok(mut list) = entries(path) else { return Vec::new() };
+    list.retain(|(name, _)| is_candidate(name));
+    list.sort_by(|a, b| b.1.cmp(&a.1));
+    if list.len() < 2 { list.clear() }
+    list
 }
 
 /// Block count and largest uncompressed block size of an .xz file, from the index of
@@ -844,6 +889,12 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    /// The entry the user chose in the outermost archive, if any (see `choices`).
+    fn wanted(&self, depth: usize) -> Option<String> {
+        if depth > 0 { return None }
+        self.progress.entry.lock().ok()?.clone()
+    }
+
     /// A layer on disk. Seekable formats are handled here; the rest stream.
     fn file(&mut self, path: &Path, depth: usize) -> Result<MidiFile, ParseError> {
         if depth > MAX_DEPTH {
@@ -891,7 +942,7 @@ impl<'a> Ctx<'a> {
                         entries.push((i, f.name().map_err(err)?.into_owned(), f.size()));
                     }
                 }
-                let index = pick(entries)?;
+                let index = pick(entries, self.wanted(depth).as_deref())?;
                 let entry = zip.by_index(index).map_err(err)?;
                 self.stream(plain(entry), depth + 1)
             }
@@ -914,6 +965,7 @@ impl<'a> Ctx<'a> {
                         .iter()
                         .filter(|f| !f.is_directory())
                         .map(|f| (f.name().to_owned(), f.name().to_owned(), f.size)),
+                    self.wanted(depth).as_deref(),
                 )?;
                 let solid = archive.archive().is_solid;
                 let mut result = None;
@@ -943,7 +995,7 @@ impl<'a> Ctx<'a> {
                         entries.push((header.filename.clone(), name, header.unpacked_size));
                     }
                 }
-                let target: PathBuf = pick(entries)?;
+                let target: PathBuf = pick(entries, self.wanted(depth).as_deref())?;
                 let out = TempFile::new()?;
                 let mut archive = unrar::Archive::new(path).open_for_processing().map_err(err)?;
                 while let Some(header) = archive.read_header().map_err(err)? {
@@ -1110,6 +1162,19 @@ mod tests {
             assert_eq!(m.source.map(|s| s.0).as_deref(), Some(layers));
         }
         assert!(load("text.txt").is_err());
+
+        // Several MIDIs: listed largest first, and the one named is loaded instead.
+        let names = |f: &str| choices(&dir.join(f)).into_iter().map(|e| e.0).collect::<Vec<_>>();
+        assert_eq!(names("song.zip"), ["song.mid.gz", "small.mid"]);
+        assert_eq!(names("solid.7z"), ["b_song.mid", "a_small.mid"]);
+        assert!(names("zstd.7z").is_empty() && names("plain.mid").is_empty());
+        for (f, small) in [("song.zip", "small.mid"), ("solid.7z", "a_small.mid"), ("separate.7z", "a_small.mid")] {
+            let progress = Progress::default();
+            *progress.entry.lock().unwrap() = Some(small.into());
+            // The small one is a bare header promising two tracks.
+            let e = MidiFile::open_and_parse(dir.join(f), 127, &progress).err().expect(f);
+            assert!(e.to_string().contains("Truncated"), "{f}: {e}");
+        }
 
         // A cancelled load fails at its next read, from a plain file or an archive.
         for name in ["plain.mid", "song.gz", "song.zip", "solid.7z"] {
