@@ -1114,7 +1114,8 @@ impl DecodeWorker {
                 if reach < now { reach = now.min(through.saturating_add(CATCH_UP_US)); }
                 let reach = reach.min(worker_target.load(Ordering::Acquire));
                 if reach <= through || worker_queued.load(Ordering::Acquire) > MAX_QUEUED_NOTES {
-                    std::thread::park_timeout(Duration::from_millis(2));
+                    // `advance` unparks the worker every frame, so idle workers (64 in parallax) can sleep long.
+                    std::thread::park_timeout(Duration::from_millis(50));
                     continue;
                 }
                 let decoded = decode_pool.install(|| {
@@ -1354,7 +1355,10 @@ impl VisibleNotes {
             let urgent = self.through < now_us.saturating_add(100_000).min(window_end);
             let batch = worker.pending.take().or_else(|| {
                 let batch = if urgent { worker.receiver.recv().ok() } else { worker.receiver.try_recv().ok() };
-                if let Some(b) = &batch { worker.queued.fetch_sub(b.notes.len() + b.updates.len(), Ordering::AcqRel); }
+                if let Some(b) = &batch {
+                    worker.queued.fetch_sub(b.notes.len() + b.updates.len(), Ordering::AcqRel);
+                    worker.thread.unpark(); // room in the queue again
+                }
                 batch
             });
             let Some(mut batch) = batch else { break };

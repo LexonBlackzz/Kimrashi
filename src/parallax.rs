@@ -64,6 +64,7 @@ impl Parallax {
     pub fn frame(&mut self, song: &VisualSong, now_us: u64, duration_us: u64, span_s: f32, far: f32,
         time_px: u32, flat_mode: u32, collapse: bool, max_instances: usize, piano_layout: bool) -> Vec<gpu::LayerDraw>
     {
+        let far = far.clamp(0.1, 1.0); // a hand-edited settings file can hold anything
         let current = self.built.as_ref().is_some_and(|(s, f, c)| Arc::ptr_eq(s, &song.data) && *f == far && *c == collapse);
         if !current {
             let (steps, count) = track_steps(&song.data);
@@ -250,5 +251,11 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while Arc::strong_count(&song.data) > 1 && std::time::Instant::now() < deadline { std::thread::yield_now(); }
         assert_eq!(Arc::strong_count(&song.data), 1);
+    }
+    #[test]
+    fn a_far_speed_out_of_range_is_clamped() {
+        let song = song(&[&[60], &[61]]);
+        let layers = Parallax::default().frame(&song, 2_000_000, 4_000_000, 1.0, 0.0, 600, 1, true, 1 << 20, false);
+        assert!((layers[1].view.height_time - 20.0).abs() < 1e-3, "far 0 acts as 0.1: {}", layers[1].view.height_time);
     }
 }

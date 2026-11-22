@@ -283,8 +283,17 @@ impl AppState {
                         }
                         if c.view == ViewMode::Parallax {
                             ui.label("Far speed");
-                            ui.add(egui::Slider::new(&mut c.parallax_far, 0.1..=1.0).fixed_decimals(2).suffix("×"))
+                            // Applied when the drag ends: every change rebuilds all the layers.
+                            let id = egui::Id::new("parallax_far_drag");
+                            let mut far = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(c.parallax_far);
+                            let r = ui.add(egui::Slider::new(&mut far, 0.1..=1.0).fixed_decimals(2).suffix("×"))
                                 .on_hover_text("The farthest track's speed, as a fraction of the nearest's");
+                            if r.dragged() {
+                                ui.data_mut(|d| d.insert_temp(id, far));
+                            } else {
+                                ui.data_mut(|d| d.remove::<f32>(id));
+                                c.parallax_far = far;
+                            }
                             ui.end_row();
                         }
                     }
@@ -839,6 +848,7 @@ pub(crate) fn draw_piano_roll(
             let layers = parallax.frame(song, now_us, duration_us, speed, parallax_far, time_px as u32, note_mode,
                 visible.collapse_overlaps, visible.max_instances, piano_layout);
             times.build = t0.elapsed();
+            (times.advance, times.decoded, times.profile) = Default::default(); // per-layer numbers aren't summed
             times.instances = layers.iter().map(|l| l.instances.len()).sum();
             if let Some(state) = frame.wgpu_render_state() {
                 if !gpu::no_notes() {
@@ -890,7 +900,7 @@ pub(crate) fn draw_piano_roll(
         );
     }
 
-    if eased > 0.0 {
+    if eased > 0.0 && side.is_none() && !in_parallax {
         let mut over = painter.clone();
         over.multiply_opacity(eased);
         draw_pfa_keyboard(&over, keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors);
