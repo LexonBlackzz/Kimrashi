@@ -760,7 +760,7 @@ pub(crate) fn draw_piano_roll(
     notes_upwards: bool,
     note_mode: u32,
     piano_layout: bool,
-    (view, keyboard_side, parallax_far, horizontal_keyboard): (crate::settings::ViewMode, KeyboardSide, f32, bool),
+    (view, keyboard_side, parallax_far, horizontal_keyboard, perspective_far): (crate::settings::ViewMode, KeyboardSide, f32, bool, f32),
     (stats_mode, synth_stats): (StatsMode, bool),
     visible: &mut VisibleNotes,
     parallax: &mut crate::parallax::Parallax,
@@ -780,6 +780,8 @@ pub(crate) fn draw_piano_roll(
     let side = (view == crate::settings::ViewMode::Horizontal).then_some(keyboard_side);
     // Parallax: no keyboard, notes fill the view, a playhead down the middle.
     let in_parallax = view == crate::settings::ViewMode::Parallax;
+    // Perspective: Vertical's layout, notes through the perspective (0 = off).
+    let far = if view == crate::settings::ViewMode::Perspective { perspective_far.clamp(0.1, 0.9) } else { 0.0 };
     // Horizontal without its keyboard: notes run to the edge.
     let bare = side.is_some() && !horizontal_keyboard;
     if !in_parallax { parallax.clear(); }
@@ -880,7 +882,7 @@ pub(crate) fn draw_piano_roll(
             let t0 = Instant::now();
 
             (active_keys, active_colors) = build_note_instances(
-                song, visible, now_us, window_end, speed, time_px as u32, piano_layout, 0.0, instances,
+                song, visible, now_us, window_end, speed, time_px as u32, piano_layout, far, instances,
             );
 
             times.build = t0.elapsed();
@@ -894,8 +896,8 @@ pub(crate) fn draw_piano_roll(
                         0,
                         instances.clone(),
                         gpu_key_positions,
-                        gpu::NoteView { horizontal: side.is_some(), ..gpu::NoteView::vertical(speed, now_us, match side {
-                            Some(KeyboardSide::Right) => 1.0, Some(KeyboardSide::Left) => -1.0, None if notes_upwards => 1.0, None => -1.0,
+                        gpu::NoteView { horizontal: side.is_some(), perspective_far: far, ..gpu::NoteView::vertical(speed, now_us, match side {
+                            Some(KeyboardSide::Right) => 1.0, Some(KeyboardSide::Left) => -1.0, None if notes_upwards && far == 0.0 => 1.0, None => -1.0,
                         }, note_mode) },
                     ));
                 }

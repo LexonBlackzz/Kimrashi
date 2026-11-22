@@ -1,6 +1,7 @@
 //! Video export: `--export-video <midi> <out.mp4> [--width n] [--height n] [--fps n] [--speed s]`
 //! `[--lead s] [--tail s] [--encoder x264|nvenc|qsv|amf] [--preset ultrafast..veryslow] [--crf n]`
-//! `[--view vertical|horizontal|parallax] [--keyboard-side left|right] [--parallax-far 0.1..1]` (default: the saved settings)
+//! `[--view vertical|horizontal|parallax] [--keyboard-side left|right] [--parallax-far 0.1..1]`
+//! `[--perspective-far 0.1..0.9]` (default; `--view perspective` too): the saved settings)
 //! Renders the real note pipeline offscreen at deterministic song time and pipes raw RGBA to ffmpeg.
 //! The keyboard is drawn on the CPU (the live view draws it with egui).
 
@@ -175,6 +176,8 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     // Parallax: no keyboard, notes fill the frame, a playhead down the middle.
     let parallax = cfg.look.view == ViewMode::Parallax;
     let (horizontal, side) = (cfg.look.view == ViewMode::Horizontal, cfg.look.keyboard_side);
+    // Perspective: Vertical's layout, notes through the perspective (0 = off).
+    let far = if cfg.look.view == ViewMode::Perspective { cfg.look.perspective_far.clamp(0.1, 0.9) } else { 0.0 };
     // Horizontal without its keyboard: notes run to the edge.
     let bare = horizontal && !cfg.look.horizontal_keyboard;
     let keyboard_h = if parallax || bare { 0 }
@@ -248,9 +251,9 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             ([false; 128], [egui::Color32::TRANSPARENT; 128])
         } else {
             visible.advance(&visual.data, now_us, window_end, future_us / time_px as u64);
-            let lit = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, 0.0, &mut instances);
-            let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise => 1.0, _ => -1.0 };
-            let view = gpu::NoteView { time_shift: deficit, horizontal, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
+            let lit = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, far, &mut instances);
+            let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise && far == 0.0 => 1.0, _ => -1.0 };
+            let view = gpu::NoteView { time_shift: deficit, horizontal, perspective_far: far, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
             gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, note_rect, [20, 20, 24], &mut frame);
             lit
         };
@@ -306,12 +309,13 @@ pub fn run_from_args() -> bool {
     let num = |name: &str, default: f32| value(name).map_or(default, |s| s.parse().unwrap_or_else(|_| panic!("bad {name}")));
     let mut look = crate::settings::Settings::load();
     if let Some(v) = value("--view") {
-        look.view = match v.as_str() { "vertical" => ViewMode::Vertical, "horizontal" => ViewMode::Horizontal, "parallax" => ViewMode::Parallax,
-            _ => panic!("view: vertical, horizontal or parallax") };
+        look.view = match v.as_str() { "vertical" => ViewMode::Vertical, "horizontal" => ViewMode::Horizontal, "parallax" => ViewMode::Parallax, "perspective" => ViewMode::Perspective,
+            _ => panic!("view: vertical, horizontal, parallax or perspective") };
     }
     if let Some(v) = value("--keyboard-side") {
         look.keyboard_side = match v.as_str() { "left" => KeyboardSide::Left, "right" => KeyboardSide::Right, _ => panic!("keyboard side: left or right") };
     }
+    if let Some(v) = value("--perspective-far") { look.perspective_far = v.parse::<f32>().expect("bad --perspective-far").clamp(0.1, 0.9); }
     if let Some(v) = value("--parallax-far") { look.parallax_far = v.parse::<f32>().expect("bad --parallax-far").clamp(0.1, 1.0); }
     let d = Settings { speed: look.note_speed, ..Default::default() };
     let cfg = Settings {
@@ -353,10 +357,10 @@ mod tests {
     }
 
     /// The first exported frame (160 x 90), or None without ffmpeg or a GPU.
-    pub(crate) fn first_frame(name: &str, look: crate::settings::Settings) -> Option<Vec<u8>> {
+    pub(crate) fn first_frame(name: &str, look: crate::settings::Settings, speed: f32) -> Option<Vec<u8>> {
         let out = std::env::temp_dir().join(format!("{name}.mp4"));
         let cfg = Settings { input: tiny_midi(&format!("{name}.mid")), output: out.to_string_lossy().into_owned(),
-            width: 160, height: 90, lead: 0.0, tail: 0.0, title: false, watermark: false, look, ..Default::default() };
+            width: 160, height: 90, speed, lead: 0.0, tail: 0.0, title: false, watermark: false, look, ..Default::default() };
         let mut frame = None;
         let result = run(&cfg, |r| { frame = Some(r.rgba.to_vec()); false });
         if frame.is_none() { eprintln!("export unavailable, skipped: {result:?}"); }
@@ -371,7 +375,7 @@ mod tests {
     #[test]
     fn horizontal_export_puts_the_keyboard_on_its_side() {
         let look = crate::settings::Settings { view: ViewMode::Horizontal, keyboard_side: KeyboardSide::Right, ..Default::default() };
-        let Some(frame) = first_frame("kimrashi-horizontal", look) else { return };
+        let Some(frame) = first_frame("kimrashi-horizontal", look, 5.0) else { return };
         let key = pixel(&frame, 155, 45);
         assert!([[245, 245, 250], [25, 25, 30], [150, 150, 160], [80, 80, 80]].contains(&key), "keyboard on the right: {key:?}");
         assert_eq!(pixel(&frame, 80, 89), [20, 20, 24], "no keyboard along the bottom");
@@ -379,7 +383,7 @@ mod tests {
     #[test]
     fn parallax_export_draws_a_playhead_and_no_keyboard() {
         let look = crate::settings::Settings { view: ViewMode::Parallax, ..Default::default() };
-        let Some(frame) = first_frame("kimrashi-parallax", look) else { return };
+        let Some(frame) = first_frame("kimrashi-parallax", look, 5.0) else { return };
         assert_eq!(pixel(&frame, 80, 45), [255, 220, 140], "playhead in the middle");
         assert_eq!(pixel(&frame, 20, 85), [20, 20, 24], "no keyboard along the bottom");
     }
@@ -387,7 +391,22 @@ mod tests {
     fn horizontal_export_can_hide_the_keyboard() {
         let look = crate::settings::Settings { view: ViewMode::Horizontal, keyboard_side: KeyboardSide::Right,
             horizontal_keyboard: false, ..Default::default() };
-        let Some(frame) = first_frame("kimrashi-horizontal-bare", look) else { return };
+        let Some(frame) = first_frame("kimrashi-horizontal-bare", look, 5.0) else { return };
         assert_eq!(pixel(&frame, 155, 45), [20, 20, 24], "notes reach the edge, no keyboard");
+    }
+    #[test]
+    fn perspective_export_narrows_notes_with_distance() {
+        // Mean x of the note's far (highest) row: key 100 sits right of centre, so perspective pulls it in.
+        let far_end_x = |frame: &[u8]| {
+            (0..78).find_map(|y| {
+                let xs: Vec<u32> = (0..160).filter(|&x| pixel(frame, x, y) != [20, 20, 24]).collect();
+                (!xs.is_empty()).then(|| xs.iter().sum::<u32>() as f32 / xs.len() as f32)
+            }).unwrap()
+        };
+        let look = |view| crate::settings::Settings { view, ..Default::default() };
+        let Some(vertical) = first_frame("kimrashi-vertical", look(ViewMode::Vertical), 1.0) else { return };
+        let Some(perspective) = first_frame("kimrashi-perspective", look(ViewMode::Perspective), 1.0) else { return };
+        let (v, p) = (far_end_x(&vertical), far_end_x(&perspective));
+        assert!(p + 20.0 < v, "vertical {v}, perspective {p}");
     }
 }
