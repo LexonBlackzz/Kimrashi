@@ -31,6 +31,11 @@ struct Globals {
     perspective_far: f32,
     /// Perspective: depth at the keyboard line (the screen's bottom edge is 1; below 1 counts as 1).
     perspective_near: f32,
+    /// Blocks: notes stand this high off the plane (a fraction of the camera's height); 0 = flat.
+    block_height: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 @group(0) @binding(0)
@@ -64,6 +69,8 @@ struct VertexOutput {
     @location(6) @interpolate(flat) thin: u32,
     @location(7) time_norm: f32,
     @location(8) @interpolate(flat) lit: u32,
+    /// Blocks: 0 top, 1 near end, 2 side.
+    @location(9) @interpolate(flat) face: u32,
 };
 
 fn microseconds_as_float(lo: u32, hi: u32) -> f32 {
@@ -157,6 +164,8 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     // The whole note's length in clip units along time (for `thin`).
     var whole_px = whole_seconds / safe_height * 2.0;
     let perspective = globals.perspective_far > 0.0 && !horizontal;
+    let face = input.vertex_index / 6u;
+    var z_block = 1.0;
     if (perspective) {
         // Time n (0 at the keyboard line, 1 at the top) is depth z = 1 + (Z - 1) n; a point
         // sits (1 - 1/z) / (1 - 1/Z) up the view, and its key position shrinks toward the centre by 1/z.
@@ -170,10 +179,21 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
         let line = (1.0 - 1.0 / line_z) * up;
         let y0 = ((1.0 - 1.0 / z0) * up - line) / (1.0 - line);
         let y1 = ((1.0 - 1.0 / z1) * up - line) / (1.0 - line);
-        let z = select(z0, z1, uv.y > 0.5);
-        let key = key_pos.left + (key_pos.right - key_pos.left) * uv.x;
+        var z = select(z0, z1, uv.y > 0.5);
+        var key = key_pos.left + (key_pos.right - key_pos.left) * uv.x;
+        // Blocks: a point `lift` off the plane (camera height 1) sits (1 - (1 - lift)/z) up the view.
+        // Faces (6 vertices each): the top, the near end, the side facing the centre line.
+        var lift = globals.block_height;
+        if (face == 1u) {
+            z = z0;
+            lift = globals.block_height * uv.y;
+        } else if (face == 2u) {
+            key = select(key_pos.left, key_pos.right, key_pos.left + key_pos.right < 1.0);
+            lift = globals.block_height * uv.x;
+        }
         x = (0.5 + (key - 0.5) / z) * 2.0 - 1.0;
-        y = select(y0, y1, uv.y > 0.5) * 2.0 - 1.0;
+        y = ((1.0 - (1.0 - lift) / z) * up - line) / (1.0 - line) * 2.0 - 1.0;
+        z_block = z;
         size = vec2<f32>((key_pos.right - key_pos.left) * 2.0 / z0, (y1 - y0) * 2.0);
         // A cut piece measures its whole note, scaled as at the piece's near end (dy/dt there).
         whole_px = whole_seconds / safe_height * (far_z - line_z) * up / (z0 * z0) / (1.0 - line) * 2.0;
@@ -188,7 +208,13 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     // Instances arrive newest (topmost) first: increasing depth, so with a Less depth
     // test, notes drawn later only fill pixels no newer note already covers.
-    let depth = globals.depth_base + globals.depth_scale * (f32(input.instance_index) + 1.0) / (f32(globals.instance_count) + 2.0);
+    let order = (f32(input.instance_index) + 1.0) / (f32(globals.instance_count) + 2.0);
+    var depth = globals.depth_base + globals.depth_scale * order;
+    // Blocks: real depth (1 - 1/z is affine on screen, so faces interpolate it exactly); instance
+    // order only breaks ties between coincident faces.
+    if (globals.block_height > 0.0) {
+        depth = (1.0 - 1.0 / z_block) * 0.999 + 1e-5 * order;
+    }
     out.clip_position = vec4<f32>(x, y, depth, 1.0);
     out.color = vec3<f32>(r, g, b);
     out.uv = uv;
@@ -198,6 +224,7 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     out.lit = select(0u, 1u, globals.playhead >= 0.0 && start_norm <= globals.playhead && end_norm >= globals.playhead);
     out.border_width = 1.0;
     out.edges = edges;
+    out.face = face;
     // Thin is under ~3.5 px. Flattened pieces measure the whole note (however much of it a
     // cut or the window shows); a whole length of 0 measures the clamped quad, as before.
     let measured = select(size.y * win.y,
@@ -249,6 +276,11 @@ fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
             ((input.edges & 1u) != 0u && p.y < d) ||
             ((input.edges & 2u) != 0u && p.y > size_px.y - d);
         color = select(input.color * mix(1.0, 0.6, input.uv.x), input.color * 0.2, border || input.thin != 0u);
+    }
+
+    // Blocks: the near end and side are the base colour, darkened.
+    if (input.face != 0u) {
+        color = select(input.color, input.color * input.color, globals.flat_mode == 0u) * select(0.5, 0.7, input.face == 1u);
     }
 
     // Parallax: a note on the playhead is lit, and the past fades out toward the edge.

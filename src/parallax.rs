@@ -101,7 +101,7 @@ impl Parallax {
             let depth = 1.0 / count as f32;
             out.push(gpu::LayerDraw { instances: layer.instances.clone(), view: gpu::NoteView {
                 height_time, now_us: origin, time_shift, direction_sign: -1.0, flat_mode, horizontal: true, playhead: 0.5,
-                brightness: 1.0 - 0.3 * k as f32 / (count - 1).max(1) as f32, depth: [k as f32 * depth, depth], perspective_far: 0.0, perspective_near: 0.0,
+                brightness: 1.0 - 0.3 * k as f32 / (count - 1).max(1) as f32, depth: [k as f32 * depth, depth], perspective_far: 0.0, perspective_near: 0.0, block_height: 0.0,
             } });
         }
         out

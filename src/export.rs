@@ -257,7 +257,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             visible.advance(&visual.data, now_us, window_end, future_us / time_px as u64);
             let lit = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, persp, &mut instances);
             let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise && !persp.is_on() => 1.0, _ => -1.0 };
-            let view = gpu::NoteView { time_shift: deficit, horizontal, perspective_far: persp.far, perspective_near: persp.near, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
+            let view = gpu::NoteView { time_shift: deficit, horizontal, perspective_far: persp.far, perspective_near: persp.near, block_height: persp.block, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
             gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, note_rect, [20, 20, 24], &mut frame);
             lit
         };

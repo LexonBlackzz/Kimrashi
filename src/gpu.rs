@@ -284,6 +284,8 @@ struct GlobalsUniform {
     depth_scale: f32,
     perspective_far: f32,
     perspective_near: f32,
+    block_height: f32,
+    _pad: [f32; 3],
 }
 
 /// How one layer of notes maps to the screen.
@@ -311,12 +313,14 @@ pub struct NoteView {
     pub perspective_far: f32,
     /// Perspective: depth at the keyboard line (see `crate::Perspective`; below 1 counts as 1).
     pub perspective_near: f32,
+    /// Blocks view: notes stand this high off the perspective plane (see `crate::Perspective::lift`); 0 = flat.
+    pub block_height: f32,
 }
 
 impl NoteView {
     pub fn vertical(height_time: f32, now_us: u64, direction_sign: f32, flat_mode: u32) -> Self {
         Self { height_time, now_us, time_shift: 0.0, direction_sign, flat_mode, horizontal: false,
-            playhead: -1.0, brightness: 1.0, depth: [0.0, 1.0], perspective_far: 0.0, perspective_near: 0.0 }
+            playhead: -1.0, brightness: 1.0, depth: [0.0, 1.0], perspective_far: 0.0, perspective_near: 0.0, block_height: 0.0 }
     }
 
     fn globals(&self, win_width: f32, win_height: f32) -> GlobalsUniform {
@@ -326,6 +330,7 @@ impl NoteView {
             now_us: [self.now_us as u32, (self.now_us >> 32) as u32], time_shift: self.time_shift,
             horizontal: self.horizontal as u32, playhead: self.playhead, brightness: self.brightness,
             depth_base: self.depth[0], depth_scale: self.depth[1], perspective_far: self.perspective_far, perspective_near: self.perspective_near,
+            block_height: self.block_height, _pad: [0.0; 3],
         }
     }
 }
@@ -427,6 +432,8 @@ struct NotePipeline {
     instance_capacity: usize,
     /// Instances uploaded this frame (may be fewer than requested, see `upload`).
     instance_count: u32,
+    /// Vertices per instance: 6 (a quad), or 18 for a block's three visible faces.
+    vertices: u32,
     uploaded: Option<Weak<InstanceRing>>,
     versions: Vec<u64>,
     /// The ring (0 = none) and how many of its pushes `versions` is up to date through.
@@ -603,6 +610,7 @@ impl NotePipeline {
             instance_buffer,
             instance_capacity: 16,
             instance_count: 0,
+            vertices: 6,
             uploaded: None,
             versions: Vec::new(), ring_id: 0, cursor: 0, order: Vec::new(), order_buffer, order_capacity: 64, relative,
             key_buffer,
@@ -688,6 +696,7 @@ impl NotePipeline {
             self.uploaded = Some(source);
         }
         globals.instance_count = self.instance_count;
+        self.vertices = if globals.block_height > 0.0 { 18 } else { 6 };
         queue.write_buffer(&self.key_buffer, 0, bytemuck::cast_slice(&keys[..]));
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
     }
@@ -726,7 +735,7 @@ impl NotePipeline {
         let slice = if self.relative { self.instance_buffer.slice(..) } else { self.order_buffer.slice(..) };
         let slice_static: wgpu::BufferSlice<'static> = unsafe { mem::transmute(slice) };
         render_pass.set_vertex_buffer(0, slice_static);
-        render_pass.draw(0..6, 0..self.instance_count);
+        render_pass.draw(0..self.vertices, 0..self.instance_count);
     }
 }
 
@@ -1139,6 +1148,31 @@ mod tests {
         let view = NoteView { perspective_near: 1.5, ..persp() };
         let px = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 0.05, [255, 0, 0]), view }]);
         assert_eq!((px(18, 62), px(26, 62)), ([0, 0, 0], [255, 0, 0]));
+    }
+
+    fn blocks() -> NoteView { NoteView { block_height: 0.15, ..persp() } }
+
+    #[test]
+    fn blocks_stand_up_from_the_plane() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        // The note ends at depth 1.7: flat at row ~26, its top's far edge lifted to row ~18.
+        let flat = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 0.3, [255, 0, 0]), view: persp() }]);
+        let raised = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 0.3, [255, 0, 0]), view: blocks() }]);
+        assert_eq!((flat(27, 22), raised(27, 22)), ([0, 0, 0], [255, 0, 0]), "the top rises above the flat note");
+        // Below the top's near edge (row ~50) is the near-end face, darker than the top.
+        let [r, g, b] = raised(24, 58);
+        assert!((170..=190).contains(&r) && g == 0 && b == 0, "near face {:?}", [r, g, b]);
+    }
+
+    #[test]
+    fn nearer_blocks_hide_farther_ones() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        // Green is newer (drawn on top by instance order) but starts where red ends, farther away:
+        // red's raised top covers green's near face.
+        let n = |offset: f32, c: u32| NoteInstance { start_us: [(NOW + (offset * 1e6) as u64) as u32, 0], len: 0.3, key_color: 60 | c << 8 };
+        let ring = Arc::new(InstanceRing::from_ordered([n(0.3, 0x00FF00), n(0.0, 0xFF0000)]));
+        let px = draw(&mut gpu, &[LayerDraw { instances: ring, view: blocks() }]);
+        assert_eq!(px(27, 22), [255, 0, 0]);
     }
 
     #[test]

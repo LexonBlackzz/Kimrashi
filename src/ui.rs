@@ -899,7 +899,7 @@ pub(crate) fn draw_piano_roll(
                         0,
                         instances.clone(),
                         gpu_key_positions,
-                        gpu::NoteView { horizontal: side.is_some(), perspective_far: persp.far, perspective_near: persp.near, ..gpu::NoteView::vertical(speed, now_us, match side {
+                        gpu::NoteView { horizontal: side.is_some(), perspective_far: persp.far, perspective_near: persp.near, block_height: persp.block, ..gpu::NoteView::vertical(speed, now_us, match side {
                             Some(KeyboardSide::Right) => 1.0, Some(KeyboardSide::Left) => -1.0, None if notes_upwards && !persp.is_on() => 1.0, None => -1.0,
                         }, note_mode) },
                     ));
