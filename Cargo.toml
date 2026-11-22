@@ -27,7 +27,7 @@ lzma-rust2 = "0.21"
 liblzma = { version = "0.4", features = ["static"] }
 memchr = "2"
 # FL Studio projects (.flp)
-flparser = { path = "../flparser" }
+flparser = { package = "flpkit", path = "../flparser" }
 flate2 = "1"
 unrar = "0.5"
 zstd = { version = "0.13", default-features = false }

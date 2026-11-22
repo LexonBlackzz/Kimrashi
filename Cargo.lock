@@ -1316,7 +1316,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "flparser"
+name = "flpkit"
 version = "0.1.0"
 dependencies = [
  "miniz_oxide",
@@ -1844,7 +1844,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "flate2",
- "flparser",
+ "flpkit",
  "libloading",
  "liblzma",
  "lzma-rust2",
