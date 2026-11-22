@@ -17,6 +17,7 @@ mod settings;
 mod song;
 mod theme;
 mod ui;
+mod parallax;
 mod svms;
 mod sig;
 mod update;
@@ -781,8 +782,14 @@ impl KeyNotes {
 }
 
 fn render_tracks(song: &SongData) -> Vec<bool> {
+    render_tracks_in(song, &vec![true; song.midi.tracks.len()])
+}
+
+/// Like `render_tracks`, but only among `members`: tracks outside it are disabled and never
+/// hide a member (a parallax step draws apart from the others).
+fn render_tracks_in(song: &SongData, members: &[bool]) -> Vec<bool> {
     let mut latest = HashMap::new();
-    for (i, refs) in song.midi.tracks.iter().enumerate() { latest.insert(refs.as_slice(), i); }
+    for (i, refs) in song.midi.tracks.iter().enumerate() { if members[i] { latest.insert(refs.as_slice(), i); } }
     let mut enabled = vec![false; song.midi.tracks.len()];
     for &i in latest.values() { enabled[i] = true; }
     // Identical packed tracks have identical spans on every key. The last track
@@ -1062,7 +1069,7 @@ impl Drop for DecodeWorker {
 }
 
 impl DecodeWorker {
-    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64, mut flatten: Option<Vec<FlattenKey>>, prepared: Vec<NoteSegment>) -> Self {
+    fn new(song: Arc<SongData>, mut readers: Vec<TrackReader>, through: u64, generation: u64, mut flatten: Option<Vec<FlattenKey>>, prepared: Vec<NoteSegment>, enabled: Vec<bool>) -> Self {
         let now = Arc::new(AtomicU64::new(0));
         let target = Arc::new(AtomicU64::new(through));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1071,7 +1078,6 @@ impl DecodeWorker {
         let worker_queued = queued.clone();
         let (worker_now, worker_target, worker_stop, worker_song) =
             (now.clone(), target.clone(), stop.clone(), song.clone());
-        let enabled = render_tracks(&song);
         let handle = std::thread::Builder::new().name("note-decode".into()).spawn(move || {
             let mut through = through;
             let mut prepared = prepared.into_iter().peekable();
@@ -1086,10 +1092,12 @@ impl DecodeWorker {
                 if prepared.peek().is_none() { break; }
                 if worker_stop.load(Ordering::Acquire) { return; }
             }
-            let decode_pool = rayon::ThreadPoolBuilder::new()
+            // One pool for every worker: parallax runs a worker per speed step.
+            static DECODE_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+            let decode_pool = DECODE_POOL.get_or_init(|| rayon::ThreadPoolBuilder::new()
                 .num_threads(std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
                 .thread_name(|i| format!("note-decode-{i}"))
-                .build().expect("note decode pool");
+                .build().expect("note decode pool"));
             while !worker_stop.load(Ordering::Acquire) {
                 let now = worker_now.load(Ordering::Acquire);
                 // Behind the clock (after a seek or a stall) what has ended is dropped, so one big
@@ -1206,6 +1214,8 @@ struct VisibleNotes {
     row_counts: [usize; 2],
     /// Where the last `advance` spent its time (for `FrameLog`).
     timing: AdvanceTimes,
+    /// Tracks to draw (a parallax step's); None = every track (`render_tracks`).
+    tracks: Option<Arc<[bool]>>,
 }
 
 impl Default for VisibleNotes {
@@ -1219,6 +1229,7 @@ impl Default for VisibleNotes {
             build_profile: [Duration::ZERO; 6],
             row_counts: [0; 2],
             timing: AdvanceTimes::default(),
+            tracks: None,
         }
     }
 }
@@ -1249,14 +1260,22 @@ impl VisibleNotes {
 
     fn set_collapse(&mut self, enabled: bool) {
         if self.collapse_overlaps != enabled {
-            *self = Self { collapse_overlaps: enabled, max_instances: self.max_instances, generation: self.generation.wrapping_add(1), ..Default::default() };
+            *self = Self { collapse_overlaps: enabled, max_instances: self.max_instances, generation: self.generation.wrapping_add(1),
+                tracks: self.tracks.clone(), ..Default::default() };
         }
     }
 
     fn set_max_instances(&mut self, max: usize) {
         if self.max_instances != max {
             *self = Self { max_instances: max, collapse_overlaps: self.collapse_overlaps,
-                generation: self.generation.wrapping_add(1), ..Default::default() };
+                generation: self.generation.wrapping_add(1), tracks: self.tracks.clone(), ..Default::default() };
+        }
+    }
+
+    fn set_tracks(&mut self, tracks: Option<Arc<[bool]>>) {
+        if self.tracks != tracks {
+            *self = Self { max_instances: self.max_instances, collapse_overlaps: self.collapse_overlaps,
+                generation: self.generation.wrapping_add(1), tracks, ..Default::default() };
         }
     }
 
@@ -1271,7 +1290,7 @@ impl VisibleNotes {
         if reset {
             let generation = self.generation.wrapping_add(1);
             *self = Self { generation, collapse_overlaps: self.collapse_overlaps,
-                max_instances: self.max_instances, ..Default::default() };
+                max_instances: self.max_instances, tracks: self.tracks.clone(), ..Default::default() };
         }
         self.time_us = now_us;
         for key in &mut self.keys { key.added_start = u64::MAX; }
@@ -1284,7 +1303,7 @@ impl VisibleNotes {
         if self.worker.is_none() {
             let resume = song.seek.get().and_then(|index| index.resume(song.tempo.time_to_tick(now_us)));
             let mut readers = resume.as_ref().map_or_else(|| vec![TrackReader::default(); song.midi.tracks.len()], |r| r.readers.to_vec());
-            let enabled = render_tracks(song);
+            let enabled = self.tracks.as_deref().map_or_else(|| render_tracks(song), <[bool]>::to_vec);
             let mut flatten = self.collapse_overlaps.then(|| (0..128).map(|_| FlattenKey::default()).collect::<Vec<_>>());
             let reach = window_end.saturating_add(SYNC_AHEAD_US);
             let mut decoded = decode_tracks_from(song, &mut readers, now_us, reach, Some(&enabled), resume.as_ref());
@@ -1316,7 +1335,7 @@ impl VisibleNotes {
             }
             self.window.extend(decoded.notes);
             self.through = window_end;
-            self.worker = Some(DecodeWorker::new(song.clone(), readers, reach, self.generation, flatten, prepared));
+            self.worker = Some(DecodeWorker::new(song.clone(), readers, reach, self.generation, flatten, prepared, enabled));
         }
         let mut worker = self.worker.take().unwrap();
         worker.now.store(now_us, Ordering::Release);
@@ -3047,7 +3066,7 @@ mod tests {
         build_note_instances(&song, &mut visible, 260_000, 760_000, 0.5, 100, true, &mut instances);
         let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
         decode_notes(&song.data, &mut readers, 0, 20_000_000);
-        visible.worker = Some(DecodeWorker::new(song.data.clone(), readers, 20_000_000, visible.generation, None, Vec::new()));
+        visible.worker = Some(DecodeWorker::new(song.data.clone(), readers, 20_000_000, visible.generation, None, Vec::new(), render_tracks(&song.data)));
         visible.through = 20_000_000;
         visible.time_us = 260_000;
         visible.advance(&song.data, 280_000, 780_000, 5000);
