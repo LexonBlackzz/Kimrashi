@@ -251,7 +251,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             ([false; 128], [egui::Color32::TRANSPARENT; 128])
         } else {
             visible.advance(&visual.data, now_us, window_end, future_us / time_px as u64);
-            let lit = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, far, &mut instances);
+            let lit = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, crate::Perspective { far, near: 1.0 }, &mut instances);
             let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise && far == 0.0 => 1.0, _ => -1.0 };
             let view = gpu::NoteView { time_shift: deficit, horizontal, perspective_far: far, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
             gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, note_rect, [20, 20, 24], &mut frame);

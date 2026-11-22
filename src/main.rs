@@ -621,7 +621,7 @@ struct KeyNotes {
     rows: Vec<RowNotes>,
     row_head: usize,
     row_time: u64,
-    row_view: (u32, u64, u32),
+    row_view: (u32, u64, u64),
     added_start: u64,
 }
 
@@ -788,17 +788,46 @@ fn drop_song_views(visible: &mut VisibleNotes, parallax: &mut parallax::Parallax
     parallax.clear();
 }
 
+/// The perspective view's tilted plane (see the note shader): the screen's bottom edge is depth 1
+/// and full width; the keyboard line is depth `near`; the top edge is depth `1 / far`, `far` of the
+/// screen's width. `far` 0 = off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Perspective {
+    pub far: f32,
+    pub near: f32,
+}
+
+impl Perspective {
+    pub const OFF: Self = Self { far: 0.0, near: 1.0 };
+
+    /// With the keyboard `keyboard_frac` of the view's height (its top is the keyboard line).
+    pub fn new(far: f32, keyboard_frac: f32) -> Self {
+        let far = far.clamp(0.1, 0.9);
+        Self { far, near: 1.0 / (1.0 - keyboard_frac.clamp(0.0, 0.9) * (1.0 - far)) }
+    }
+
+    pub fn is_on(&self) -> bool { self.far > 0.0 }
+
+    /// Height of depth `z` above the screen's bottom edge, as a fraction of the view (top = 1).
+    pub fn y_total(&self, z: f32) -> f32 { (1.0 - 1.0 / z) / (1.0 - self.far) }
+
+    /// Where key fraction `x` at depth `z` lands: (x, height), as fractions of the view.
+    pub fn point(&self, x: f32, z: f32) -> (f32, f32) { (0.5 + (x - 0.5) / z, self.y_total(z)) }
+}
+
 /// Sample time of each screen row (row 0 at the keyboard line): even steps of `height_time /
-/// height_px`, or with `far` > 0 the perspective view's (far width `far`; see the note shader).
-fn row_times(now_us: u64, height_time: f32, height_px: u32, far: f32) -> Vec<u64> {
+/// height_px`, or with perspective at the times its rows show (see `Perspective`).
+fn row_times(now_us: u64, height_time: f32, height_px: u32, p: Perspective) -> Vec<u64> {
     let height = height_px.max(1) as usize;
     let span = height_time as f64 * 1e6;
+    let (far_z, near) = (1.0 / p.far as f64, p.near.max(1.0) as f64);
+    let line = (1.0 - 1.0 / near) * far_z / (far_z - 1.0); // the keyboard line's height in the view
     (0..height).map(|row| {
         let y = (row as f64 + 0.5) / height as f64;
-        let t = if far > 0.0 {
-            let far_z = 1.0 / far as f64;
+        let t = if p.is_on() {
+            let y = line + y * (1.0 - line);
             let z = 1.0 / (1.0 - y * (1.0 - 1.0 / far_z));
-            (z - 1.0) / (far_z - 1.0) * span
+            (z - near) / (far_z - near) * span
         } else { (row as f64 + 0.5) * (span / height as f64) };
         now_us.saturating_add(t as u64)
     }).collect()
@@ -1577,8 +1606,8 @@ impl VisibleNotes {
         self.indexed = end;
     }
 
-    /// `far`: the perspective view's far width (rows at perspective times, see `row_times`); 0 = even rows.
-    fn select_pixels(&mut self, now_us: u64, window_end: u64, height_time: f32, height_px: u32, far: f32) {
+    /// `p`: rows at the perspective view's times (see `row_times`); `Perspective::OFF` = even rows.
+    fn select_pixels(&mut self, now_us: u64, window_end: u64, height_time: f32, height_px: u32, p: Perspective) {
         let t0 = Instant::now();
         self.selected.clear();
         if !self.dense(height_time, height_px) {
@@ -1601,9 +1630,9 @@ impl VisibleNotes {
             bits[word].fetch_or(1 << (i % 64), Ordering::Relaxed);
             summary[word / 64].fetch_or(1 << (word % 64), Ordering::Relaxed);
         };
-        let times = row_times(now_us, height_time, height_px, far);
+        let times = row_times(now_us, height_time, height_px, p);
         // The widest row's time span (all rows are even without perspective; the top is widest with it).
-        let px_us = if far > 0.0 && times.len() > 1 { (times[times.len() - 1] - times[times.len() - 2]) as f64 }
+        let px_us = if p.is_on() && times.len() > 1 { (times[times.len() - 1] - times[times.len() - 2]) as f64 }
             else { height_time as f64 * 1e6 / height_px.max(1) as f64 };
         // Include uncertain edge samples as well: float rounding and the GPU's
         // subpixel raster grid must never hide an exposed colour/border pixel.
@@ -1623,10 +1652,10 @@ impl VisibleNotes {
                 key.rows.clear();
                 return counts; // top note covers the whole viewport, including its borders
             }
-            let view = (height_time.to_bits(), guard, far.to_bits());
+            let view = (height_time.to_bits(), guard, (p.far.to_bits() as u64) << 32 | p.near.to_bits() as u64);
             let mut rows = std::mem::take(&mut key.rows);
             // Uneven perspective rows can't be shifted by whole rows as time passes: rebuilt each frame.
-            if rows.len() != height || key.row_view != view || now_us < key.row_time || far > 0.0 {
+            if rows.len() != height || key.row_view != view || now_us < key.row_time || p.is_on() {
                 rows.clear();
                 rows.resize_with(height, RowNotes::default);
                 key.row_head = 0;
@@ -2344,8 +2373,8 @@ fn build_note_instances(
     height_time: f32,
     height_px: u32,
     piano_layout: bool,
-    // The perspective view's far width (see `row_times`); 0 = even rows.
-    far: f32,
+    // Rows at the perspective view's times (see `row_times`); `Perspective::OFF` = even rows.
+    perspective: Perspective,
     instances: &mut Arc<gpu::InstanceRing>,
 ) -> ([bool; 128], [Color32; 128]) {
     if visible.instance_ring_id != instances.id() {
@@ -2425,7 +2454,7 @@ fn build_note_instances(
         }
     }
     visible.build_profile[0] = t0.elapsed();
-    visible.select_pixels(now_us, window_end, height_time, height_px, far);
+    visible.select_pixels(now_us, window_end, height_time, height_px, perspective);
     let t0 = Instant::now();
     if visible.instance_dirty || visible.instance_style != Some(style) || visible.selected != visible.selection {
         let buf = Arc::make_mut(instances);
@@ -2628,7 +2657,7 @@ mod tests {
     }
 
     fn assert_raster_equal(song: &VisualSong, visible: &mut VisibleNotes, now: u64, speed: f32, height: u32) {
-        visible.select_pixels(now, now + (speed as f64 * 1e6) as u64, speed, height, 0.0);
+        visible.select_pixels(now, now + (speed as f64 * 1e6) as u64, speed, height, Perspective::OFF);
         let selected: Vec<_> = visible.selected.iter().map(|&i| visible.window[i]).collect();
         for by_channel in [false, true] {
             for piano in [false, true] {
@@ -2657,12 +2686,12 @@ mod tests {
         for now in [0, 1, 17, 1539] {
             for height in [16, 64, 1024] { assert_raster_equal(&song, &mut visible, now, 0.1, height); }
         }
-        visible.select_pixels(0, 100_000, 0.1, 64, 0.0);
+        visible.select_pixels(0, 100_000, 0.1, 64, Perspective::OFF);
         let surviving: Vec<_> = visible.selected.iter().map(|&i| visible.window[i]).filter(|n| n.pitch == 60).collect();
         assert_eq!(surviving.iter().map(|n| (n.start_us, n.end_us, n.track)).collect::<Vec<_>>(),
             [(20, 100_000, 1), (20, 40_000, 2), (50_500, 99_000, 0)]);
         let mut instances = Arc::new(gpu::InstanceRing::default());
-        build_note_instances(&song, &mut visible, 0, 100_000, 0.1, 64, false, 0.0, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 100_000, 0.1, 64, false, crate::Perspective::OFF, &mut instances);
         for instance in instances.iter().filter(|n| n.key_color & 255 == 60) {
             let start = instance.start_us[0] as u64;
             let note = surviving.iter().find(|n| n.start_us == start &&
@@ -2719,11 +2748,11 @@ mod tests {
             channel: (i % 3) as u8, pitch: 60,
         }).collect(), false);
         let mut instances = Arc::new(gpu::InstanceRing::default());
-        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, true, 0.0, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, true, crate::Perspective::OFF, &mut instances);
         let coarse = instances.clone();
-        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, true, 0.0, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 100, true, crate::Perspective::OFF, &mut instances);
         assert!(Arc::ptr_eq(&coarse, &instances));
-        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 10_000, true, 0.0, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 500_000, 0.5, 10_000, true, crate::Perspective::OFF, &mut instances);
         assert!(instances.len() > coarse.len() * 10);
         assert_raster_equal(&song, &mut visible, 123_456, 0.01, 48);
     }
@@ -2746,7 +2775,7 @@ mod tests {
         let mut a = Arc::new(gpu::InstanceRing::default());
         let mut b = Arc::new(gpu::InstanceRing::default());
         let build = |visible: &mut VisibleNotes, buf: &mut Arc<gpu::InstanceRing>, now| {
-            build_note_instances(&song, visible, now, now + 3_000_000, 3.0, 900, true, 0.0, buf);
+            build_note_instances(&song, visible, now, now + 3_000_000, 3.0, 900, true, crate::Perspective::OFF, buf);
         };
         build(&mut stepped, &mut a, 2_000_000);
         stepped.frames_since_sweep = 239;
@@ -2781,14 +2810,27 @@ mod tests {
 
     #[test]
     fn row_times_follow_the_perspective() {
-        let even = row_times(0, 1.0, 100, 0.0);
+        let even = row_times(0, 1.0, 100, Perspective::OFF);
         assert_eq!((even[0], even[99]), (5_000, 995_000));
         for far in [0.1, 0.3, 0.9] {
-            let rows = row_times(0, 1.0, 100, far);
+            let rows = row_times(0, 1.0, 100, Perspective { far, near: 1.0 });
             assert!(rows.windows(2).all(|w| w[0] < w[1]) && rows[99] < 1_000_000, "{far}: {rows:?}");
             let (bottom, top) = (rows[1] - rows[0], rows[99] - rows[98]);
             if far == 0.3 { assert!(top > 5 * bottom, "{bottom} {top}"); }
         }
+    }
+
+    #[test]
+    fn row_times_start_at_the_keyboard_line() {
+        // A keyboard a fifth of the view high: the keyboard line is deeper than the screen's edge.
+        let p = Perspective::new(0.3, 0.2);
+        assert!(p.near > 1.0 && (p.y_total(p.near) - 0.2).abs() < 1e-5, "{p:?}");
+        let rows = row_times(0, 1.0, 100, p);
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "{rows:?}");
+        assert!(rows[0] < 10_000 && rows[99] > 980_000 && rows[99] < 1_000_000, "{} {}", rows[0], rows[99]);
+        // The plane is continuous: the keyboard line's width is 1/near of the screen.
+        let (left, _) = p.point(0.0, p.near);
+        assert!((left - (0.5 - 0.5 / p.near)).abs() < 1e-6);
     }
 
     /// About 5,000 overlapping notes on keys 59..=62 over 0..5 s.
@@ -2804,10 +2846,10 @@ mod tests {
     #[test]
     fn perspective_culling_keeps_every_row_winner() {
         let mut visible = indexed(random_notes(7), true);
-        visible.select_pixels(0, 5_000_000, 5.0, 200, 0.3);
+        visible.select_pixels(0, 5_000_000, 5.0, 200, Perspective { far: 0.3, near: 1.0 });
         assert!(visible.dense(5.0, 200));
         let selected: std::collections::HashSet<_> = visible.selected.iter().copied().collect();
-        for time in row_times(0, 5.0, 200, 0.3) {
+        for time in row_times(0, 5.0, 200, Perspective { far: 0.3, near: 1.0 }) {
             for pitch in 59..=62 {
                 let newest = visible.window.entries().filter(|(_, n)| n.pitch == pitch && n.start_us <= time && time < n.end_us).map(|(i, _)| i).max();
                 if let Some(i) = newest { assert!(selected.contains(&i), "key {pitch} at {time} us: note {i} missing"); }
@@ -2818,9 +2860,9 @@ mod tests {
     #[test]
     fn switching_row_sampling_rebuilds_the_rows() {
         let mut visible = indexed(random_notes(9), true);
-        for far in [0.0, 0.3, 0.0] { visible.select_pixels(0, 5_000_000, 5.0, 200, far); }
+        for far in [0.0, 0.3, 0.0] { visible.select_pixels(0, 5_000_000, 5.0, 200, Perspective { far, near: 1.0 }); }
         let mut fresh = indexed(random_notes(9), true);
-        fresh.select_pixels(0, 5_000_000, 5.0, 200, 0.0);
+        fresh.select_pixels(0, 5_000_000, 5.0, 200, Perspective::OFF);
         assert_eq!(visible.selected, fresh.selected);
     }
 
@@ -3144,7 +3186,7 @@ mod tests {
         }).collect();
         let mut visible = indexed(notes, false);
         let mut instances = Arc::new(gpu::InstanceRing::default());
-        build_note_instances(&song, &mut visible, 260_000, 760_000, 0.5, 100, true, 0.0, &mut instances);
+        build_note_instances(&song, &mut visible, 260_000, 760_000, 0.5, 100, true, crate::Perspective::OFF, &mut instances);
         let mut readers = vec![TrackReader::default(); song.data.midi.tracks.len()];
         decode_notes(&song.data, &mut readers, 0, 20_000_000);
         visible.worker = Some(DecodeWorker::new(song.data.clone(), readers, 20_000_000, visible.generation, None, Vec::new(), render_tracks(&song.data)));
@@ -3166,14 +3208,14 @@ mod tests {
             NoteSegment { source: 0, start_us: 5000, end_us: 10_000, track: 1, channel: 2, pitch: 60 },
         ], false);
         let mut instances = Arc::new(gpu::InstanceRing::default());
-        build_note_instances(&song, &mut visible, 0, 10_000, 0.01, 100, false, 0.0, &mut instances);
+        build_note_instances(&song, &mut visible, 0, 10_000, 0.01, 100, false, crate::Perspective::OFF, &mut instances);
         assert_eq!(instances.len(), 2);
-        build_note_instances(&song, &mut visible, 4000, 14_000, 0.01, 100, false, 0.0, &mut instances);
+        build_note_instances(&song, &mut visible, 4000, 14_000, 0.01, 100, false, crate::Perspective::OFF, &mut instances);
         assert_eq!(instances.len(), 1);
         let old_colour = instances[0].key_color;
         song.set_palette(theme::NotePalette::Pitch, &[], 7);
         visible.instance_ring_id = u64::MAX; // what the UI does on a palette change
-        let (active, colours) = build_note_instances(&song, &mut visible, 6000, 16_000, 0.01, 100, false, 0.0, &mut instances);
+        let (active, colours) = build_note_instances(&song, &mut visible, 6000, 16_000, 0.01, 100, false, crate::Perspective::OFF, &mut instances);
         assert_ne!(old_colour, instances[0].key_color);
         assert!(active[60]);
         assert_eq!(colours[60], song.color_for(&visible.window[1]));

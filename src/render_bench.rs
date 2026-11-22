@@ -209,7 +209,7 @@ pub fn run_from_args() -> bool {
         let t0 = Instant::now();
         visible.advance(&visual.data, now, end, future_us / 900);
         let t1 = Instant::now();
-        crate::build_note_instances(&visual, &mut visible, now, end, speed, 900, true, 0.0, &mut instances);
+        crate::build_note_instances(&visual, &mut visible, now, end, speed, 900, true, crate::Perspective::OFF, &mut instances);
         let build = t1.elapsed();
         let cpu = t0.elapsed();
         let (upload, gpu) = renderer.frame(&instances, &keys, speed, now);
@@ -372,7 +372,7 @@ fn play_from(visual: &VisualSong, visible: &mut VisibleNotes, instances: &mut Ar
                 visible.advance(&visual.data, now, end, future_us / 900);
             }
         }
-        crate::build_note_instances(visual, visible, now, end, speed, 900, true, 0.0, instances);
+        crate::build_note_instances(visual, visible, now, end, speed, 900, true, crate::Perspective::OFF, instances);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         if f == 0 {
             first = ms;
