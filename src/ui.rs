@@ -274,6 +274,8 @@ impl AppState {
                                 .on_hover_text("The vertical view at an angle: far notes small at the top");
                             ui.selectable_value(&mut c.view, ViewMode::Blocks, "Blocks")
                                 .on_hover_text("Perspective in 3D: notes are blocks, black keys stand up");
+                            ui.selectable_value(&mut c.view, ViewMode::Matrix, "Matrix")
+                                .on_hover_text("Velocity matrix: keys across, velocity up, a cell lit while a note sounds on it");
                         });
                         ui.end_row();
                         shown += 1;
@@ -766,6 +768,7 @@ pub(crate) fn draw_piano_roll(
     (stats_mode, synth_stats): (StatsMode, bool),
     visible: &mut VisibleNotes,
     parallax: &mut crate::parallax::Parallax,
+    matrix: &mut crate::matrix::Matrix,
     instances: &mut Arc<gpu::InstanceRing>,
     times: &mut FrameTimes,
 ) {
@@ -787,9 +790,12 @@ pub(crate) fn draw_piano_roll(
     let perspective = blocks || view == crate::settings::ViewMode::Perspective;
     // Horizontal without its keyboard: notes run to the edge.
     let bare = side.is_some() && !horizontal_keyboard;
+    // Velocity matrix: no keyboard, no notes, a grid of key by velocity (see `crate::matrix`).
+    let in_matrix = view == crate::settings::ViewMode::Matrix;
     if !in_parallax { parallax.clear(); }
+    if !in_matrix { matrix.clear(); }
     // The keyboard grows to PFA's size and back, easing out in both directions.
-    let pfa = note_mode == 2 && side.is_none() && !in_parallax;
+    let pfa = note_mode == 2 && side.is_none() && !in_parallax && !in_matrix;
     let linear = ui.ctx().animate_bool_with_time(egui::Id::new("pfa_keyboard"), pfa, 0.4);
     let eased = if pfa { egui::emath::easing::cubic_out(linear) } else { 1.0 - egui::emath::easing::cubic_out(1.0 - linear) };
     let classic_height = (rect.height() * 0.12).clamp(36.0, 120.0);
@@ -802,7 +808,7 @@ pub(crate) fn draw_piano_roll(
         else { crate::Perspective::OFF };
     let keyboard_width = (rect.width() * 0.12).clamp(36.0, 120.0);
     let (note_area, keyboard_rect, edge) = match side {
-        _ if in_parallax || bare => (rect, Rect::from_min_max(rect.max, rect.max), [rect.max, rect.max]),
+        _ if in_parallax || in_matrix || bare => (rect, Rect::from_min_max(rect.max, rect.max), [rect.max, rect.max]),
         None => {
             let y = rect.bottom() - keyboard_height;
             (Rect::from_min_max(rect.min, Pos2::new(rect.right(), y)), Rect::from_min_max(Pos2::new(rect.left(), y), rect.max),
@@ -854,14 +860,21 @@ pub(crate) fn draw_piano_roll(
         }
     }
 
-    if !in_parallax && !bare && !persp.is_on() { painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210))); }
+    if !in_parallax && !in_matrix && !bare && !persp.is_on() { painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210))); }
 
     if let Some(song) = song {
         let ppp = ui.ctx().pixels_per_point();
         // Pixels along the time axis.
         let time_px = if side.is_some() || in_parallax { (note_area.right() * ppp).round() - (note_area.left() * ppp).round() }
             else { (note_area.bottom() * ppp).round() - (note_area.top() * ppp).round() }.max(1.0);
-        if in_parallax {
+        if in_matrix {
+            let t0 = Instant::now();
+            matrix.advance(&song.data, song.data.tempo.time_to_tick(now_us));
+            let mut mesh = egui::Mesh::default();
+            for (k, v, c) in matrix.lit() { mesh.add_colored_rect(crate::matrix::cell_rect(note_area, k, v), crate::matrix::color(song, k, c)); }
+            painter.add(egui::Shape::mesh(mesh));
+            times.build = t0.elapsed();
+        } else if in_parallax {
             let t0 = Instant::now();
             let layers = parallax.frame(song, now_us, duration_us, speed, parallax_far, time_px as u32, note_mode,
                 visible.collapse_overlaps, visible.max_instances, piano_layout);
@@ -932,12 +945,12 @@ pub(crate) fn draw_piano_roll(
                 &black_keys(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), pfa, &active_keys, &active_colors)));
         }
         paint_quads(&painter, &quads);
-    } else if eased > 0.0 && side.is_none() && !in_parallax {
+    } else if eased > 0.0 && side.is_none() && !in_parallax && !in_matrix {
         let mut over = painter.clone();
         over.multiply_opacity(eased);
         draw_pfa_keyboard(&over, keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors);
     }
-    if eased < 1.0 && !in_parallax && !bare && !persp.is_on() {
+    if eased < 1.0 && !in_parallax && !in_matrix && !bare && !persp.is_on() {
         draw_keyboard(
             &painter,
             keyboard_rect,

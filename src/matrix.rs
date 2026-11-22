@@ -6,6 +6,7 @@ use crate::parser::{Record, TrackReader};
 use crate::song::SongData;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::{Arc, Weak};
 
 /// One cell: how many notes sound on it, and the track (of the file) and channel of the newest.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -16,6 +17,8 @@ pub struct Cell {
 }
 
 pub struct Matrix {
+    /// The song read. Weak, but it pins the address, so a later song can't be mistaken for it.
+    song: Weak<SongData>,
     readers: Vec<TrackReader>,
     /// Records are read through this tick (None: nothing read yet).
     done: Option<u32>,
@@ -26,16 +29,27 @@ pub struct Matrix {
 
 impl Matrix {
     pub fn new() -> Self {
-        Self { readers: Vec::new(), done: None, ending: BinaryHeap::new(), cells: vec![Cell::default(); 128 * 128] }
+        Self { song: Weak::new(), readers: Vec::new(), done: None, ending: BinaryHeap::new(), cells: vec![Cell::default(); 128 * 128] }
     }
 
     pub fn cell(&self, key: u8, vel: u8) -> Cell { self.cells[cell_index(key, vel) as usize] }
 
+    /// Every lit cell: (key, velocity, cell).
+    pub fn lit(&self) -> impl Iterator<Item = (u8, u8, Cell)> + '_ {
+        self.cells.iter().enumerate().filter(|(_, c)| c.count > 0).map(|(i, &c)| ((i / 128) as u8, (i % 128) as u8, c))
+    }
+
+    /// Frees the state (leaving the view).
+    pub fn clear(&mut self) { if self.song.strong_count() > 0 || !self.readers.is_empty() { *self = Self::new(); } }
+
     /// Brings the grid to `tick`: a note sounds over `[tick, tick + dur)`. Going backwards replays
     /// from the start, or from the seek index's snapshot when that is ahead of what was read.
-    pub fn advance(&mut self, song: &SongData, tick: u32) {
+    pub fn advance(&mut self, song: &Arc<SongData>, tick: u32) {
         let tracks = song.midi.tracks.len();
-        if self.readers.len() != tracks || self.done.is_some_and(|d| tick < d) { self.reset(tracks); }
+        if !Weak::ptr_eq(&self.song, &Arc::downgrade(song)) || self.done.is_some_and(|d| tick < d) {
+            self.reset(tracks);
+            self.song = Arc::downgrade(song);
+        }
         if let Some(resume) = song.seek.get().and_then(|index| index.resume(tick)) {
             if self.done.is_none_or(|d| resume.before > d + 1) {
                 self.reset(tracks);
@@ -84,11 +98,21 @@ impl Matrix {
 
 fn cell_index(key: u8, vel: u8) -> u16 { (key as u16 & 127) * 128 + (vel as u16 & 127) }
 
+/// Where cell (key, velocity) sits in `area`: keys across, velocity 127 at the top.
+pub fn cell_rect(area: egui::Rect, key: u8, vel: u8) -> egui::Rect {
+    let (w, h) = (area.width() / 128.0, area.height() / 128.0);
+    egui::Rect::from_min_size(egui::pos2(area.left() + key as f32 * w, area.bottom() - (vel as f32 + 1.0) * h), egui::vec2(w, h))
+}
+
+/// A cell's colour: what the roll would give its newest note.
+pub fn color(song: &crate::VisualSong, key: u8, c: Cell) -> egui::Color32 {
+    song.color_for(&crate::NoteSegment { source: 0, start_us: 0, end_us: 0, track: c.track, channel: c.ch, pitch: key })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser;
-    use std::sync::Arc;
 
     /// A song from per-track notes (tick, key, velocity, length in ticks), 480 ticks per beat.
     fn song(tracks: &[Vec<(u32, u8, u8, u32)>]) -> Arc<SongData> {

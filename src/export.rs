@@ -175,15 +175,17 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     // Horizontal: the keyboard is a strip `keyboard_h` wide at `side`, and notes fill the rest.
     // Parallax: no keyboard, notes fill the frame, a playhead down the middle.
     let parallax = cfg.look.view == ViewMode::Parallax;
+    // Velocity matrix: no keyboard and no notes, a grid of key by velocity (see `crate::matrix`).
+    let matrix = cfg.look.view == ViewMode::Matrix;
     let (horizontal, side) = (cfg.look.view == ViewMode::Horizontal, cfg.look.keyboard_side);
     // Perspective: Vertical's layout, notes through the perspective (0 = off).
     // Horizontal without its keyboard: notes run to the edge.
     let bare = horizontal && !cfg.look.horizontal_keyboard;
-    let keyboard_h = if parallax || bare { 0 }
+    let keyboard_h = if parallax || bare || matrix { 0 }
         else if horizontal { (width as f32 * 0.12) as u32 }
         else if cfg.look.pfa_style { crate::pfa::key_height(height as f32, width as f32, visual.pitch_min, visual.pitch_max) as u32 }
         else { (height as f32 * 0.12) as u32 };
-    let note_h = if horizontal || parallax { height } else { height - keyboard_h };
+    let note_h = if horizontal || parallax || matrix { height } else { height - keyboard_h };
     // Perspective: one tilted plane, the keyboard's bottom edge full width (see `crate::Perspective`).
     let persp = if matches!(cfg.look.view, ViewMode::Perspective | ViewMode::Blocks) { 
         let p = crate::Perspective::new(cfg.look.perspective_far, keyboard_h as f32 / height as f32);
@@ -191,7 +193,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     }
         else { crate::Perspective::OFF };
     let note_rect = match (horizontal, side) {
-        _ if parallax || bare => [0, 0, width, height],
+        _ if parallax || bare || matrix => [0, 0, width, height],
         (false, _) => [0, 0, width, note_h],
         (true, KeyboardSide::Left) => [keyboard_h + 1, 0, width - keyboard_h - 1, height],
         (true, KeyboardSide::Right) => [0, 0, width - keyboard_h - 1, height],
@@ -235,6 +237,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     for p in lo..=hi { keys[p as usize].left = columns[p as usize].0; keys[p as usize].right = columns[p as usize].1; }
 
     let mut layers = crate::parallax::Parallax::default();
+    let mut cells = crate::matrix::Matrix::new();
     let mut visible = VisibleNotes::default();
     visible.set_collapse(look.collapse_overlaps);
     visible.set_max_instances(look.max_instances);
@@ -248,7 +251,16 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         let deficit = (-t).max(0.0) as f32;
         let window_end = (now_us + future_us).saturating_sub((deficit * 1e6) as u64).max(now_us).min(duration_us.max(now_us));
         let mut frame = free_rx.try_recv().unwrap_or_default();
-        let (mut active, colors) = if parallax {
+        let (mut active, colors) = if matrix {
+            gpu.render(&[], &keys, note_rect, [20, 20, 24], &mut frame);
+            cells.advance(&visual.data, visual.data.tempo.time_to_tick(now_us));
+            let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32));
+            for (k, v, c) in cells.lit() {
+                let col = crate::matrix::color(&visual, k, c);
+                fill_rect(&mut frame, width, crate::matrix::cell_rect(area, k, v), [col.r(), col.g(), col.b()]);
+            }
+            ([false; 128], [egui::Color32::TRANSPARENT; 128])
+        } else if parallax {
             let mut draws = layers.frame(&visual, now_us, duration_us, speed, look.parallax_far, time_px, look.note_mode(),
                 look.collapse_overlaps, look.max_instances, piano);
             for d in &mut draws { d.view.time_shift += deficit; }
@@ -275,7 +287,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         if parallax {
             let x = width / 2;
             fill(&mut frame, width, (x - 1) as f32, (x + 1) as f32, 0, height, [255, 220, 140]);
-        } else if bare {
+        } else if bare || matrix {
         } else if horizontal {
             let (line, strip) = match side { KeyboardSide::Left => (keyboard_h, 0), KeyboardSide::Right => (width - keyboard_h - 1, width - keyboard_h) };
             fill(&mut frame, width, line as f32, (line + 1) as f32, 0, height, [200, 200, 210]);
@@ -332,8 +344,8 @@ pub fn run_from_args() -> bool {
     let num = |name: &str, default: f32| value(name).map_or(default, |s| s.parse().unwrap_or_else(|_| panic!("bad {name}")));
     let mut look = crate::settings::Settings::load();
     if let Some(v) = value("--view") {
-        look.view = match v.as_str() { "vertical" => ViewMode::Vertical, "horizontal" => ViewMode::Horizontal, "parallax" => ViewMode::Parallax, "perspective" => ViewMode::Perspective, "blocks" => ViewMode::Blocks,
-            _ => panic!("view: vertical, horizontal, parallax, perspective or blocks") };
+        look.view = match v.as_str() { "vertical" => ViewMode::Vertical, "horizontal" => ViewMode::Horizontal, "parallax" => ViewMode::Parallax, "perspective" => ViewMode::Perspective, "blocks" => ViewMode::Blocks, "matrix" => ViewMode::Matrix,
+            _ => panic!("view: vertical, horizontal, parallax, perspective, blocks or matrix") };
     }
     if let Some(v) = value("--keyboard-side") {
         look.keyboard_side = match v.as_str() { "left" => KeyboardSide::Left, "right" => KeyboardSide::Right, _ => panic!("keyboard side: left or right") };
@@ -438,6 +450,15 @@ mod tests {
         let Some(frame) = first_frame("kimrashi-perspective-keys", look, 5.0) else { return };
         assert_ne!(pixel(&frame, 1, 89), [20, 20, 24], "the bottom edge is full width");
         assert_eq!(pixel(&frame, 1, 81), [20, 20, 24], "the keyboard line is narrower: background beside it");
+    }
+    #[test]
+    fn matrix_export_lights_the_sounding_cell() {
+        let look = crate::settings::Settings { view: ViewMode::Matrix, ..Default::default() };
+        let Some(frame) = first_frame("kimrashi-matrix", look, 1.0) else { return };
+        // Key 100 at velocity 100: x 125..126, y 19..20 of 160 x 90 (velocity 127 at the top).
+        assert_ne!(pixel(&frame, 125, 19), [20, 20, 24], "the sounding cell is lit");
+        assert_eq!(pixel(&frame, 80, 45), [20, 20, 24], "an unused cell is background");
+        assert_eq!(pixel(&frame, 125, 89), [20, 20, 24], "no keyboard");
     }
     #[test]
     fn blocks_export_raises_the_black_keys() {

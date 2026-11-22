@@ -29,6 +29,8 @@ pub enum ViewMode {
     Perspective,
     /// Perspective with depth: notes are blocks, black keys stand up.
     Blocks,
+    /// No time axis: a 128 x 128 grid of keys by velocity, a cell lit while a note sounds on it.
+    Matrix,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Debug)]

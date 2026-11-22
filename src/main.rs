@@ -224,6 +224,7 @@ fn main() {
                 settings_search: String::new(),
                 visible: VisibleNotes::default(),
                 parallax: parallax::Parallax::default(),
+                matrix: matrix::Matrix::new(),
                 instances: Arc::default(),
                 refresh_rate_hz: vsync::refresh_hz(),
                 status_message: None,
@@ -1837,6 +1838,7 @@ struct AppState {
     visible: VisibleNotes,
     /// The parallax view's layers (empty in the other views).
     parallax: parallax::Parallax,
+    matrix: matrix::Matrix,
     /// Reused across frames; the GPU callback holds a clone until it renders.
     instances: Arc<gpu::InstanceRing>,
     /// Display refresh rate reported by the compositor (for the VSync label).
@@ -2137,6 +2139,7 @@ impl eframe::App for AppState {
                     (self.cfg.stats, self.cfg.synth_stats),
                     &mut self.visible,
                     &mut self.parallax,
+                    &mut self.matrix,
                     &mut self.instances,
                     &mut self.frame_times,
                 );
