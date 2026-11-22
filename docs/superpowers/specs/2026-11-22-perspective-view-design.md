@@ -102,3 +102,29 @@ dropping with distance.
   on black MIDIs. Measure on the Septette at 0.25 s note speed, export throughput as before.
   If it's too slow, cache rows by their time instead, and reuse rows whose time range is
   unchanged.
+
+## Addendum: the keyboard bends too (approved 2026-11-22)
+
+The keyboard and notes are one tilted plane. The screen's bottom edge is full width (depth 1).
+The keyboard keeps its current height on screen; its top, the keyboard line, sits at depth
+`line_z`, and the notes run from `line_z` (now) to `far_z = 1 / perspective_far` (now + note speed).
+
+- Whole-view height of depth z: `Y(z) = (1 − 1/z) / (1 − 1/far_z)`. With keyboard fraction `k`
+  (keyboard height / view height): `line_z = 1 / (1 − k·(1 − 1/far_z))`, so `Y(line_z) = k`.
+- Notes: `z = line_z + (far_z − line_z)·t/T`. In the note area (0 = keyboard line, 1 = top):
+  `y = (Y(z) − k) / (1 − k)`, `x = 0.5 + (x_key − 0.5)/z`.
+- Keys: a point at key fraction `x_key` and depth `d` down from the keyboard line (0..1) sits at
+  `z = line_z − d·(line_z − 1)`. Both keyboard styles become quads mapped corner by corner; the
+  classic one as an edge quad plus an inset body quad per key.
+- Shader: a `perspective_near` uniform (= `line_z`; below 1 counts as 1, so `NoteView::vertical`
+  is unchanged). Culling: `row_times` and friends take `Perspective { far, near }` instead of `far`.
+- Outside the trapezoid, the keyboard strip shows the dark background; no separator line (my call).
+
+Plan (native, TDD):
+1. `Perspective { far, near }` replaces the `far: f32` culling parameter; `row_times` inverts the
+   mapping above (test: near 1 reproduces today's rows; near 1.5 still spans now..now+T).
+2. Shader `perspective_near` (GlobalsUniform grows to 80 bytes) — GPU test: with near 1.5 a note
+   at the keyboard line spans x ≈ 0.33..0.5 instead of 0.25..0.5.
+3. `bend` for keyboard quads + classic keyboard as quads, drawn live (mesh) and in export
+   (`pfa::fill`) — test: the bottom row of an exported perspective frame is keyboard at x = 1,
+   while the keyboard line's row at x = 1 is background.
