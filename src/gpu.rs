@@ -928,10 +928,19 @@ pub struct Offscreen {
     stride: u32,
     width: u32,
     height: u32,
+    /// Tests: one GPU user at a time (parallel devices sometimes hung the whole test run).
+    /// Last, so it is released after the device.
+    #[cfg(test)]
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
+
+#[cfg(test)]
+static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Offscreen {
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
+        #[cfg(test)]
+        let serial = GPU_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = pollster_block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .map_err(|e| format!("no GPU adapter: {e}"))?;
@@ -952,7 +961,8 @@ impl Offscreen {
             label: Some("export.readback"), size: stride as u64 * height as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
         });
-        Ok(Self { device, queue, layers: vec![pipeline], color_texture, color, depth, readback, stride, width, height })
+        Ok(Self { device, queue, layers: vec![pipeline], color_texture, color, depth, readback, stride, width, height,
+            #[cfg(test)] _serial: serial })
     }
 
     /// Draws `layers` in order into `viewport` (x, y, width, height in pixels) and copies the
