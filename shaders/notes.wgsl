@@ -152,6 +152,8 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     var y = select(time_clip, key_clip, horizontal);
     // Clip-space size: across the keys, along time.
     var size = vec2<f32>(right - left, abs(start_clip - end_clip));
+    // The whole note's length in clip units along time (for `thin`).
+    var whole_px = whole_seconds / safe_height * 2.0;
     let perspective = globals.perspective_far > 0.0 && !horizontal;
     if (perspective) {
         // Time n (0 at the keyboard line, 1 at the top) is depth z = 1 + (Z - 1) n; a point
@@ -167,6 +169,8 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
         x = (0.5 + (key - 0.5) / z) * 2.0 - 1.0;
         y = select(y0, y1, uv.y > 0.5) * 2.0 - 1.0;
         size = vec2<f32>((key_pos.right - key_pos.left) * 2.0 / z0, (y1 - y0) * 2.0);
+        // A cut piece measures its whole note, scaled as at the piece's near end (dy/dt there).
+        whole_px = whole_seconds / safe_height * (far_z - 1.0) * up / (z0 * z0) * 2.0;
     }
     // Pixels along the key axis, then along the time axis.
     let win = select(vec2<f32>(globals.win_width, globals.win_height), vec2<f32>(globals.win_height, globals.win_width), horizontal);
@@ -191,7 +195,7 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     // Thin is under ~3.5 px. Flattened pieces measure the whole note (however much of it a
     // cut or the window shows); a whole length of 0 measures the clamped quad, as before.
     let measured = select(size.y * win.y,
-        whole_seconds / safe_height * win.y * 2.0, whole_seconds > 0.0 && !perspective);
+        whole_px * win.y, whole_seconds > 0.0);
     out.thin = select(0u, 1u, measured < 7.0);
     return out;
 }
@@ -199,12 +203,16 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
     var color = input.color;
+    // Perspective: a note is a trapezoid drawn as two triangles, so uv.x stretches differently in
+    // each; side borders are measured in screen pixels instead (uv.x per pixel, in this triangle).
+    let perspective = globals.perspective_far > 0.0 && globals.horizontal == 0u;
+    let uv_x_per_px = max(fwidth(input.uv.x), 1e-6);
 
     if (globals.flat_mode == 0u) {
         let srgb = input.color * input.color;
         let horiz_width_pixels = max(input.note_size.x * 0.5 * input.win_size.x, 1.0);
         let vert_width_pixels = max(input.note_size.y * 0.5 * input.win_size.y, 1.0);
-        let horiz_margin = input.border_width / horiz_width_pixels;
+        let horiz_margin = select(input.border_width / horiz_width_pixels, input.border_width * uv_x_per_px, perspective);
         let vert_margin = input.border_width / vert_width_pixels;
         let start_border = (input.edges & 1u) != 0u;
         let end_border = (input.edges & 2u) != 0u;
@@ -224,9 +232,13 @@ fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
     // Piano From Above: a border of the color at 20% brightness (key-width scaled, 1-3 px),
     // inside it a gradient from the full color on the left to 60% on the right.
     if (globals.flat_mode == 2u) {
-        let size_px = input.note_size * 0.5 * input.win_size;
+        var size_px = input.note_size * 0.5 * input.win_size;
         let d = clamp(round(size_px.x * 0.075), 1.0, 3.0);
-        let p = input.uv * size_px;
+        var p = input.uv * size_px;
+        if (perspective) {
+            size_px.x = 1.0 / uv_x_per_px;
+            p.x = input.uv.x * size_px.x;
+        }
         let border = p.x < d || p.x > size_px.x - d ||
             ((input.edges & 1u) != 0u && p.y < d) ||
             ((input.edges & 2u) != 0u && p.y > size_px.y - d);

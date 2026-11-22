@@ -1107,6 +1107,30 @@ mod tests {
     }
 
     #[test]
+    fn perspective_borders_are_even_on_both_sides() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        // Shaded: the inside is the colour squared (255 stays 255), the border 40 % of it.
+        let view = NoteView { flat_mode: 0, ..persp() };
+        let px = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 1.0, [255, 0, 0]), view }]);
+        // Row 10 is far up: the note spans about x 25.3..32 there.
+        assert!(px(25, 10)[0] < 150 && px(31, 10)[0] < 150, "both sides bordered: {:?} {:?}", px(25, 10), px(31, 10));
+        assert_eq!(px(28, 10)[0], 255);
+    }
+
+    #[test]
+    fn perspective_measures_cut_pieces_by_their_whole_note() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        // A 2 px piece of a half-second note: thin on screen, but not a thin note.
+        let whole = (0.5f32.to_bits() >> 16) << 16;
+        let start = NOW;
+        // A cut piece: no start border (bit 7), no end border (negative length).
+        let piece = NoteInstance { start_us: [start as u32, whole], len: -0.01, key_color: 60 | 0x80 | 255 << 24 };
+        let view = NoteView { flat_mode: 0, ..persp() };
+        let px = draw(&mut gpu, &[LayerDraw { instances: Arc::new(InstanceRing::from_ordered([piece])), view }]);
+        assert_eq!(px(24, 63)[0], 255, "drawn in its colour, not darkened as thin");
+    }
+
+    #[test]
     fn note_shader_is_valid() {
         use egui_wgpu::wgpu::naga;
         let module = naga::front::wgsl::parse_str(include_str!("../shaders/notes.wgsl")).unwrap();
