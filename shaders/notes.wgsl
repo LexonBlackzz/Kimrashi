@@ -27,6 +27,8 @@ struct Globals {
     brightness: f32,
     depth_base: f32,
     depth_scale: f32,
+    /// Perspective (vertical only): the far edge's width as a fraction of the near; 0 = off.
+    perspective_far: f32,
 };
 
 @group(0) @binding(0)
@@ -146,8 +148,26 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     let key_clip = left + (right - left) * uv.x;
     let time_clip = start_clip + (end_clip - start_clip) * uv.y;
     let horizontal = globals.horizontal != 0u;
-    let x = select(key_clip, time_clip, horizontal);
-    let y = select(time_clip, key_clip, horizontal);
+    var x = select(key_clip, time_clip, horizontal);
+    var y = select(time_clip, key_clip, horizontal);
+    // Clip-space size: across the keys, along time.
+    var size = vec2<f32>(right - left, abs(start_clip - end_clip));
+    let perspective = globals.perspective_far > 0.0 && !horizontal;
+    if (perspective) {
+        // Time n (0 at the keyboard line, 1 at the top) is depth z = 1 + (Z - 1) n; a point
+        // sits (1 - 1/z) / (1 - 1/Z) up the view, and its key position shrinks toward the centre by 1/z.
+        let far_z = 1.0 / globals.perspective_far;
+        let z0 = 1.0 + (far_z - 1.0) * clamp(start / safe_height, 0.0, 1.0);
+        let z1 = 1.0 + (far_z - 1.0) * clamp((start + note_length) / safe_height, 0.0, 1.0);
+        let up = 1.0 / (1.0 - 1.0 / far_z);
+        let y0 = (1.0 - 1.0 / z0) * up;
+        let y1 = (1.0 - 1.0 / z1) * up;
+        let z = select(z0, z1, uv.y > 0.5);
+        let key = key_pos.left + (key_pos.right - key_pos.left) * uv.x;
+        x = (0.5 + (key - 0.5) / z) * 2.0 - 1.0;
+        y = select(y0, y1, uv.y > 0.5) * 2.0 - 1.0;
+        size = vec2<f32>((key_pos.right - key_pos.left) * 2.0 / z0, (y1 - y0) * 2.0);
+    }
     // Pixels along the key axis, then along the time axis.
     let win = select(vec2<f32>(globals.win_width, globals.win_height), vec2<f32>(globals.win_height, globals.win_width), horizontal);
 
@@ -162,7 +182,7 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     out.clip_position = vec4<f32>(x, y, depth, 1.0);
     out.color = vec3<f32>(r, g, b);
     out.uv = uv;
-    out.note_size = vec2<f32>(right - left, abs(start_clip - end_clip));
+    out.note_size = size;
     out.win_size = win;
     out.time_norm = start_norm + (end_norm - start_norm) * uv.y;
     out.lit = select(0u, 1u, globals.playhead >= 0.0 && start_norm <= globals.playhead && end_norm >= globals.playhead);
@@ -170,8 +190,8 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     out.edges = edges;
     // Thin is under ~3.5 px. Flattened pieces measure the whole note (however much of it a
     // cut or the window shows); a whole length of 0 measures the clamped quad, as before.
-    let measured = select(abs(start_clip - end_clip) * win.y,
-        whole_seconds / safe_height * win.y * 2.0, whole_seconds > 0.0);
+    let measured = select(size.y * win.y,
+        whole_seconds / safe_height * win.y * 2.0, whole_seconds > 0.0 && !perspective);
     out.thin = select(0u, 1u, measured < 7.0);
     return out;
 }

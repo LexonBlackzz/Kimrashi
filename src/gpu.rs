@@ -282,7 +282,8 @@ struct GlobalsUniform {
     brightness: f32,
     depth_base: f32,
     depth_scale: f32,
-    _pad: [f32; 2],
+    perspective_far: f32,
+    _pad: [f32; 1],
 }
 
 /// How one layer of notes maps to the screen.
@@ -306,12 +307,14 @@ pub struct NoteView {
     pub brightness: f32,
     /// [base, scale]: this draw's depth range inside 0..1 (lower is nearer).
     pub depth: [f32; 2],
+    /// Perspective (vertical only): the far edge's width as a fraction of the near; 0 = off.
+    pub perspective_far: f32,
 }
 
 impl NoteView {
     pub fn vertical(height_time: f32, now_us: u64, direction_sign: f32, flat_mode: u32) -> Self {
         Self { height_time, now_us, time_shift: 0.0, direction_sign, flat_mode, horizontal: false,
-            playhead: -1.0, brightness: 1.0, depth: [0.0, 1.0] }
+            playhead: -1.0, brightness: 1.0, depth: [0.0, 1.0], perspective_far: 0.0 }
     }
 
     fn globals(&self, win_width: f32, win_height: f32) -> GlobalsUniform {
@@ -320,7 +323,7 @@ impl NoteView {
             flat_mode: self.flat_mode, instance_count: 0, // set in `upload`
             now_us: [self.now_us as u32, (self.now_us >> 32) as u32], time_shift: self.time_shift,
             horizontal: self.horizontal as u32, playhead: self.playhead, brightness: self.brightness,
-            depth_base: self.depth[0], depth_scale: self.depth[1], _pad: [0.0; 2],
+            depth_base: self.depth[0], depth_scale: self.depth[1], perspective_far: self.perspective_far, _pad: [0.0; 1],
         }
     }
 }
@@ -1077,6 +1080,30 @@ mod tests {
         let green = LayerDraw { view: NoteView { depth: [0.0, 0.5], ..green.view }, ..green };
         let [r, g, b] = draw(&mut gpu, &[red, green])(24, 48);
         assert!(r == 0 && b == 0 && (100..=140).contains(&g), "dim green wins: {r} {g} {b}");
+    }
+
+    fn persp() -> NoteView { NoteView { perspective_far: 0.3, ..NoteView::vertical(1.0, NOW, -1.0, 1) } }
+
+    #[test]
+    fn perspective_keeps_near_notes_and_squeezes_far_ones() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        let near = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 0.05, [255, 0, 0]), view: persp() }]);
+        assert_eq!(near(20, 62), [255, 0, 0]);
+        let far = draw(&mut gpu, &[LayerDraw { instances: one_note(0.9, 0.1, [255, 0, 0]), view: persp() }]);
+        assert_eq!((far(29, 1), far(18, 1)), ([255, 0, 0], [0, 0, 0]));
+        assert!((0..4).all(|y| (0..26).all(|x| far(x, y) == [0, 0, 0])), "far columns converge on the centre");
+    }
+
+    #[test]
+    fn perspective_clamps_sounding_notes_to_the_keyboard_line() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        let mut ring = InstanceRing::default();
+        ring.begin(0);
+        let start = NOW - 500_000;
+        ring.push(NoteInstance { start_us: [start as u32, 0], len: 0.6, key_color: 60 | 255 << 24 }, u64::MAX);
+        let px = draw(&mut gpu, &[LayerDraw { instances: Arc::new(ring), view: persp() }]);
+        assert_eq!(px(20, 62), [255, 0, 0]);
+        assert_eq!(px(20, 40), [0, 0, 0], "ends 0.1 s ahead, near the keyboard");
     }
 
     #[test]
