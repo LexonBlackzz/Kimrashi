@@ -27,6 +27,8 @@ pub enum ViewMode {
     Parallax,
     /// The vertical view at an angle: the note area narrows toward the top.
     Perspective,
+    /// Perspective with depth: notes are blocks, black keys stand up.
+    Blocks,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Debug)]

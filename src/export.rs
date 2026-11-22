@@ -185,7 +185,9 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         else { (height as f32 * 0.12) as u32 };
     let note_h = if horizontal || parallax { height } else { height - keyboard_h };
     // Perspective: one tilted plane, the keyboard's bottom edge full width (see `crate::Perspective`).
-    let persp = if cfg.look.view == ViewMode::Perspective { crate::Perspective::new(cfg.look.perspective_far, keyboard_h as f32 / height as f32) }
+    let persp = if matches!(cfg.look.view, ViewMode::Perspective | ViewMode::Blocks) { crate::Perspective {
+        block: if cfg.look.view == ViewMode::Blocks { crate::BLOCK_H } else { 0.0 },
+        ..crate::Perspective::new(cfg.look.perspective_far, keyboard_h as f32 / height as f32) } }
         else { crate::Perspective::OFF };
     let note_rect = match (horizontal, side) {
         _ if parallax || bare => [0, 0, width, height],
@@ -324,8 +326,8 @@ pub fn run_from_args() -> bool {
     let num = |name: &str, default: f32| value(name).map_or(default, |s| s.parse().unwrap_or_else(|_| panic!("bad {name}")));
     let mut look = crate::settings::Settings::load();
     if let Some(v) = value("--view") {
-        look.view = match v.as_str() { "vertical" => ViewMode::Vertical, "horizontal" => ViewMode::Horizontal, "parallax" => ViewMode::Parallax, "perspective" => ViewMode::Perspective,
-            _ => panic!("view: vertical, horizontal, parallax or perspective") };
+        look.view = match v.as_str() { "vertical" => ViewMode::Vertical, "horizontal" => ViewMode::Horizontal, "parallax" => ViewMode::Parallax, "perspective" => ViewMode::Perspective, "blocks" => ViewMode::Blocks,
+            _ => panic!("view: vertical, horizontal, parallax, perspective or blocks") };
     }
     if let Some(v) = value("--keyboard-side") {
         look.keyboard_side = match v.as_str() { "left" => KeyboardSide::Left, "right" => KeyboardSide::Right, _ => panic!("keyboard side: left or right") };

@@ -272,6 +272,8 @@ impl AppState {
                                 .on_hover_text("No keyboard: notes cross a line in the middle, every track at its own speed");
                             ui.selectable_value(&mut c.view, ViewMode::Perspective, "Perspective")
                                 .on_hover_text("The vertical view at an angle: far notes small at the top");
+                            ui.selectable_value(&mut c.view, ViewMode::Blocks, "Blocks")
+                                .on_hover_text("Perspective in 3D: notes are blocks, black keys stand up");
                         });
                         ui.end_row();
                         shown += 1;
@@ -299,7 +301,7 @@ impl AppState {
                             }
                             ui.end_row();
                         }
-                        if c.view == ViewMode::Perspective {
+                        if matches!(c.view, ViewMode::Perspective | ViewMode::Blocks) {
                             ui.label("Far width");
                             ui.add(egui::Slider::new(&mut c.perspective_far, 0.1..=0.9).fixed_decimals(2).suffix("×"))
                                 .on_hover_text("How wide the far (top) edge is, as a fraction of the keyboard's width");
@@ -781,7 +783,8 @@ pub(crate) fn draw_piano_roll(
     // Parallax: no keyboard, notes fill the view, a playhead down the middle.
     let in_parallax = view == crate::settings::ViewMode::Parallax;
     // Perspective: Vertical's layout, notes through the perspective (0 = off).
-    let perspective = view == crate::settings::ViewMode::Perspective;
+    let blocks = view == crate::settings::ViewMode::Blocks;
+    let perspective = blocks || view == crate::settings::ViewMode::Perspective;
     // Horizontal without its keyboard: notes run to the edge.
     let bare = side.is_some() && !horizontal_keyboard;
     if !in_parallax { parallax.clear(); }
@@ -792,7 +795,8 @@ pub(crate) fn draw_piano_roll(
     let classic_height = (rect.height() * 0.12).clamp(36.0, 120.0);
     let keyboard_height = classic_height + (crate::pfa::key_height(rect.height(), rect.width(), pitch_min, pitch_max) - classic_height) * eased;
     // Perspective: one tilted plane, the keyboard's bottom edge full width (see `crate::Perspective`).
-    let persp = if perspective { crate::Perspective::new(perspective_far, keyboard_height / rect.height().max(1.0)) }
+    let persp = if perspective { crate::Perspective { block: if blocks { crate::BLOCK_H } else { 0.0 },
+        ..crate::Perspective::new(perspective_far, keyboard_height / rect.height().max(1.0)) } }
         else { crate::Perspective::OFF };
     let keyboard_width = (rect.width() * 0.12).clamp(36.0, 120.0);
     let (note_area, keyboard_rect, edge) = match side {

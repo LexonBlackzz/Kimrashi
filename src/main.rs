@@ -795,15 +795,20 @@ fn drop_song_views(visible: &mut VisibleNotes, parallax: &mut parallax::Parallax
 pub(crate) struct Perspective {
     pub far: f32,
     pub near: f32,
+    /// Blocks view: notes and black keys stand this high (a fraction of the camera's height); 0 = flat.
+    pub block: f32,
 }
 
+/// Height of note blocks and raised black keys in the Blocks view (see `Perspective::lift`).
+pub(crate) const BLOCK_H: f32 = 0.015;
+
 impl Perspective {
-    pub const OFF: Self = Self { far: 0.0, near: 1.0 };
+    pub const OFF: Self = Self { far: 0.0, near: 1.0, block: 0.0 };
 
     /// With the keyboard `keyboard_frac` of the view's height (its top is the keyboard line).
     pub fn new(far: f32, keyboard_frac: f32) -> Self {
         let far = far.clamp(0.1, 0.9);
-        Self { far, near: 1.0 / (1.0 - keyboard_frac.clamp(0.0, 0.9) * (1.0 - far)) }
+        Self { far, near: 1.0 / (1.0 - keyboard_frac.clamp(0.0, 0.9) * (1.0 - far)), block: 0.0 }
     }
 
     pub fn is_on(&self) -> bool { self.far > 0.0 }
@@ -813,6 +818,9 @@ impl Perspective {
 
     /// Where key fraction `x` at depth `z` lands: (x, height), as fractions of the view.
     pub fn point(&self, x: f32, z: f32) -> (f32, f32) { (0.5 + (x - 0.5) / z, self.y_total(z)) }
+
+    /// `point` raised `h` off the plane (a fraction of the camera's height above it).
+    pub fn lift(&self, x: f32, z: f32, h: f32) -> (f32, f32) { (0.5 + (x - 0.5) / z, (1.0 - (1.0 - h) / z) / (1.0 - self.far)) }
 
     /// Tilts quads drawn flat in `keyboard` (the full width of `view`, its top the keyboard line)
     /// onto the plane: a point `d` of the way down the keyboard sits at depth `near - d (near - 1)`.
@@ -2824,11 +2832,21 @@ mod tests {
         let even = row_times(0, 1.0, 100, Perspective::OFF);
         assert_eq!((even[0], even[99]), (5_000, 995_000));
         for far in [0.1, 0.3, 0.9] {
-            let rows = row_times(0, 1.0, 100, Perspective { far, near: 1.0 });
+            let rows = row_times(0, 1.0, 100, Perspective { far, ..Perspective::OFF });
             assert!(rows.windows(2).all(|w| w[0] < w[1]) && rows[99] < 1_000_000, "{far}: {rows:?}");
             let (bottom, top) = (rows[1] - rows[0], rows[99] - rows[98]);
             if far == 0.3 { assert!(top > 5 * bottom, "{bottom} {top}"); }
         }
+    }
+
+    #[test]
+    fn lifted_points_rise_toward_the_camera() {
+        let p = Perspective::new(0.3, 0.15);
+        assert_eq!(p.lift(0.2, 1.5, 0.0), p.point(0.2, 1.5), "height 0 is the plane");
+        let (x, y) = p.lift(0.2, 1.5, BLOCK_H);
+        assert_eq!(x, p.point(0.2, 1.5).0, "lifting keeps x");
+        assert!(y > p.point(0.2, 1.5).1, "a lifted point sits higher");
+        assert!(p.lift(0.2, 3.0, BLOCK_H).1 - p.point(0.2, 3.0).1 < y - p.point(0.2, 1.5).1, "and less so farther away");
     }
 
     #[test]
@@ -2857,10 +2875,10 @@ mod tests {
     #[test]
     fn perspective_culling_keeps_every_row_winner() {
         let mut visible = indexed(random_notes(7), true);
-        visible.select_pixels(0, 5_000_000, 5.0, 200, Perspective { far: 0.3, near: 1.0 });
+        visible.select_pixels(0, 5_000_000, 5.0, 200, Perspective { far: 0.3, ..Perspective::OFF });
         assert!(visible.dense(5.0, 200));
         let selected: std::collections::HashSet<_> = visible.selected.iter().copied().collect();
-        for time in row_times(0, 5.0, 200, Perspective { far: 0.3, near: 1.0 }) {
+        for time in row_times(0, 5.0, 200, Perspective { far: 0.3, ..Perspective::OFF }) {
             for pitch in 59..=62 {
                 let newest = visible.window.entries().filter(|(_, n)| n.pitch == pitch && n.start_us <= time && time < n.end_us).map(|(i, _)| i).max();
                 if let Some(i) = newest { assert!(selected.contains(&i), "key {pitch} at {time} us: note {i} missing"); }
@@ -2871,7 +2889,7 @@ mod tests {
     #[test]
     fn switching_row_sampling_rebuilds_the_rows() {
         let mut visible = indexed(random_notes(9), true);
-        for far in [0.0, 0.3, 0.0] { visible.select_pixels(0, 5_000_000, 5.0, 200, Perspective { far, near: 1.0 }); }
+        for far in [0.0, 0.3, 0.0] { visible.select_pixels(0, 5_000_000, 5.0, 200, Perspective { far, ..Perspective::OFF }); }
         let mut fresh = indexed(random_notes(9), true);
         fresh.select_pixels(0, 5_000_000, 5.0, 200, Perspective::OFF);
         assert_eq!(visible.selected, fresh.selected);
