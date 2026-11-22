@@ -71,6 +71,8 @@ struct VertexOutput {
     @location(8) @interpolate(flat) lit: u32,
     /// Blocks: 0 top, 1 near end, 2 side.
     @location(9) @interpolate(flat) face: u32,
+    /// Perspective: the note's width in pixels here ((right - left)/z is affine on screen, so exact).
+    @location(10) width_px: f32,
 };
 
 fn microseconds_as_float(lo: u32, hi: u32) -> f32 {
@@ -164,8 +166,13 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     // The whole note's length in clip units along time (for `thin`).
     var whole_px = whole_seconds / safe_height * 2.0;
     let perspective = globals.perspective_far > 0.0 && !horizontal;
-    let face = input.vertex_index / 6u;
+    // Blocks, 6 vertices per piece: the top near and far of where sinking ends, the near end, the
+    // side (facing the centre line) near and far. `face` is what shading sees: top, near end, side.
+    let piece = input.vertex_index / 6u;
+    let face = select(select(0u, 1u, piece == 2u), 2u, piece >= 3u);
     var z_block = 1.0;
+    var uv_out = uv;
+    var width_px = 1e9;
     if (perspective) {
         // Time n (0 at the keyboard line, 1 at the top) is depth z = 1 + (Z - 1) n; a point
         // sits (1 - 1/z) / (1 - 1/Z) up the view, and its key position shrinks toward the centre by 1/z.
@@ -179,21 +186,30 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
         let line = (1.0 - 1.0 / line_z) * up;
         let y0 = ((1.0 - 1.0 / z0) * up - line) / (1.0 - line);
         let y1 = ((1.0 - 1.0 / z1) * up - line) / (1.0 - line);
-        var z = select(z0, z1, uv.y > 0.5);
-        var key = key_pos.left + (key_pos.right - key_pos.left) * uv.x;
         // Blocks: a point `lift` off the plane (camera height 1) sits (1 - (1 - lift)/z) up the view.
-        // Faces (6 vertices each): the top, the near end, the side facing the centre line.
-        var lift = globals.block_height;
+        // Over the last `sink` of depth before the keyboard line, blocks flatten onto the plane, so
+        // sounding notes meet their keys flush. Flat (no blocks): one piece, the whole note.
+        let sink = 0.06 * (far_z - line_z);
+        let zk = select(z1, clamp(line_z + sink, z0, z1), globals.block_height > 0.0);
+        let near_piece = piece == 0u || piece == 3u;
+        var z = select(select(zk, z0, near_piece), select(z1, zk, near_piece), uv.y > 0.5);
+        var key = key_pos.left + (key_pos.right - key_pos.left) * uv.x;
+        var tall = 1.0;
         if (face == 1u) {
+            // A cut piece (no start border) continues an older part: no near end (zero height).
             z = z0;
-            lift = globals.block_height * uv.y;
+            tall = select(0.0, uv.y, (edges & 1u) != 0u);
         } else if (face == 2u) {
             key = select(key_pos.left, key_pos.right, key_pos.left + key_pos.right < 1.0);
-            lift = globals.block_height * uv.x;
+            tall = uv.x;
         }
+        let lift = globals.block_height * clamp((z - line_z) / max(sink, 1e-6), 0.0, 1.0) * tall;
+        // The top's two pieces share the note's uv (borders at its real ends, not at the split).
+        if (face == 0u && globals.block_height > 0.0) { uv_out.y = (z - z0) / max(z1 - z0, 1e-6); }
         x = (0.5 + (key - 0.5) / z) * 2.0 - 1.0;
         y = ((1.0 - (1.0 - lift) / z) * up - line) / (1.0 - line) * 2.0 - 1.0;
         z_block = z;
+        width_px = (key_pos.right - key_pos.left) / z * globals.win_width;
         size = vec2<f32>((key_pos.right - key_pos.left) * 2.0 / z0, (y1 - y0) * 2.0);
         // A cut piece measures its whole note, scaled as at the piece's near end (dy/dt there).
         whole_px = whole_seconds / safe_height * (far_z - line_z) * up / (z0 * z0) / (1.0 - line) * 2.0;
@@ -217,7 +233,8 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     }
     out.clip_position = vec4<f32>(x, y, depth, 1.0);
     out.color = vec3<f32>(r, g, b);
-    out.uv = uv;
+    out.uv = uv_out;
+    out.width_px = width_px;
     out.note_size = size;
     out.win_size = win;
     out.time_norm = start_norm + (end_norm - start_norm) * uv.y;
@@ -240,6 +257,9 @@ fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
     // each; side borders are measured in screen pixels instead (uv.x per pixel, in this triangle).
     let perspective = globals.perspective_far > 0.0 && globals.horizontal == 0u;
     let uv_x_per_px = max(fwidth(input.uv.x), 1e-6);
+    // Perspective: a far note under 8 px wide fades to its border colour (all of it under 5.5 px). Its inside would be a
+    // pixel or two that comes and goes with alignment, drawing moire swirls across the distance.
+    let narrow = select(1.0, smoothstep(5.5, 8.0, input.width_px), perspective);
 
     if (globals.flat_mode == 0u) {
         let srgb = input.color * input.color;
@@ -260,6 +280,7 @@ fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
         } else {
             color = srgb;
         }
+        color = mix(dark, color, narrow);
     }
 
     // Piano From Above: a border of the color at 20% brightness (key-width scaled, 1-3 px),
@@ -276,6 +297,7 @@ fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
             ((input.edges & 1u) != 0u && p.y < d) ||
             ((input.edges & 2u) != 0u && p.y > size_px.y - d);
         color = select(input.color * mix(1.0, 0.6, input.uv.x), input.color * 0.2, border || input.thin != 0u);
+        color = mix(input.color * 0.2, color, narrow);
     }
 
     // Blocks: the near end and side are the base colour, darkened.

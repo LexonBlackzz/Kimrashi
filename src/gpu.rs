@@ -432,7 +432,7 @@ struct NotePipeline {
     instance_capacity: usize,
     /// Instances uploaded this frame (may be fewer than requested, see `upload`).
     instance_count: u32,
-    /// Vertices per instance: 6 (a quad), or 18 for a block's three visible faces.
+    /// Vertices per instance: 6 (a quad), or 30 for a block's pieces (see the note shader).
     vertices: u32,
     uploaded: Option<Weak<InstanceRing>>,
     versions: Vec<u64>,
@@ -696,7 +696,7 @@ impl NotePipeline {
             self.uploaded = Some(source);
         }
         globals.instance_count = self.instance_count;
-        self.vertices = if globals.block_height > 0.0 { 18 } else { 6 };
+        self.vertices = if globals.block_height > 0.0 { 30 } else { 6 };
         queue.write_buffer(&self.key_buffer, 0, bytemuck::cast_slice(&keys[..]));
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
     }
@@ -1123,9 +1123,9 @@ mod tests {
         // Shaded: the inside is the colour squared (255 stays 255), the border 40 % of it.
         let view = NoteView { flat_mode: 0, ..persp() };
         let px = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 1.0, [255, 0, 0]), view }]);
-        // Row 10 is far up: the note spans about x 25.3..32 there.
-        assert!(px(25, 10)[0] < 150 && px(31, 10)[0] < 150, "both sides bordered: {:?} {:?}", px(25, 10), px(31, 10));
-        assert_eq!(px(28, 10)[0], 255);
+        // Row 20: the note spans about x 23.6..32 there (8.4 px, wide enough not to fade).
+        assert!(px(24, 20)[0] < 150 && px(31, 20)[0] < 150, "both sides bordered: {:?} {:?}", px(24, 20), px(31, 20));
+        assert_eq!(px(28, 20)[0], 255);
     }
 
     #[test]
@@ -1155,13 +1155,31 @@ mod tests {
     #[test]
     fn blocks_stand_up_from_the_plane() {
         let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
-        // The note ends at depth 1.7: flat at row ~26, its top's far edge lifted to row ~18.
-        let flat = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 0.3, [255, 0, 0]), view: persp() }]);
-        let raised = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 0.3, [255, 0, 0]), view: blocks() }]);
-        assert_eq!((flat(27, 22), raised(27, 22)), ([0, 0, 0], [255, 0, 0]), "the top rises above the flat note");
-        // Below the top's near edge (row ~50) is the near-end face, darker than the top.
-        let [r, g, b] = raised(24, 58);
+        // In flight 0.2..0.5 s ahead: flat it spans rows ~35..15, its top lifted to rows ~26..8.
+        let flat = draw(&mut gpu, &[LayerDraw { instances: one_note(0.2, 0.3, [255, 0, 0]), view: persp() }]);
+        let raised = draw(&mut gpu, &[LayerDraw { instances: one_note(0.2, 0.3, [255, 0, 0]), view: blocks() }]);
+        assert_eq!((flat(28, 12), raised(28, 12)), ([0, 0, 0], [255, 0, 0]), "the top rises above the flat note");
+        // Below the top's near edge is the near-end face, darker than the top.
+        let [r, g, b] = raised(26, 30);
         assert!((170..=190).contains(&r) && g == 0 && b == 0, "near face {:?}", [r, g, b]);
+    }
+
+    #[test]
+    fn cut_pieces_have_no_near_end() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        // Bit 7: the piece continues an older part of its note, so it has no near end of its own.
+        let start = NOW + 200_000;
+        let piece = NoteInstance { start_us: [start as u32, 0], len: 0.3, key_color: 60 | 0x80 | 255 << 24 };
+        let px = draw(&mut gpu, &[LayerDraw { instances: Arc::new(InstanceRing::from_ordered([piece])), view: blocks() }]);
+        assert_eq!(px(26, 30), [0, 0, 0]);
+    }
+
+    #[test]
+    fn sounding_blocks_sink_into_the_keyboard() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        // At the keyboard line a sounding block is flat: its top, not a near-end wall.
+        let px = draw(&mut gpu, &[LayerDraw { instances: one_note(-0.1, 0.4, [255, 0, 0]), view: blocks() }]);
+        assert_eq!(px(20, 62), [255, 0, 0]);
     }
 
     #[test]
@@ -1173,6 +1191,17 @@ mod tests {
         let ring = Arc::new(InstanceRing::from_ordered([n(0.3, 0x00FF00), n(0.0, 0xFF0000)]));
         let px = draw(&mut gpu, &[LayerDraw { instances: ring, view: blocks() }]);
         assert_eq!(px(27, 22), [255, 0, 0]);
+    }
+
+    #[test]
+    fn perspective_keeps_narrow_far_notes_dark() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        // Near the far edge (rows 1..3) this note is about 5 px wide: a 1 px PFA border leaves a
+        // 1..3 px inside that comes and goes with pixel alignment (moire). It should be border colour (20 %).
+        let view = NoteView { flat_mode: 2, ..persp() };
+        let px = draw(&mut gpu, &[LayerDraw { instances: one_note(0.8, 0.2, [255, 0, 0]), view }]);
+        let brightest = (1..4).flat_map(|y| (24..40).map(move |x| (x, y))).map(|(x, y)| px(x, y)[0]).max().unwrap();
+        assert!((40..=60).contains(&brightest), "brightest {brightest}");
     }
 
     #[test]
