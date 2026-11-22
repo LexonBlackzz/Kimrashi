@@ -93,7 +93,7 @@ impl Parallax {
             // ponytail: near the start, pixel culling maps rows from the clamped origin, up to
             // `time_shift` off; it only picks which overlapping notes survive for those seconds.
             layer.visible.advance(&song.data, origin, window_end, 2 * half_us / time_px.max(1) as u64);
-            build_note_instances(song, &mut layer.visible, origin, window_end, height_time, time_px, piano_layout, &mut layer.instances);
+            build_note_instances(song, &mut layer.visible, origin, window_end, height_time, time_px, piano_layout, 0.0, &mut layer.instances);
             if max_instances > 0 && used + layer.instances.len() > max_instances {
                 Arc::make_mut(&mut layer.instances).cap(max_instances - used, origin, piano_layout);
             }

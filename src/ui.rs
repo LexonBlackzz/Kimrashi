@@ -880,7 +880,7 @@ pub(crate) fn draw_piano_roll(
             let t0 = Instant::now();
 
             (active_keys, active_colors) = build_note_instances(
-                song, visible, now_us, window_end, speed, time_px as u32, piano_layout, instances,
+                song, visible, now_us, window_end, speed, time_px as u32, piano_layout, 0.0, instances,
             );
 
             times.build = t0.elapsed();
