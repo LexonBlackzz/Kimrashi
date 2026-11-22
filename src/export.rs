@@ -282,7 +282,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         } else if persp.is_on() {
             let pt = |x: u32, y: u32| egui::pos2(x as f32, y as f32);
             let kb = egui::Rect::from_min_max(pt(0, note_h), pt(width, height));
-            fill_rect(&mut frame, width, kb, [10, 10, 12]);
+            fill_rect(&mut frame, width, kb, [20, 20, 24]);
             let mut quads = if look.pfa_style {
                 let (whites, sharps) = crate::pfa::layout(piano.then_some(&columns), lo, hi, 0.0, width as f32);
                 let lit = |p: u8| active[p as usize].then(|| { let c = colors[p as usize]; if c == egui::Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] } });
@@ -428,7 +428,7 @@ mod tests {
     fn perspective_export_bends_the_keyboard() {
         let look = crate::settings::Settings { view: ViewMode::Perspective, ..Default::default() };
         let Some(frame) = first_frame("kimrashi-perspective-keys", look, 5.0) else { return };
-        assert_ne!(pixel(&frame, 1, 89), [10, 10, 12], "the bottom edge is full width");
-        assert_eq!(pixel(&frame, 1, 81), [10, 10, 12], "the keyboard line is narrower: background beside it");
+        assert_ne!(pixel(&frame, 1, 89), [20, 20, 24], "the bottom edge is full width");
+        assert_eq!(pixel(&frame, 1, 81), [20, 20, 24], "the keyboard line is narrower: background beside it");
     }
 }
