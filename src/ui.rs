@@ -262,7 +262,7 @@ impl AppState {
                 egui::Grid::new("settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     use SettingsTab::*;
                     let c = &mut self.cfg;
-                    if show(Display, "View vertical horizontal parallax") {
+                    if show(Display, "View vertical horizontal parallax perspective") {
                         use crate::settings::{KeyboardSide, ViewMode};
                         ui.label("View");
                         ui.horizontal(|ui| {
@@ -270,6 +270,8 @@ impl AppState {
                             ui.selectable_value(&mut c.view, ViewMode::Horizontal, "Horizontal");
                             ui.selectable_value(&mut c.view, ViewMode::Parallax, "Parallax")
                                 .on_hover_text("No keyboard: notes cross a line in the middle, every track at its own speed");
+                            ui.selectable_value(&mut c.view, ViewMode::Perspective, "Perspective")
+                                .on_hover_text("The vertical view at an angle: far notes small at the top");
                         });
                         ui.end_row();
                         shown += 1;
@@ -295,6 +297,12 @@ impl AppState {
                                 ui.data_mut(|d| d.remove::<f32>(id));
                                 c.parallax_far = far;
                             }
+                            ui.end_row();
+                        }
+                        if c.view == ViewMode::Perspective {
+                            ui.label("Far width");
+                            ui.add(egui::Slider::new(&mut c.perspective_far, 0.1..=0.9).fixed_decimals(2).suffix("×"))
+                                .on_hover_text("How wide the far (top) edge is, as a fraction of the keyboard's width");
                             ui.end_row();
                         }
                     }

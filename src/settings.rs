@@ -25,6 +25,8 @@ pub enum ViewMode {
     Horizontal,
     /// No keyboard; a playhead in the middle, every track at its own speed.
     Parallax,
+    /// The vertical view at an angle: the note area narrows toward the top.
+    Perspective,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Debug)]
@@ -44,6 +46,8 @@ pub struct Settings {
     pub horizontal_keyboard: bool,
     /// Parallax: the farthest track's speed, as a fraction of the nearest's.
     pub parallax_far: f32,
+    /// Perspective: the far (top) edge's width, as a fraction of the bottom.
+    pub perspective_far: f32,
     pub note_speed: f32,
     pub notes_rise: bool,
     pub piano_layout: bool,
@@ -92,6 +96,7 @@ impl Default for Settings {
             keyboard_side: KeyboardSide::Left,
             horizontal_keyboard: true,
             parallax_far: 0.3,
+            perspective_far: 0.3,
             note_speed: 5.0,
             notes_rise: false,
             piano_layout: false,
@@ -184,6 +189,12 @@ mod tests {
         assert_eq!((s.view, s.keyboard_side, s.parallax_far), (ViewMode::Vertical, KeyboardSide::Left, 0.3));
         let back: Settings = serde_json::from_str(&serde_json::to_string(&Settings { view: ViewMode::Parallax, ..s.clone() }).unwrap()).unwrap();
         assert_eq!(back.view, ViewMode::Parallax);
+    }
+
+    #[test]
+    fn perspective_settings_default_and_round_trip() {
+        let s = Settings::from_json(r#"{"view":"Perspective"}"#);
+        assert_eq!((s.view, s.perspective_far), (ViewMode::Perspective, 0.3));
     }
 
     #[test]
