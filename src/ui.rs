@@ -274,11 +274,12 @@ impl AppState {
                         ui.end_row();
                         shown += 1;
                         if c.view == ViewMode::Horizontal {
-                            ui.label("Keyboard side");
+                            ui.label("Keyboard");
                             ui.horizontal(|ui| {
                                 ui.selectable_value(&mut c.keyboard_side, KeyboardSide::Left, "Left");
                                 ui.selectable_value(&mut c.keyboard_side, KeyboardSide::Right, "Right");
-                            });
+                                ui.checkbox(&mut c.horizontal_keyboard, "Show");
+                            }).response.on_hover_text("Which side notes travel to; hide the keyboard and they run to that edge");
                             ui.end_row();
                         }
                         if c.view == ViewMode::Parallax {
@@ -751,7 +752,7 @@ pub(crate) fn draw_piano_roll(
     notes_upwards: bool,
     note_mode: u32,
     piano_layout: bool,
-    (view, keyboard_side, parallax_far): (crate::settings::ViewMode, KeyboardSide, f32),
+    (view, keyboard_side, parallax_far, horizontal_keyboard): (crate::settings::ViewMode, KeyboardSide, f32, bool),
     (stats_mode, synth_stats): (StatsMode, bool),
     visible: &mut VisibleNotes,
     parallax: &mut crate::parallax::Parallax,
@@ -771,6 +772,8 @@ pub(crate) fn draw_piano_roll(
     let side = (view == crate::settings::ViewMode::Horizontal).then_some(keyboard_side);
     // Parallax: no keyboard, notes fill the view, a playhead down the middle.
     let in_parallax = view == crate::settings::ViewMode::Parallax;
+    // Horizontal without its keyboard: notes run to the edge.
+    let bare = side.is_some() && !horizontal_keyboard;
     if !in_parallax { parallax.clear(); }
     // The keyboard grows to PFA's size and back, easing out in both directions.
     let pfa = note_mode == 2 && side.is_none() && !in_parallax;
@@ -780,7 +783,7 @@ pub(crate) fn draw_piano_roll(
     let keyboard_height = classic_height + (crate::pfa::key_height(rect.height(), rect.width(), pitch_min, pitch_max) - classic_height) * eased;
     let keyboard_width = (rect.width() * 0.12).clamp(36.0, 120.0);
     let (note_area, keyboard_rect, edge) = match side {
-        _ if in_parallax => (rect, Rect::from_min_max(rect.max, rect.max), [rect.max, rect.max]),
+        _ if in_parallax || bare => (rect, Rect::from_min_max(rect.max, rect.max), [rect.max, rect.max]),
         None => {
             let y = rect.bottom() - keyboard_height;
             (Rect::from_min_max(rect.min, Pos2::new(rect.right(), y)), Rect::from_min_max(Pos2::new(rect.left(), y), rect.max),
@@ -836,7 +839,7 @@ pub(crate) fn draw_piano_roll(
         }
     }
 
-    if !in_parallax { painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210))); }
+    if !in_parallax && !bare { painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210))); }
 
     if let Some(song) = song {
         let ppp = ui.ctx().pixels_per_point();
@@ -905,7 +908,7 @@ pub(crate) fn draw_piano_roll(
         over.multiply_opacity(eased);
         draw_pfa_keyboard(&over, keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors);
     }
-    if eased < 1.0 && !in_parallax {
+    if eased < 1.0 && !in_parallax && !bare {
         draw_keyboard(
             &painter,
             keyboard_rect,

@@ -175,13 +175,15 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     // Parallax: no keyboard, notes fill the frame, a playhead down the middle.
     let parallax = cfg.look.view == ViewMode::Parallax;
     let (horizontal, side) = (cfg.look.view == ViewMode::Horizontal, cfg.look.keyboard_side);
-    let keyboard_h = if parallax { 0 }
+    // Horizontal without its keyboard: notes run to the edge.
+    let bare = horizontal && !cfg.look.horizontal_keyboard;
+    let keyboard_h = if parallax || bare { 0 }
         else if horizontal { (width as f32 * 0.12) as u32 }
         else if cfg.look.pfa_style { crate::pfa::key_height(height as f32, width as f32, visual.pitch_min, visual.pitch_max) as u32 }
         else { (height as f32 * 0.12) as u32 };
     let note_h = if horizontal || parallax { height } else { height - keyboard_h };
     let note_rect = match (horizontal, side) {
-        _ if parallax => [0, 0, width, height],
+        _ if parallax || bare => [0, 0, width, height],
         (false, _) => [0, 0, width, note_h],
         (true, KeyboardSide::Left) => [keyboard_h + 1, 0, width - keyboard_h - 1, height],
         (true, KeyboardSide::Right) => [0, 0, width - keyboard_h - 1, height],
@@ -265,6 +267,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         if parallax {
             let x = width / 2;
             fill(&mut frame, width, (x - 1) as f32, (x + 1) as f32, 0, height, [255, 220, 140]);
+        } else if bare {
         } else if horizontal {
             let (line, strip) = match side { KeyboardSide::Left => (keyboard_h, 0), KeyboardSide::Right => (width - keyboard_h - 1, width - keyboard_h) };
             fill(&mut frame, width, line as f32, (line + 1) as f32, 0, height, [200, 200, 210]);
@@ -379,5 +382,12 @@ mod tests {
         let Some(frame) = first_frame("kimrashi-parallax", look) else { return };
         assert_eq!(pixel(&frame, 80, 45), [255, 220, 140], "playhead in the middle");
         assert_eq!(pixel(&frame, 20, 85), [20, 20, 24], "no keyboard along the bottom");
+    }
+    #[test]
+    fn horizontal_export_can_hide_the_keyboard() {
+        let look = crate::settings::Settings { view: ViewMode::Horizontal, keyboard_side: KeyboardSide::Right,
+            horizontal_keyboard: false, ..Default::default() };
+        let Some(frame) = first_frame("kimrashi-horizontal-bare", look) else { return };
+        assert_eq!(pixel(&frame, 155, 45), [20, 20, 24], "notes reach the edge, no keyboard");
     }
 }

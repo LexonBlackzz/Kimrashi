@@ -40,6 +40,8 @@ pub struct Settings {
     // Display
     pub view: ViewMode,
     pub keyboard_side: KeyboardSide,
+    /// Horizontal: draw the keyboard (off: notes run to the edge).
+    pub horizontal_keyboard: bool,
     /// Parallax: the farthest track's speed, as a fraction of the nearest's.
     pub parallax_far: f32,
     pub note_speed: f32,
@@ -88,6 +90,7 @@ impl Default for Settings {
         Self {
             view: ViewMode::Vertical,
             keyboard_side: KeyboardSide::Left,
+            horizontal_keyboard: true,
             parallax_far: 0.3,
             note_speed: 5.0,
             notes_rise: false,
