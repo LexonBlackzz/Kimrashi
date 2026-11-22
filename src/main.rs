@@ -95,7 +95,21 @@ const SEEK_STEP_US: u64 = 5_000_000;
 const SYNTH_LIMIT_OFF: f64 = 20_000_000.0;
 const NOTE_HOLD_MICROS: u64 = 1_000; // keep notes visible 1ms after Note Off to avoid abrupt drop
 
+/// Warnings and errors from wgpu, egui and the rest, to stderr: on an old GPU this is where its
+/// driver says what it can't do.
+struct StderrLog;
+
+impl log::Log for StderrLog {
+    fn enabled(&self, m: &log::Metadata) -> bool { m.level() <= log::Level::Warn }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) { eprintln!("{} {}: {}", r.level(), r.target(), r.args()); }
+    }
+    fn flush(&self) {}
+}
+
 fn main() {
+    static LOG: StderrLog = StderrLog;
+    if log::set_logger(&LOG).is_ok() { log::set_max_level(log::LevelFilter::Warn); }
     let _timer = create_timer_guard();
     if bench::run_from_args() || export::run_from_args() || render_bench::run_from_args() || render_bench::run_seek_from_args() || benchmark::run_from_args() || update::run_from_args() {
         return;
@@ -197,7 +211,12 @@ fn main() {
     let _ = eframe::run_native(
         "kimrashi",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            if let Some(rs) = &cc.wgpu_render_state {
+                let (info, limits) = (rs.adapter.get_info(), rs.device.limits());
+                eprintln!("GPU: {} ({:?}, driver {} {}), max texture {} px", info.name, info.backend,
+                    info.driver, info.driver_info, limits.max_texture_dimension_2d);
+            }
             let timer_guard = create_timer_guard();
             let mut state = AppState {
                 telemetry_rx,

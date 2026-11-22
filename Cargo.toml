@@ -11,6 +11,7 @@ name = "kimrashi-sign"
 path = "tools/sign.rs"
 
 [dependencies]
+log = "0.4"
 libloading = "0.8.9"
 crossbeam-channel = "0.5.15"
 eframe = { version = "0.32.3", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }

@@ -1847,6 +1847,7 @@ dependencies = [
  "flpkit",
  "libloading",
  "liblzma",
+ "log",
  "lzma-rust2",
  "memchr",
  "png",
