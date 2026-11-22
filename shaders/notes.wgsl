@@ -20,6 +20,13 @@ struct Globals {
     now_lo: u32,
     now_hi: u32,
     time_shift: f32,
+    /// 1: the time axis runs across the screen and the keys up it (low pitch at the bottom).
+    horizontal: u32,
+    /// Fraction of the time axis where notes light up and the past fades; < 0 = none.
+    playhead: f32,
+    brightness: f32,
+    depth_base: f32,
+    depth_scale: f32,
 };
 
 @group(0) @binding(0)
@@ -51,6 +58,8 @@ struct VertexOutput {
     @location(4) border_width: f32,
     @location(5) @interpolate(flat) edges: u32,
     @location(6) @interpolate(flat) thin: u32,
+    @location(7) time_norm: f32,
+    @location(8) @interpolate(flat) lit: u32,
 };
 
 fn microseconds_as_float(lo: u32, hi: u32) -> f32 {
@@ -134,8 +143,13 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     start_clip = clamp(start_clip, -1.0, 1.0);
     end_clip = clamp(end_clip, -1.0, 1.0);
 
-    let x = left + (right - left) * uv.x;
-    let y = start_clip + (end_clip - start_clip) * uv.y;
+    let key_clip = left + (right - left) * uv.x;
+    let time_clip = start_clip + (end_clip - start_clip) * uv.y;
+    let horizontal = globals.horizontal != 0u;
+    let x = select(key_clip, time_clip, horizontal);
+    let y = select(time_clip, key_clip, horizontal);
+    // Pixels along the key axis, then along the time axis.
+    let win = select(vec2<f32>(globals.win_width, globals.win_height), vec2<f32>(globals.win_height, globals.win_width), horizontal);
 
     let r = f32((color_packed >> 16u) & 0xFFu) / 255.0;
     let g = f32((color_packed >> 8u) & 0xFFu) / 255.0;
@@ -144,18 +158,20 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     // Instances arrive newest (topmost) first: increasing depth, so with a Less depth
     // test, notes drawn later only fill pixels no newer note already covers.
-    let depth = (f32(input.instance_index) + 1.0) / (f32(globals.instance_count) + 2.0);
+    let depth = globals.depth_base + globals.depth_scale * (f32(input.instance_index) + 1.0) / (f32(globals.instance_count) + 2.0);
     out.clip_position = vec4<f32>(x, y, depth, 1.0);
     out.color = vec3<f32>(r, g, b);
     out.uv = uv;
     out.note_size = vec2<f32>(right - left, abs(start_clip - end_clip));
-    out.win_size = vec2<f32>(globals.win_width, globals.win_height);
+    out.win_size = win;
+    out.time_norm = start_norm + (end_norm - start_norm) * uv.y;
+    out.lit = select(0u, 1u, globals.playhead >= 0.0 && start_norm <= globals.playhead && end_norm >= globals.playhead);
     out.border_width = 1.0;
     out.edges = edges;
     // Thin is under ~3.5 px. Flattened pieces measure the whole note (however much of it a
     // cut or the window shows); a whole length of 0 measures the clamped quad, as before.
-    let measured = select(abs(start_clip - end_clip) * globals.win_height,
-        whole_seconds / safe_height * globals.win_height * 2.0, whole_seconds > 0.0);
+    let measured = select(abs(start_clip - end_clip) * win.y,
+        whole_seconds / safe_height * win.y * 2.0, whole_seconds > 0.0);
     out.thin = select(0u, 1u, measured < 7.0);
     return out;
 }
@@ -197,5 +213,12 @@ fn fs_notes(input: VertexOutput) -> @location(0) vec4<f32> {
         color = select(input.color * mix(1.0, 0.6, input.uv.x), input.color * 0.2, border || input.thin != 0u);
     }
 
-    return vec4<f32>(color, 1.0);
+    // Parallax: a note on the playhead is lit, and the past fades out toward the edge.
+    if (input.lit != 0u) {
+        color = mix(color, vec3<f32>(1.0), 0.4);
+    }
+    if (globals.playhead > 0.0 && input.time_norm < globals.playhead) {
+        color = color * mix(0.15, 1.0, input.time_norm / globals.playhead);
+    }
+    return vec4<f32>(color * globals.brightness, 1.0);
 }

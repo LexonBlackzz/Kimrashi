@@ -277,7 +277,59 @@ struct GlobalsUniform {
     now_us: [u32; 2],
     /// Seconds added to every note's start: negative song time (export lead-in).
     time_shift: f32,
-    _pad: [f32; 3],
+    horizontal: u32,
+    playhead: f32,
+    brightness: f32,
+    depth_base: f32,
+    depth_scale: f32,
+    _pad: [f32; 2],
+}
+
+/// How one layer of notes maps to the screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteView {
+    /// Seconds the time axis spans.
+    pub height_time: f32,
+    /// Song time at the time axis origin.
+    pub now_us: u64,
+    /// Seconds added to every start (negative song time).
+    pub time_shift: f32,
+    /// Vertical: +1 rise, -1 fall. Horizontal: +1 origin at the right, -1 at the left.
+    pub direction_sign: f32,
+    /// 0 shaded, 1 flat, 2 Piano From Above.
+    pub flat_mode: u32,
+    /// The time axis runs across the screen, the keys up it (low pitch at the bottom).
+    pub horizontal: bool,
+    /// Fraction of the time axis where notes light up and the past fades; < 0 = none.
+    pub playhead: f32,
+    /// Colour multiplier, 1.0 = unchanged.
+    pub brightness: f32,
+    /// [base, scale]: this draw's depth range inside 0..1 (lower is nearer).
+    pub depth: [f32; 2],
+}
+
+impl NoteView {
+    pub fn vertical(height_time: f32, now_us: u64, direction_sign: f32, flat_mode: u32) -> Self {
+        Self { height_time, now_us, time_shift: 0.0, direction_sign, flat_mode, horizontal: false,
+            playhead: -1.0, brightness: 1.0, depth: [0.0, 1.0] }
+    }
+
+    fn globals(&self, win_width: f32, win_height: f32) -> GlobalsUniform {
+        GlobalsUniform {
+            height_time: self.height_time.max(1e-6), win_width, win_height, direction_sign: self.direction_sign,
+            flat_mode: self.flat_mode, instance_count: 0, // set in `upload`
+            now_us: [self.now_us as u32, (self.now_us >> 32) as u32], time_shift: self.time_shift,
+            horizontal: self.horizontal as u32, playhead: self.playhead, brightness: self.brightness,
+            depth_base: self.depth[0], depth_scale: self.depth[1], _pad: [0.0; 2],
+        }
+    }
+}
+
+/// One layer to draw: its notes and how they map to the screen.
+#[derive(Clone)]
+pub struct LayerDraw {
+    pub instances: Arc<InstanceRing>,
+    pub view: NoteView,
 }
 
 /// Depth buffer bits requested from eframe (see `NativeOptions::depth_buffer`), and
@@ -288,41 +340,28 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub struct NotesCallback {
     viewport: egui::Rect,
     target_format: wgpu::TextureFormat,
+    /// Which of this frame's layers: each has its own GPU buffers.
+    layer: usize,
     instances: Arc<InstanceRing>,
     key_positions: [KeyPosition; 256],
-    height_time: f32,
-    now_us: u64,
-    direction_sign: f32,
-    /// 0 shaded, 1 flat, 2 Piano From Above.
-    flat_mode: u32,
+    view: NoteView,
 }
 
 impl NotesCallback {
     pub fn new(
         viewport: egui::Rect,
         target_format: wgpu::TextureFormat,
+        layer: usize,
         instances: Arc<InstanceRing>,
         key_positions: [KeyPosition; 256],
-        height_time: f32,
-        now_us: u64,
-        direction_sign: f32,
-        flat_mode: u32,
+        view: NoteView,
     ) -> egui::PaintCallback {
-        Callback::new_paint_callback(
-            viewport,
-            Self {
-                viewport,
-                target_format,
-                instances,
-                key_positions,
-                height_time: height_time.max(1e-6),
-                now_us,
-                direction_sign,
-                flat_mode,
-            },
-        )
+        Callback::new_paint_callback(viewport, Self { viewport, target_format, layer, instances, key_positions, view })
     }
 }
+
+/// One compiled pipeline's buffer sets, one per layer (see `NotesCallback::layer`).
+struct NotePipelines(Vec<NotePipeline>);
 
 impl CallbackTrait for NotesCallback {
     fn prepare(
@@ -343,24 +382,17 @@ impl CallbackTrait for NotesCallback {
         let win_width = viewport_px.width_px.max(1) as f32;
         let win_height = viewport_px.height_px.max(1) as f32;
 
-        let globals = GlobalsUniform {
-            height_time: self.height_time,
-            win_width,
-            win_height,
-            direction_sign: self.direction_sign,
-            flat_mode: self.flat_mode,
-            instance_count: 0, // set in `upload`
-            now_us: [self.now_us as u32, (self.now_us >> 32) as u32],
-            time_shift: 0.0,
-            _pad: [0.0; 3],
-        };
+        let globals = self.view.globals(win_width, win_height);
 
-        let pipeline = resources
-            .entry::<NotePipeline>()
-            .or_insert_with(|| NotePipeline::new(device, self.target_format));
-
-        pipeline.ensure_format(device, self.target_format);
-        pipeline.upload(device, queue, &self.instances, &self.key_positions, globals);
+        let layers = &mut resources
+            .entry::<NotePipelines>()
+            .or_insert_with(|| NotePipelines(vec![NotePipeline::new(device, self.target_format)])).0;
+        if layers[0].target_format != self.target_format {
+            layers.clear();
+            layers.push(NotePipeline::new(device, self.target_format));
+        }
+        while layers.len() <= self.layer { let next = layers[0].sibling(device); layers.push(next); }
+        layers[self.layer].upload(device, queue, &self.instances, &self.key_positions, globals);
 
         PREPARE_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Vec::new()
@@ -373,7 +405,7 @@ impl CallbackTrait for NotesCallback {
         resources: &CallbackResources,
     ) {
         let started = Instant::now();
-        let Some(pipeline) = resources.get::<NotePipeline>() else {
+        let Some(pipeline) = resources.get::<NotePipelines>().and_then(|p| p.0.get(self.layer)) else {
             return;
         };
         if !no_draw() {
@@ -506,7 +538,16 @@ impl NotePipeline {
             multiview: None,
             cache: None,
         });
+        Self::from_pipeline(device, pipeline, relative, target_format)
+    }
 
+    /// Another buffer set drawing with the same compiled pipeline (no shader compile).
+    fn sibling(&self, device: &wgpu::Device) -> Self {
+        Self::from_pipeline(device, self.pipeline.clone(), self.relative, self.target_format)
+    }
+
+    fn from_pipeline(device: &wgpu::Device, pipeline: wgpu::RenderPipeline, relative: bool, target_format: wgpu::TextureFormat) -> Self {
+        let bind_group_layout = pipeline.get_bind_group_layout(0);
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("notes.instances"),
             size: 256,
@@ -563,13 +604,6 @@ impl NotePipeline {
             globals_buffer,
             target_format,
         }
-    }
-
-    fn ensure_format(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
-        if self.target_format == format {
-            return;
-        }
-        *self = Self::new(device, format);
     }
 
     fn upload(
@@ -749,11 +783,8 @@ impl RenderBenchmark {
     /// CPU upload time and GPU vertex/fragment time (timestamp queries, excluding readback).
     pub fn frame(&mut self, instances: &Arc<InstanceRing>, keys: &[KeyPosition; 256], height_time: f32, now_us: u64) -> (Duration, Duration) {
         let t0 = Instant::now();
-        self.pipeline.upload(&self.device, &self.queue, instances, keys, GlobalsUniform {
-            height_time, win_width: self.width as f32, win_height: self.height as f32,
-            direction_sign: 1.0, flat_mode: 0, instance_count: 0,
-            now_us: [now_us as u32, (now_us >> 32) as u32], time_shift: 0.0, _pad: [0.0; 3],
-        });
+        self.pipeline.upload(&self.device, &self.queue, instances, keys,
+            NoteView::vertical(height_time, now_us, 1.0, 0).globals(self.width as f32, self.height as f32));
         let upload = t0.elapsed();
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -823,7 +854,8 @@ impl RenderBenchmark {
 pub struct Offscreen {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: NotePipeline,
+    /// One buffer set per layer, sharing the first's compiled pipeline.
+    layers: Vec<NotePipeline>,
     color_texture: wgpu::Texture,
     color: wgpu::TextureView,
     depth: wgpu::TextureView,
@@ -831,11 +863,10 @@ pub struct Offscreen {
     stride: u32,
     width: u32,
     height: u32,
-    note_height: u32,
 }
 
 impl Offscreen {
-    pub fn new(width: u32, height: u32, note_height: u32) -> Result<Self, String> {
+    pub fn new(width: u32, height: u32) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = pollster_block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .map_err(|e| format!("no GPU adapter: {e}"))?;
@@ -856,18 +887,19 @@ impl Offscreen {
             label: Some("export.readback"), size: stride as u64 * height as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
         });
-        Ok(Self { device, queue, pipeline, color_texture, color, depth, readback, stride, width, height, note_height })
+        Ok(Self { device, queue, layers: vec![pipeline], color_texture, color, depth, readback, stride, width, height })
     }
 
-    /// Draws one frame and copies the whole target into `out` (width * height * 4 bytes).
-    pub fn render(&mut self, instances: &Arc<InstanceRing>, keys: &[KeyPosition; 256], height_time: f32,
-        now_us: u64, time_shift: f32, background: [u8; 3], direction_sign: f32, flat_mode: u32, out: &mut Vec<u8>)
+    /// Draws `layers` in order into `viewport` (x, y, width, height in pixels) and copies the
+    /// whole target into `out` (width * height * 4 bytes).
+    pub fn render(&mut self, layers: &[LayerDraw], keys: &[KeyPosition; 256], viewport: [u32; 4],
+        background: [u8; 3], out: &mut Vec<u8>)
     {
-        self.pipeline.upload(&self.device, &self.queue, instances, keys, GlobalsUniform {
-            height_time, win_width: self.width as f32, win_height: self.note_height as f32,
-            direction_sign, flat_mode, instance_count: 0,
-            now_us: [now_us as u32, (now_us >> 32) as u32], time_shift, _pad: [0.0; 3],
-        });
+        while self.layers.len() < layers.len() { let next = self.layers[0].sibling(&self.device); self.layers.push(next); }
+        let [vx, vy, vw, vh] = viewport.map(|v| v as f32);
+        for (pipeline, layer) in self.layers.iter_mut().zip(layers) {
+            pipeline.upload(&self.device, &self.queue, &layer.instances, keys, layer.view.globals(vw, vh));
+        }
         let bg = background.map(|c| c as f64 / 255.0);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -884,8 +916,8 @@ impl Offscreen {
                 }),
                 timestamp_writes: None, occlusion_query_set: None,
             }).forget_lifetime();
-            pass.set_viewport(0.0, 0.0, self.width as f32, self.note_height as f32, 0.0, 1.0);
-            self.pipeline.draw(&mut pass);
+            pass.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
+            for pipeline in &self.layers[..layers.len()] { pipeline.draw(&mut pass); }
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture: &self.color_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -986,6 +1018,65 @@ mod tests {
         assert_eq!(ring.pushes(), total, "trimming drops old pushes, it does not forget how many there were");
         assert_eq!(ring.pushed_since(0), None);
         assert_eq!(ring.pushed_since(total), Some(&[][..]));
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    /// One pitch-60 note, `offset` seconds after `NOW`, `len` seconds long, flat colour.
+    fn one_note(offset: f32, len: f32, [r, g, b]: [u8; 3]) -> Arc<InstanceRing> {
+        let start = NOW + (offset * 1e6) as u64;
+        Arc::new(InstanceRing::from_ordered([NoteInstance { start_us: [start as u32, 0], len,
+            key_color: 60 | (r as u32) << 24 | (g as u32) << 16 | (b as u32) << 8 }]))
+    }
+
+    fn keys() -> [KeyPosition; 256] {
+        let mut keys = [KeyPosition { left: 0.0, right: 0.0, _pad0: 0.0, _pad1: 0.0 }; 256];
+        (keys[60].left, keys[60].right) = (0.25, 0.5);
+        keys
+    }
+
+    fn draw(gpu: &mut Offscreen, layers: &[LayerDraw]) -> impl Fn(u32, u32) -> [u8; 3] {
+        let mut out = Vec::new();
+        gpu.render(layers, &keys(), [0, 0, 64, 64], [0, 0, 0], &mut out);
+        move |x, y| { let i = (y as usize * 64 + x as usize) * 4; [out[i], out[i + 1], out[i + 2]] }
+    }
+
+    #[test]
+    fn horizontal_mode_turns_the_vertical_picture_sideways() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        let instances = one_note(0.0, 0.5, [255, 0, 0]);
+        let view = NoteView::vertical(1.0, NOW, -1.0, 1);
+        let px = draw(&mut gpu, &[LayerDraw { instances: instances.clone(), view }]);
+        assert_eq!((px(24, 48), px(24, 8)), ([255, 0, 0], [0, 0, 0]));
+        let px = draw(&mut gpu, &[LayerDraw { instances, view: NoteView { horizontal: true, ..view } }]);
+        assert_eq!((px(8, 40), px(56, 40), px(24, 48)), ([255, 0, 0], [0, 0, 0], [0, 0, 0]));
+    }
+
+    #[test]
+    fn playhead_lights_crossing_notes_and_fades_the_past() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        let view = NoteView { horizontal: true, playhead: 0.5, ..NoteView::vertical(1.0, NOW, -1.0, 1) };
+        // Time norm n is at x = 64 n (origin on the left); the key spans y 32..48.
+        let crossing = draw(&mut gpu, &[LayerDraw { instances: one_note(0.25, 0.5, [255, 0, 0]), view }]);
+        let future = draw(&mut gpu, &[LayerDraw { instances: one_note(0.6, 0.3, [255, 0, 0]), view }]);
+        assert!(crossing(36, 40)[1] > 60, "a note on the playhead is lit: {:?}", crossing(36, 40));
+        assert_eq!(future(50, 40), [255, 0, 0]);
+        let past = draw(&mut gpu, &[LayerDraw { instances: one_note(0.1, 0.3, [255, 0, 0]), view }]);
+        assert!(past(9, 40)[0] + 40 < past(22, 40)[0], "older is darker: {:?} {:?}", past(9, 40), past(22, 40));
+    }
+
+    #[test]
+    fn brightness_and_depth_ranges_order_layers() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        let view = NoteView::vertical(1.0, NOW, -1.0, 1);
+        let red = LayerDraw { instances: one_note(0.0, 0.5, [255, 0, 0]), view: NoteView { depth: [0.0, 0.5], ..view } };
+        let green = LayerDraw { instances: one_note(0.0, 0.5, [0, 255, 0]), view: NoteView { depth: [0.5, 0.5], brightness: 0.5, ..view } };
+        let px = draw(&mut gpu, &[red.clone(), green.clone()]);
+        assert_eq!(px(24, 48), [255, 0, 0]);
+        let red = LayerDraw { view: NoteView { depth: [0.5, 0.5], ..red.view }, ..red };
+        let green = LayerDraw { view: NoteView { depth: [0.0, 0.5], ..green.view }, ..green };
+        let [r, g, b] = draw(&mut gpu, &[red, green])(24, 48);
+        assert!(r == 0 && b == 0 && (100..=140).contains(&g), "dim green wins: {r} {g} {b}");
     }
 
     #[test]

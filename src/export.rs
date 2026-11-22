@@ -169,7 +169,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     visual.set_palette(cfg.look.note_palette, &cfg.look.custom_colors, cfg.look.rainbow_size);
     let keyboard_h = if cfg.look.pfa_style { crate::pfa::key_height(height as f32, width as f32, visual.pitch_min, visual.pitch_max) as u32 } else { (height as f32 * 0.12) as u32 };
     let note_h = height - keyboard_h;
-    let mut gpu = gpu::Offscreen::new(width, height, note_h)?;
+    let mut gpu = gpu::Offscreen::new(width, height)?;
 
     let mut ffmpeg = Command::new(&cfg.ffmpeg);
     ffmpeg.args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{width}x{height}"),
@@ -221,7 +221,8 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         let (mut active, colors) = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, note_h, piano, &mut instances);
         if deficit > 0.0 { active = [false; 128]; }
         let mut frame = free_rx.try_recv().unwrap_or_default();
-        gpu.render(&instances, &keys, speed, now_us, deficit, [20, 20, 24], if look.notes_rise { 1.0 } else { -1.0 }, look.note_mode(), &mut frame);
+        let view = gpu::NoteView { time_shift: deficit, ..gpu::NoteView::vertical(speed, now_us, if look.notes_rise { 1.0 } else { -1.0 }, look.note_mode()) };
+        gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, [0, 0, width, note_h], [20, 20, 24], &mut frame);
         if cfg.title && cfg.lead >= 1.0 {
             // Half-dark band behind the title, fading with it (the text itself is drawn by ffmpeg).
             let dim = 1.0 - 0.5 * intro_fade(f as f64 / cfg.fps as f64, cfg.lead as f64);

@@ -838,12 +838,10 @@ pub(crate) fn draw_piano_roll(
                 painter.add(gpu::NotesCallback::new(
                     note_area,
                     state.target_format,
+                    0,
                     instances.clone(),
                     gpu_key_positions,
-                    speed,
-                    now_us,
-                    if notes_upwards { 1.0 } else { -1.0 },
-                    note_mode,
+                    gpu::NoteView::vertical(speed, now_us, if notes_upwards { 1.0 } else { -1.0 }, note_mode),
                 ));
             }
         }
