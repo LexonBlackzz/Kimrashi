@@ -255,8 +255,8 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             gpu.render(&[], &keys, note_rect, [20, 20, 24], &mut frame);
             cells.advance(&visual.data, visual.data.tempo.time_to_tick(now_us));
             let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32));
-            for (k, v, c) in cells.lit() {
-                let col = crate::matrix::color(&visual, k, c);
+            for (k, v, c, a) in cells.shown(&visual.data, now_us, (look.matrix_fade.max(0.0) * 1e6) as u64) {
+                let col = crate::matrix::color(&visual, k, c, a);
                 fill_rect(&mut frame, width, crate::matrix::cell_rect(area, k, v), [col.r(), col.g(), col.b()]);
             }
             ([false; 128], [egui::Color32::TRANSPARENT; 128])
@@ -350,6 +350,7 @@ pub fn run_from_args() -> bool {
     if let Some(v) = value("--keyboard-side") {
         look.keyboard_side = match v.as_str() { "left" => KeyboardSide::Left, "right" => KeyboardSide::Right, _ => panic!("keyboard side: left or right") };
     }
+    if let Some(v) = value("--matrix-fade") { look.matrix_fade = v.parse::<f32>().expect("bad --matrix-fade").clamp(0.0, 2.0); }
     if let Some(v) = value("--perspective-far") { look.perspective_far = v.parse::<f32>().expect("bad --perspective-far").clamp(0.1, 0.9); }
     if let Some(v) = value("--parallax-far") { look.parallax_far = v.parse::<f32>().expect("bad --parallax-far").clamp(0.1, 1.0); }
     let d = Settings { speed: look.note_speed, ..Default::default() };

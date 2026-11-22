@@ -8,12 +8,14 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Weak};
 
-/// One cell: how many notes sound on it, and the track (of the file) and channel of the newest.
+/// One cell: how many notes sound on it, the track (of the file) and channel of the newest, and
+/// the tick its last note ended (0: never lit), for fading.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cell {
     pub count: u32,
     pub track: u16,
     pub ch: u8,
+    pub ended: u32,
 }
 
 pub struct Matrix {
@@ -32,11 +34,20 @@ impl Matrix {
         Self { song: Weak::new(), readers: Vec::new(), done: None, ending: BinaryHeap::new(), cells: vec![Cell::default(); 128 * 128] }
     }
 
+    #[cfg(test)]
     pub fn cell(&self, key: u8, vel: u8) -> Cell { self.cells[cell_index(key, vel) as usize] }
 
-    /// Every lit cell: (key, velocity, cell).
-    pub fn lit(&self) -> impl Iterator<Item = (u8, u8, Cell)> + '_ {
-        self.cells.iter().enumerate().filter(|(_, c)| c.count > 0).map(|(i, &c)| ((i / 128) as u8, (i % 128) as u8, c))
+    /// Every cell to draw at `now_us`: (key, velocity, cell, strength). Sounding cells are at 1;
+    /// with a fade, cells whose notes ended fall to 0 over `fade_us`.
+    pub fn shown<'a>(&'a self, song: &'a SongData, now_us: u64, fade_us: u64) -> impl Iterator<Item = (u8, u8, Cell, f32)> + 'a {
+        let mut cache = 0;
+        self.cells.iter().enumerate().filter_map(move |(i, &c)| {
+            let strength = if c.count > 0 { 1.0 } else if fade_us == 0 || c.ended == 0 { return None } else {
+                let since = now_us.saturating_sub(song.tempo.tick_to_time_with_cache(c.ended, &mut cache));
+                1.0 - since as f32 / fade_us as f32
+            };
+            (strength > 0.0).then_some(((i / 128) as u8, (i % 128) as u8, c, strength))
+        })
     }
 
     /// Frees the state (leaving the view).
@@ -72,7 +83,9 @@ impl Matrix {
         while let Some(&Reverse((end, i))) = self.ending.peek() {
             if end > tick { break; }
             self.ending.pop();
-            self.cells[i as usize].count -= 1;
+            let cell = &mut self.cells[i as usize];
+            cell.count -= 1;
+            if cell.count == 0 { cell.ended = end; }
         }
         self.done = Some(tick);
     }
@@ -84,7 +97,7 @@ impl Matrix {
         if end <= now { return; }
         let i = cell_index(key, vel);
         let cell = &mut self.cells[i as usize];
-        *cell = Cell { count: cell.count + 1, track: song.midi.track_origin[track] as u16, ch };
+        *cell = Cell { count: cell.count + 1, track: song.midi.track_origin[track] as u16, ch, ..*cell };
         self.ending.push(Reverse((end, i)));
     }
 
@@ -104,9 +117,12 @@ pub fn cell_rect(area: egui::Rect, key: u8, vel: u8) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(area.left() + key as f32 * w, area.bottom() - (vel as f32 + 1.0) * h), egui::vec2(w, h))
 }
 
-/// A cell's colour: what the roll would give its newest note.
-pub fn color(song: &crate::VisualSong, key: u8, c: Cell) -> egui::Color32 {
-    song.color_for(&crate::NoteSegment { source: 0, start_us: 0, end_us: 0, track: c.track, channel: c.ch, pitch: key })
+/// A cell's colour: what the roll would give its newest note, `strength` of the way from the
+/// note area's background (20, 20, 24).
+pub fn color(song: &crate::VisualSong, key: u8, c: Cell, strength: f32) -> egui::Color32 {
+    let full = song.color_for(&crate::NoteSegment { source: 0, start_us: 0, end_us: 0, track: c.track, channel: c.ch, pitch: key });
+    let mix = |bg: u8, v: u8| (bg as f32 + (v as f32 - bg as f32) * strength.clamp(0.0, 1.0)).round() as u8;
+    egui::Color32::from_rgb(mix(20, full.r()), mix(20, full.g()), mix(24, full.b()))
 }
 
 #[cfg(test)]
@@ -161,6 +177,21 @@ mod tests {
         assert_eq!(lit(&m), [(60, 90, 1)], "a note ends at its end tick");
         m.advance(&s, 960);
         assert_eq!(lit(&m), []);
+    }
+
+    #[test]
+    fn ended_cells_fade_out() {
+        // 480 ticks a beat at 120 BPM: the note ends at 0.5 s.
+        let s = song(&[vec![(0, 60, 40, 480)]]);
+        let mut m = Matrix::new();
+        let shown = |m: &mut Matrix, us: u64, fade: u64| {
+            m.advance(&s, s.tempo.time_to_tick(us));
+            m.shown(&s, us, fade).map(|(k, v, _, a)| (k, v, (a * 100.0).round() as u32)).collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&mut m, 250_000, 1_000_000), [(60, 40, 100)], "sounding: full");
+        assert_eq!(shown(&mut m, 750_000, 1_000_000), [(60, 40, 75)], "ended 0.25 s ago: 75 %");
+        assert_eq!(shown(&mut m, 750_000, 0), [], "no fade: gone when it ends");
+        assert_eq!(shown(&mut m, 1_600_000, 1_000_000), [], "faded out");
     }
 
     #[test]

@@ -303,6 +303,12 @@ impl AppState {
                             }
                             ui.end_row();
                         }
+                        if c.view == ViewMode::Matrix {
+                            ui.label("Fade");
+                            ui.add(egui::Slider::new(&mut c.matrix_fade, 0.0..=2.0).fixed_decimals(2).suffix(" s"))
+                                .on_hover_text("How long a cell takes to fade out after its last note ends (0: at once)");
+                            ui.end_row();
+                        }
                         if matches!(c.view, ViewMode::Perspective | ViewMode::Blocks) {
                             ui.label("Far width");
                             ui.add(egui::Slider::new(&mut c.perspective_far, 0.1..=0.9).fixed_decimals(2).suffix("×"))
@@ -764,7 +770,7 @@ pub(crate) fn draw_piano_roll(
     notes_upwards: bool,
     note_mode: u32,
     piano_layout: bool,
-    (view, keyboard_side, parallax_far, horizontal_keyboard, perspective_far): (crate::settings::ViewMode, KeyboardSide, f32, bool, f32),
+    (view, keyboard_side, parallax_far, horizontal_keyboard, perspective_far, matrix_fade): (crate::settings::ViewMode, KeyboardSide, f32, bool, f32, f32),
     (stats_mode, synth_stats): (StatsMode, bool),
     visible: &mut VisibleNotes,
     parallax: &mut crate::parallax::Parallax,
@@ -871,7 +877,9 @@ pub(crate) fn draw_piano_roll(
             let t0 = Instant::now();
             matrix.advance(&song.data, song.data.tempo.time_to_tick(now_us));
             let mut mesh = egui::Mesh::default();
-            for (k, v, c) in matrix.lit() { mesh.add_colored_rect(crate::matrix::cell_rect(note_area, k, v), crate::matrix::color(song, k, c)); }
+            for (k, v, c, a) in matrix.shown(&song.data, now_us, (matrix_fade.max(0.0) * 1e6) as u64) {
+                mesh.add_colored_rect(crate::matrix::cell_rect(note_area, k, v), crate::matrix::color(song, k, c, a));
+            }
             painter.add(egui::Shape::mesh(mesh));
             times.build = t0.elapsed();
         } else if in_parallax {
@@ -946,13 +954,15 @@ pub(crate) fn draw_piano_roll(
         }
         paint_quads(&painter, &quads);
     } else if eased > 0.0 && side.is_none() && !in_parallax && !in_matrix {
-        let mut over = painter.clone();
-        over.multiply_opacity(eased);
-        draw_pfa_keyboard(&over, keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors);
+        draw_pfa_keyboard(&painter, keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors);
     }
     if eased < 1.0 && !in_parallax && !in_matrix && !bare && !persp.is_on() {
+        // Switching styles: PFA lies underneath and the classic keyboard fades out over it (or in,
+        // shrinking back), so the two crossfade instead of PFA popping in at the end.
+        let mut classic = painter.clone();
+        if side.is_none() && eased > 0.0 { classic.multiply_opacity(1.0 - eased); }
         draw_keyboard(
-            &painter,
+            &classic,
             keyboard_rect,
             pitch_min,
             pitch_max,

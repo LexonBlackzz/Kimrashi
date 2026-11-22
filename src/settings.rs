@@ -52,6 +52,8 @@ pub struct Settings {
     pub parallax_far: f32,
     /// Perspective: the far (top) edge's width, as a fraction of the bottom.
     pub perspective_far: f32,
+    /// Matrix: seconds a cell takes to fade out after its last note ends; 0 = off at once.
+    pub matrix_fade: f32,
     pub note_speed: f32,
     pub notes_rise: bool,
     pub piano_layout: bool,
@@ -101,6 +103,7 @@ impl Default for Settings {
             horizontal_keyboard: true,
             parallax_far: 0.3,
             perspective_far: 0.3,
+            matrix_fade: 0.0,
             note_speed: 5.0,
             notes_rise: false,
             piano_layout: false,
