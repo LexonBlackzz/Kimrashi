@@ -209,15 +209,8 @@ impl SongData {
     ) -> Result<Arc<Self>, ParseError> {
         let start = std::time::Instant::now();
         let path_ref = path.as_ref();
-        let midi = Arc::new(MidiFile::open_and_parse(path_ref, vel_levels, progress)?);
-        let tempo = Arc::new(TempoMap::from_midi(&midi));
-        let song = Arc::new(SongData {
-            path: path_ref.to_string_lossy().into_owned(),
-            midi,
-            tempo,
-            load_time: start.elapsed(),
-            seek: Default::default(),
-        });
+        let midi = MidiFile::open_and_parse(path_ref, vel_levels, progress)?;
+        let song = Self::from_midi(path_ref.to_string_lossy().into_owned(), midi, start.elapsed());
         if song.midi.note_count >= crate::seek::MIN_NOTES && std::env::var_os("KIM_NO_SEEK_INDEX").is_none() {
             let song = song.clone();
             let _ = std::thread::Builder::new().name("seek-index".into()).spawn(move || {
@@ -225,6 +218,12 @@ impl SongData {
             });
         }
         Ok(song)
+    }
+
+    /// A song from a parsed MIDI, without the seek index `load` adds to big ones.
+    pub fn from_midi(path: String, midi: MidiFile, load_time: std::time::Duration) -> Arc<Self> {
+        let tempo = Arc::new(TempoMap::from_midi(&midi));
+        Arc::new(SongData { path, midi: Arc::new(midi), tempo, load_time, seek: Default::default() })
     }
 }
 

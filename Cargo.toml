@@ -26,6 +26,8 @@ lzma-rust2 = "0.21"
 # C liblzma for xz layers: ~3.5x faster than lzma-rust2 on streams of long matches (bomb-like files)
 liblzma = { version = "0.4", features = ["static"] }
 memchr = "2"
+# FL Studio projects (.flp)
+flparser = { path = "../flparser" }
 flate2 = "1"
 unrar = "0.5"
 zstd = { version = "0.13", default-features = false }

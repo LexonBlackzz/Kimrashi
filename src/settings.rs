@@ -53,6 +53,8 @@ pub struct Settings {
     // Loading
     pub velocity_levels: u8,
     pub verify_repeats: bool,
+    /// FL projects: start playing the song's opening while the rest still loads.
+    pub flp_quick_start: bool,
     pub loading_details: bool,
     // Updates
     pub check_updates: bool,
@@ -86,6 +88,7 @@ impl Default for Settings {
             long_data: false,
             velocity_levels: 127,
             verify_repeats: false,
+            flp_quick_start: false,
             loading_details: false,
             check_updates: true,
             last_update_check: 0,

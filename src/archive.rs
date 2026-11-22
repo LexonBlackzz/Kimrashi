@@ -26,6 +26,7 @@ const MAX_DEPTH: usize = 4;
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Midi,
+    Flp,
     Gz,
     Xz,
     Zstd,
@@ -40,6 +41,7 @@ impl Kind {
     fn sniff(head: &[u8]) -> Option<Kind> {
         Some(match head {
             [b'M', b'T', b'h', b'd', ..] => Kind::Midi,
+            [b'F', b'L', b'h', b'd', ..] => Kind::Flp,
             [0x1F, 0x8B, ..] => Kind::Gz,
             [0xFD, b'7', b'z', b'X', b'Z', 0, ..] => Kind::Xz,
             [0x28, 0xB5, 0x2F, 0xFD, ..] => Kind::Zstd,
@@ -55,6 +57,7 @@ impl Kind {
     fn name(self) -> &'static str {
         match self {
             Kind::Midi => "mid",
+            Kind::Flp => "flp",
             Kind::Gz => "gz",
             Kind::Xz => "xz",
             Kind::Zstd => "zst",
@@ -110,6 +113,53 @@ fn plain<'a, R: Read + 'a>(r: R) -> Box<dyn Source + 'a> {
     Box::new(Plain(r))
 }
 
+/// Seconds of an FL project packed first when `Progress::quick_flp` asks: enough for the
+/// whole song to pack while they play (about 20 s for the Nuker 3).
+const EARLY_SECS: f64 = 45.0;
+
+/// An FL project's note track up to song tick `cut`, and a little past: it ends once a
+/// batch of events reaching the cut is all read (a short read empties the reader's batch,
+/// so the end falls between events). Notes sounding there are left unreleased.
+struct Upto<'a> {
+    r: flparser::TrackReader<'a>,
+    cut: u64,
+    ended: bool,
+}
+
+impl Read for Upto<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.ended {
+            return Ok(0);
+        }
+        let n = self.r.read(buf)?;
+        self.ended = self.r.tick() >= self.cut && n < buf.len();
+        Ok(n)
+    }
+}
+
+/// An FL project's note track as it is made, counting its progress into `Progress`'s
+/// FL fields (song ticks done, summed over tracks, and notes written).
+struct Watched<'a> {
+    r: flparser::TrackReader<'a>,
+    end: u64,
+    tick: u64,
+    notes: u64,
+    progress: &'a Progress,
+}
+
+impl Read for Watched<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.progress.add(0)?; // (fails once cancelled)
+        let n = self.r.read(buf)?;
+        let tick = if n == 0 { self.end } else { self.r.tick().min(self.end) };
+        self.progress.flp_done.fetch_add(tick.saturating_sub(self.tick), Relaxed);
+        self.progress.flp_notes.fetch_add(self.r.notes() - self.notes, Relaxed);
+        (self.tick, self.notes) = (tick.max(self.tick), self.r.notes());
+        Ok(n)
+    }
+}
+
 /// `head` (bytes already taken from `rest`), then `rest`.
 struct Prefixed<'a> {
     head: Cursor<Vec<u8>>,
@@ -149,7 +199,7 @@ fn is_candidate(name: &str) -> bool {
     {
         name = stripped.to_owned();
     }
-    [".mid", ".midi", ".smf", ".kar", ".zip", ".7z", ".rar", ".tar", ".tgz", ".txz"]
+    [".mid", ".midi", ".smf", ".kar", ".flp", ".zip", ".7z", ".rar", ".tar", ".tgz", ".txz"]
         .iter()
         .any(|ext| name.ends_with(ext))
 }
@@ -210,8 +260,9 @@ pub fn choices(path: &Path) -> Vec<(String, u64)> {
 }
 
 /// Block count and largest uncompressed block size of an .xz file, from the index of
-/// its last stream (None if it can't be read; callers then just stream).
-fn xz_blocks(path: &Path) -> Option<(u64, u64)> {
+/// its last stream (None if it can't be read; callers then just stream), and the whole
+/// file's uncompressed size if that stream is all of it.
+fn xz_blocks(path: &Path) -> Option<(u64, u64, Option<u64>)> {
     let mut f = File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let mut footer = [0u8; 12];
@@ -243,12 +294,15 @@ fn xz_blocks(path: &Path) -> Option<(u64, u64)> {
         return None;
     }
     let count = num()?;
-    let mut largest = 0;
+    let (mut largest, mut total, mut packed) = (0, 0u64, 0u64);
     for _ in 0..count {
-        num()?;
-        largest = largest.max(num()?);
+        packed += (num()? + 3) / 4 * 4;
+        let size = num()?;
+        largest = largest.max(size);
+        total += size;
     }
-    Some((count, largest))
+    let whole = (12 + packed + index_len + 12 == len).then_some(total);
+    Some((count, largest, whole))
 }
 
 fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -904,6 +958,10 @@ impl<'a> Ctx<'a> {
             .ok_or("Not a MIDI file or a supported archive (zip, 7z, rar, xz, gz, zst, tar)")?;
         match kind {
             Kind::Midi => MidiFile::open_and_parse(path, self.vel_levels, self.progress),
+            Kind::Flp => {
+                let size = std::fs::metadata(path)?.len();
+                self.flp(self.reader(path)?, Some(size))
+            }
             Kind::Xz => {
                 self.layer("xz");
                 // A file that is one stream repeated many times is read specially.
@@ -916,8 +974,10 @@ impl<'a> Ctx<'a> {
                 // need its entire uncompressed size in memory.
                 const BUDGET: u64 = 1 << 30;
                 let cores = std::thread::available_parallelism().map_or(4, |n| n.get() as u64);
-                match xz_blocks(path) {
-                    Some((blocks, largest)) if blocks > 1 && largest * 2 <= BUDGET => {
+                let blocks = xz_blocks(path);
+                self.layer_total = blocks.and_then(|b| b.2);
+                match blocks {
+                    Some((blocks, largest, _)) if blocks > 1 && largest * 2 <= BUDGET => {
                         let workers = (BUDGET / (largest * 2)).clamp(1, cores) as u32;
                         let xz = lzma_rust2::XzReaderMt::new(self.reader(path)?, true, workers)?;
                         self.stream(plain(xz), depth + 1)
@@ -1010,6 +1070,81 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// An FL Studio project: read whole (flparser needs it in memory), then each note
+    /// track packed straight from the MIDI bytes flparser makes for it as they are read,
+    /// all tracks in parallel; the same tracks as FL's own MIDI export. `size` (if known)
+    /// avoids regrowing.
+    fn flp(&mut self, mut r: impl Read, size: Option<u64>) -> Result<MidiFile, ParseError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.layer("flp");
+        let p = self.progress;
+        let stage = |s| {
+            if let Ok(mut st) = p.flp_stage.lock() {
+                *st = s;
+            }
+            p.flp_done.store(0, Relaxed);
+        };
+
+        stage("Reading");
+        p.flp_total.store(size.unwrap_or(0), Relaxed);
+        let mut bytes = Vec::with_capacity(size.unwrap_or(0) as usize);
+        while r.by_ref().take(1 << 24).read_to_end(&mut bytes)? > 0 {
+            p.flp_done.store(bytes.len() as u64, Relaxed);
+            p.add(0)?; // (fails once cancelled)
+        }
+
+        stage("Parsing");
+        let project = flparser::Project::parse_progress(&bytes, &mut |d, t| {
+            p.flp_done.store(d, Relaxed);
+            p.flp_total.store(t, Relaxed);
+        })?;
+        drop(bytes);
+        let pattern_notes: usize = project.patterns.values().map(|p| p.notes.len()).sum();
+        if let Ok(mut s) = p.flp_stats.lock() {
+            *s = format!(
+                "FL {} · {} channels · {} patterns · {} clips · {} pattern notes · {} BPM{}",
+                project.version.trim_end_matches('\0'),
+                project.channels.len(),
+                project.patterns.len(),
+                project.clips.len(),
+                crate::si(pattern_notes as f64),
+                project.tempo,
+                match project.tempo_clips.len() {
+                    0 => String::new(),
+                    n => format!(" · {n} tempo clips"),
+                },
+            );
+        }
+
+        stage("Packing");
+        let chans = project.used_channels();
+        // ponytail: flparser's private song end, for the percentage only (tracks run on a
+        // little past it, to FL's render tail).
+        let end = project.clips.iter().map(|c| c.pos as u64 + c.len as u64).max().unwrap_or(0).max(1);
+        p.flp_total.store(end * chans.len() as u64, Relaxed);
+        let small = |data: Vec<u8>| -> Box<dyn Read + Send + '_> { Box::new(Cursor::new(data)) };
+        if p.quick_flp.load(Relaxed) {
+            // ponytail: the cut is EARLY_SECS at the project's base tempo; tempo automation
+            // makes it longer or shorter.
+            let cut = (EARLY_SECS * project.tempo / 60.0 * project.ppq as f64) as u64;
+            let mut tracks = vec![small(project.time_sig_track()), small(project.tempo_track_data())];
+            for &c in &chans {
+                tracks.push(Box::new(Upto { r: project.track_reader(c), cut, ended: false }));
+            }
+            let early = MidiFile::from_tracks(project.ppq, tracks, self.vel_levels, &Progress::default())?;
+            if let Ok(mut e) = p.early.lock() {
+                *e = Some((early, cut.min(u32::MAX as u64) as u32));
+            }
+        }
+        let mut tracks = vec![small(project.time_sig_track()), small(project.tempo_track_data())];
+        for &c in &chans {
+            tracks.push(Box::new(Watched { r: project.track_reader(c), end, tick: 0, notes: 0, progress: p }));
+        }
+        let midi = MidiFile::from_tracks(project.ppq, tracks, self.vel_levels, p);
+        stage("");
+        midi
+    }
+
     /// A layer arriving as a stream: peek at its first bytes and continue accordingly.
     fn stream(&mut self, mut r: Box<dyn Source + '_>, depth: usize) -> Result<MidiFile, ParseError> {
         if depth > MAX_DEPTH {
@@ -1026,6 +1161,7 @@ impl<'a> Ctx<'a> {
         let mut r: Box<dyn Source + '_> = Box::new(Prefixed { head: Cursor::new(head), rest: r });
         match kind {
             Kind::Midi => MidiFile::parse_stream(r, self.vel_levels, self.progress),
+            Kind::Flp => self.flp(r, total),
             Kind::Gz => {
                 self.layer("gz");
                 self.stream(plain(flate2::read::MultiGzDecoder::new(r)), depth + 1)
@@ -1073,6 +1209,94 @@ impl<'a> Ctx<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_flp_cut_short_plays_the_same_notes_up_to_the_cut() {
+        use crate::parser::{Record, TrackReader};
+        // (tick, channel, key, velocity) of every note starting before `cut`, by track
+        let starts = |m: &MidiFile, cut: u32| -> Vec<Vec<(u32, u8, u8, u8)>> {
+            (0..m.tracks.len())
+                .map(|i| {
+                    let (t, mut r, mut out) = (m.track(i), TrackReader::default(), Vec::new());
+                    while let Some((tick, e)) = r.next(t) {
+                        if let (Record::Note { ch, key, vel, .. }, true) = (e, tick < cut) {
+                            out.push((tick, ch, key, vel));
+                        }
+                    }
+                    out.sort();
+                    out
+                })
+                .collect()
+        };
+        let mut checked = 0;
+        for e in std::fs::read_dir("../flparser/samples").into_iter().flatten().flatten() {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "flp") {
+                continue;
+            }
+            let project = flparser::Project::parse(&std::fs::read(&path).unwrap()).unwrap();
+            let end = project.clips.iter().map(|c| c.pos as u64 + c.len as u64).max().unwrap_or(0);
+            let load = |cut: Option<u64>| {
+                let small = |d: Vec<u8>| -> Box<dyn Read + Send + '_> { Box::new(Cursor::new(d)) };
+                let mut tracks = vec![small(project.time_sig_track()), small(project.tempo_track_data())];
+                for c in project.used_channels() {
+                    let r = project.track_reader(c);
+                    tracks.push(match cut {
+                        Some(cut) => Box::new(Upto { r, cut, ended: false }),
+                        None => Box::new(r),
+                    });
+                }
+                MidiFile::from_tracks(project.ppq, tracks, 127, &Progress::default()).unwrap()
+            };
+            let (whole, cut) = (load(None), end / 2);
+            let early = load(Some(cut));
+            assert_eq!(early.tracks.len(), whole.tracks.len(), "{path:?}");
+            assert_eq!(starts(&early, cut as u32), starts(&whole, cut as u32), "{path:?}");
+            checked += 1;
+        }
+        // (the samples' tracks each fit one 64 kB batch of flparser's, so none actually
+        // ends early: this checks the cut keeps what comes before it, not the cutting)
+        assert!(checked > 0 || !Path::new("../flparser/samples").exists());
+    }
+
+    #[test]
+    fn flp_plays_the_notes_of_fls_own_export() {
+        use crate::parser::{Record, TrackReader};
+        // (FL8's exporter ends every note a tick early; flparser keeps the full length.)
+        let notes = |m: &MidiFile, cut: u32| -> Vec<Vec<(u32, u8, u8, u8, Option<u32>)>> {
+            (0..m.tracks.len())
+                .map(|i| {
+                    let (t, mut r, mut out) = (m.track(i), TrackReader::default(), Vec::new());
+                    while let Some((tick, e)) = r.next(t) {
+                        if let Record::Note { ch, key, vel, dur } = e {
+                            out.push((tick, ch, key, vel, dur.map(|d| d - cut)));
+                        }
+                    }
+                    out.sort();
+                    out
+                })
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        let dir = Path::new("../flparser/samples");
+        let mut checked = 0;
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let flp = e.path();
+            let mid = flp.with_extension("mid");
+            if flp.extension().is_some_and(|x| x == "flp") && mid.exists() {
+                let load = |p: &Path, pr: &Progress| MidiFile::open_and_parse(p, 127, pr).unwrap();
+                let progress = Progress::default();
+                let (got, want) = (load(&flp, &progress), load(&mid, &Progress::default()));
+                assert!(progress.flp_stats.lock().unwrap().starts_with("FL "), "{flp:?}");
+                assert!(progress.flp_stage.lock().unwrap().is_empty());
+                assert_eq!(got.note_count, want.note_count, "{flp:?}");
+                let fl8 = flp.to_string_lossy().contains("(FL8Export)") as u32;
+                assert_eq!(notes(&got, fl8), notes(&want, 0), "{flp:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0 || !dir.exists());
+    }
+
     use super::*;
     use std::io::Write;
 

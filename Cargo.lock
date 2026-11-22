@@ -1316,6 +1316,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "flparser"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1837,6 +1844,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "flate2",
+ "flparser",
  "libloading",
  "liblzma",
  "lzma-rust2",

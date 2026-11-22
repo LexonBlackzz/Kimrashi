@@ -503,6 +503,14 @@ impl AppState {
                         ui.end_row();
                         shown += 1;
                     }
+                    if show(Loading, "FL Studio project flp play while loading quick start") {
+                        ui.label("FL projects");
+                        ui.checkbox(&mut c.flp_quick_start, "Play FL projects while loading").on_hover_text(
+                            "Packs the first 45 s of an .flp first and starts playing it while the rest                              loads; the whole song then takes over at the same place. If the opening                              runs out first, playback waits for it.",
+                        );
+                        ui.end_row();
+                        shown += 1;
+                    }
                     if show(Loading, "Details stats window while loading") {
                         ui.label("Details");
                         ui.checkbox(&mut c.loading_details, "Show a stats window while loading")
@@ -624,6 +632,25 @@ pub(crate) fn loading_details(ui: &mut egui::Ui, l: &Loading) {
         ui.label("MIDI parsed");
         ui.label(format!("{} ({}/s)", mb(midi), mb((midi as f64 / secs_f) as u64)));
         ui.end_row();
+        let stats = p.flp_stats.lock().map(|s| s.clone()).unwrap_or_default();
+        if !stats.is_empty() {
+            ui.label("FL project");
+            ui.label(stats);
+            ui.end_row();
+        }
+        let stage = p.flp_stage.lock().map(|s| *s).unwrap_or_default();
+        if !stage.is_empty() {
+            let (d, t) = (p.flp_done.load(Relaxed), p.flp_total.load(Relaxed));
+            let pct = if t > 0 { format!(" {:.0}%", d as f64 * 100.0 / t as f64) } else { String::new() };
+            let detail = match stage {
+                "Packing" => format!(" · {} notes packed", si(p.flp_notes.load(Relaxed) as f64)),
+                _ if t > 0 => format!(" · {} of {}", mb(d), mb(t)),
+                _ => format!(" · {}", mb(d)),
+            };
+            ui.label("FL → MIDI");
+            ui.label(format!("{stage}…{pct}{detail}"));
+            ui.end_row();
+        }
         let scanned = p.scan_done.load(Relaxed);
         if scanned > 0 {
             // The layer is read in full to find the repeated tracks; a track's share of it
@@ -659,7 +686,11 @@ pub(crate) fn loading_details(ui: &mut egui::Ui, l: &Loading) {
             ui.end_row();
         }
         ui.label("Tracks");
-        ui.label(if total == 0 { "waiting for the header…".to_owned() } else { format!("{done} of {total}") });
+        ui.label(match total {
+            0 if !stage.is_empty() => "after the FL project is turned into MIDI".to_owned(),
+            0 => "waiting for the header…".to_owned(),
+            _ => format!("{done} of {total}"),
+        });
         ui.end_row();
         if live > 0 {
             ui.label("Current track");

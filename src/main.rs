@@ -215,6 +215,7 @@ fn main() {
                 benchmark: None,
                 diagnose: None,
                 loading: None,
+                quick: None,
                 choosing: None,
                 show_settings: false,
                 settings_tab: SettingsTab::Display,
@@ -1669,6 +1670,7 @@ struct DiagRun {
 /// A file being loaded on a worker thread.
 struct Loading {
     name: String,
+    path: String,
     rx: Receiver<Result<Arc<SongData>, String>>,
     /// Bytes parsed so far, out of `total`.
     progress: Arc<parser::Progress>,
@@ -1700,6 +1702,10 @@ struct AppState {
     benchmark: Option<BenchRun>,
     diagnose: Option<DiagRun>,
     loading: Option<Loading>,
+    /// Playing an FL project's opening while the whole song loads (see
+    /// `Settings::flp_quick_start`): where that opening ends, and whether playback was
+    /// paused there to wait.
+    quick: Option<(u64, bool)>,
     /// An archive holding several MIDIs, and its (name, size) entries, while the user picks one.
     choosing: Option<(std::path::PathBuf, Vec<(String, u64)>)>,
     show_settings: bool,
@@ -1793,6 +1799,14 @@ impl eframe::App for AppState {
             self.playback_time_us = new_time;
             t.playback_time_us = new_time;
             self.last_telemetry = t;
+        }
+        // An FL project's opening ends before the rest has loaded: wait there.
+        if let Some((wait_us, auto_paused)) = &mut self.quick {
+            if self.last_telemetry.is_playing && self.playback_time_us >= *wait_us {
+                *auto_paused = true;
+                let at = *wait_us;
+                self.toggle_play(at);
+            }
         }
 
         let duration_us = self
@@ -2075,7 +2089,7 @@ impl AppState {
         let Some(path) = rfd::FileDialog::new()
             .add_filter(
                 "MIDI file or archive",
-                &["mid", "midi", "zip", "7z", "rar", "xz", "gz", "zst", "tar", "tgz", "txz"],
+                &["mid", "midi", "flp", "zip", "7z", "rar", "xz", "gz", "zst", "tar", "tgz", "txz"],
             )
             .add_filter("All files", &["*"])
             .pick_file()
@@ -2152,7 +2166,10 @@ impl AppState {
         self.cancel_loading();
         let progress = Arc::new(parser::Progress::default());
         progress.verify_all.store(self.cfg.verify_repeats, std::sync::atomic::Ordering::Relaxed);
+        progress.quick_flp.store(self.cfg.flp_quick_start, std::sync::atomic::Ordering::Relaxed);
         *progress.entry.lock().unwrap() = entry;
+        self.quick = None;
+        let song_path = path.to_string_lossy().into_owned();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (vel_levels, p) = (self.cfg.velocity_levels, progress.clone());
         std::thread::spawn(move || {
@@ -2161,6 +2178,7 @@ impl AppState {
         self.status_message = None;
         self.loading = Some(Loading {
             name,
+            path: song_path,
             rx,
             progress,
             total,
@@ -2170,38 +2188,64 @@ impl AppState {
 
     fn poll_loading(&mut self) {
         let Some(l) = &self.loading else { return };
+        let early = l.progress.early.lock().ok().and_then(|mut e| e.take());
+        if let Some((midi, cut)) = early {
+            let song = SongData::from_midi(l.path.clone(), midi, l.started.elapsed());
+            let wait_us = song.tempo.tick_to_time_with_cache(cut, &mut 0);
+            self.start_song(song);
+            self.quick = Some((wait_us, false));
+            return;
+        }
+        let Some(l) = &self.loading else { return };
         let result = match l.rx.try_recv() {
             Ok(result) => result,
             Err(crossbeam_channel::TryRecvError::Empty) => return,
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err("loader thread died".into()),
         };
         let name = self.loading.take().map(|l| l.name).unwrap_or_default();
+        let quick = self.quick.take();
         match result {
-            Ok(song) => {
-                let duration = song.tempo.duration_us();
-                // Reset the clock before Play so it can't override the player's start.
-                self.clock.set_paused(0);
-                let _ = self.cmd_tx.send(PlayerCommand::Play(song.clone()));
-                if let Some(us) = self.open_at_us.take() {
-                    let _ = self.cmd_tx.send(PlayerCommand::Seek(us));
+            Ok(song) => match quick {
+                // The whole song replaces its opening at the same place, playing or not.
+                Some((_, auto_paused)) => {
+                    let (at, playing) = (self.playback_time_us, self.last_telemetry.is_playing || auto_paused);
+                    self.start_song(song);
+                    if at > 0 {
+                        self.seek(at);
+                    }
+                    if !playing {
+                        self.toggle_play(at);
+                    }
                 }
-
-                self.last_telemetry.midi_path = song.path.clone();
-                self.last_telemetry.duration_us = duration;
-                self.last_telemetry.playback_time_us = 0;
-                self.last_telemetry.is_playing = true;
-                self.current_song = Some(VisualSong::new(song));
-                self.applied_look = None;
-                self.playback_time_us = 0;
-                self.slider_override_us = None;
-                self.slider_grabbed = false;
-                self.status_message = None;
-                self.reset_visible_indices();
-            }
+                None => self.start_song(song),
+            },
             Err(e) => {
                 self.status_message = Some(format!("Couldn't open {name}: {e}"));
             }
         }
+    }
+
+    /// Start playing `song` from the beginning (or where `--from` said).
+    fn start_song(&mut self, song: Arc<SongData>) {
+        let duration = song.tempo.duration_us();
+        // Reset the clock before Play so it can't override the player's start.
+        self.clock.set_paused(0);
+        let _ = self.cmd_tx.send(PlayerCommand::Play(song.clone()));
+        if let Some(us) = self.open_at_us.take() {
+            let _ = self.cmd_tx.send(PlayerCommand::Seek(us));
+        }
+
+        self.last_telemetry.midi_path = song.path.clone();
+        self.last_telemetry.duration_us = duration;
+        self.last_telemetry.playback_time_us = 0;
+        self.last_telemetry.is_playing = true;
+        self.current_song = Some(VisualSong::new(song));
+        self.applied_look = None;
+        self.playback_time_us = 0;
+        self.slider_override_us = None;
+        self.slider_grabbed = false;
+        self.status_message = None;
+        self.reset_visible_indices();
     }
 }
 

@@ -105,6 +105,18 @@ pub struct Progress {
     /// Notes found so far in the big track being read on its own (0 between tracks).
     pub live_notes: std::sync::atomic::AtomicU64,
     pub scan_unit: std::sync::atomic::AtomicU64,
+    /// An FL project being turned into MIDI (see `archive`): the step under way ("" when
+    /// none), how far it is (`flp_done` of `flp_total`: bytes while reading and parsing,
+    /// ticks while building the MIDI), notes written so far, and the project's summary.
+    pub flp_stage: std::sync::Mutex<&'static str>,
+    pub flp_done: std::sync::atomic::AtomicU64,
+    pub flp_total: std::sync::atomic::AtomicU64,
+    pub flp_notes: std::sync::atomic::AtomicU64,
+    pub flp_stats: std::sync::Mutex<String>,
+    /// Asked for: an FL project's opening packed first and left in `early` (with the tick
+    /// it was cut at), to play while the whole song loads.
+    pub quick_flp: std::sync::atomic::AtomicBool,
+    pub early: std::sync::Mutex<Option<(MidiFile, u32)>>,
     /// Which file to load from an archive holding several (see `archive::choices`);
     /// `None` loads the largest.
     pub entry: std::sync::Mutex<Option<String>>,
@@ -658,6 +670,39 @@ impl MidiFile {
         Ok(Self::assemble_with(division, tracks, packed, dedup, file_bytes, parse_start.elapsed()).with_smpte_tempo(&hdr))
     }
 
+    /// A MIDI given as its tracks' data (what follows each "MTrk" and length), each read
+    /// to its end; the tracks are packed in parallel, in this order.
+    pub(crate) fn from_tracks<R: Read + Send>(division: u16, tracks: Vec<R>, vel_levels: u8, progress: &Progress) -> Result<Self, ParseError> {
+        struct Counted<R>(R, u64);
+        impl<R: Read> Read for Counted<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(buf)?;
+                self.1 += n as u64;
+                Ok(n)
+            }
+        }
+        progress.tracks_total.store(tracks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let parse_start = std::time::Instant::now();
+        let dedup = Dedup::new();
+        let packed: Vec<(PackedTrack, u64)> = tracks
+            .into_par_iter()
+            .map_init(
+                || (vec![0u8; WINDOW], Scratch::default()),
+                |(window, scratch), r| {
+                    let mut input = Input::to_end(window, Counted(r, 0));
+                    let t = pack_track(&mut input, vel_levels, scratch, &dedup, None)?;
+                    let len = input.src.1;
+                    scratch.trim();
+                    progress.track_done(len, 1, t.note_count);
+                    Ok((t, len))
+                },
+            )
+            .collect::<Result<_, ParseError>>()?;
+        let file_bytes = 14 + packed.iter().map(|(_, len)| 8 + len).sum::<u64>();
+        let packed = packed.into_iter().map(|(t, _)| vec![t]);
+        Ok(Self::assemble(division, packed, dedup, file_bytes, parse_start.elapsed()))
+    }
+
     /// With an SMPTE division the speed is fixed: the tempo events are ignored.
     fn with_smpte_tempo(mut self, hdr: &[u8; 14]) -> Self {
         if let Some(tempo) = smpte_tempo(hdr) {
@@ -1007,6 +1052,9 @@ const SPLIT_BATCH: usize = 16384;
 /// stream, instead of reading it into memory whole and handing it to the pool.
 const POOLED_MAX: usize = 64 << 20;
 
+/// `Input::left` for a track whose length isn't known: it ends where its source does.
+const UNSIZED: usize = usize::MAX;
+
 /// One track's bytes, read through a window that refills from `src`, so the track never
 /// has to be in memory whole.
 struct Input<'a, R> {
@@ -1036,6 +1084,11 @@ impl<'a, R: Read> Input<'a, R> {
         Input { buf, pos: 0, end: 0, left: len, src }
     }
 
+    /// A track that is all of `src`, however long, read through `buf`.
+    fn to_end(buf: &'a mut [u8], src: R) -> Self {
+        Self::streaming(buf, src, UNSIZED)
+    }
+
     /// The unread bytes: at least `n` of them unless the track ends first.
     #[inline]
     fn window(&mut self, n: usize) -> Result<&[u8], ParseError> {
@@ -1044,9 +1097,23 @@ impl<'a, R: Read> Input<'a, R> {
             self.end -= self.pos;
             self.pos = 0;
             let want = self.left.min(self.buf.len() - self.end);
-            self.src.read_exact(&mut self.buf[self.end..self.end + want])?;
-            self.end += want;
-            self.left -= want;
+            if self.left == UNSIZED {
+                let mut got = 0;
+                while got < want {
+                    match self.src.read(&mut self.buf[self.end + got..self.end + want])? {
+                        0 => {
+                            self.left = 0;
+                            break;
+                        }
+                        n => got += n,
+                    }
+                }
+                self.end += got;
+            } else {
+                self.src.read_exact(&mut self.buf[self.end..self.end + want])?;
+                self.end += want;
+                self.left -= want;
+            }
         }
         Ok(&self.buf[self.pos..self.end])
     }
@@ -1064,7 +1131,9 @@ impl<'a, R: Read> Input<'a, R> {
         }
         self.pos = self.end;
         let skipped = std::io::copy(&mut (&mut self.src).take(more as u64), &mut std::io::sink())?;
-        self.left -= more;
+        if self.left != UNSIZED {
+            self.left -= more;
+        }
         Ok(skipped == more as u64)
     }
 }
