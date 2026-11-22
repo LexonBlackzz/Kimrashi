@@ -177,7 +177,6 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     let parallax = cfg.look.view == ViewMode::Parallax;
     let (horizontal, side) = (cfg.look.view == ViewMode::Horizontal, cfg.look.keyboard_side);
     // Perspective: Vertical's layout, notes through the perspective (0 = off).
-    let far = if cfg.look.view == ViewMode::Perspective { cfg.look.perspective_far.clamp(0.1, 0.9) } else { 0.0 };
     // Horizontal without its keyboard: notes run to the edge.
     let bare = horizontal && !cfg.look.horizontal_keyboard;
     let keyboard_h = if parallax || bare { 0 }
@@ -185,6 +184,9 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         else if cfg.look.pfa_style { crate::pfa::key_height(height as f32, width as f32, visual.pitch_min, visual.pitch_max) as u32 }
         else { (height as f32 * 0.12) as u32 };
     let note_h = if horizontal || parallax { height } else { height - keyboard_h };
+    // Perspective: one tilted plane, the keyboard's bottom edge full width (see `crate::Perspective`).
+    let persp = if cfg.look.view == ViewMode::Perspective { crate::Perspective::new(cfg.look.perspective_far, keyboard_h as f32 / height as f32) }
+        else { crate::Perspective::OFF };
     let note_rect = match (horizontal, side) {
         _ if parallax || bare => [0, 0, width, height],
         (false, _) => [0, 0, width, note_h],
@@ -251,9 +253,9 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             ([false; 128], [egui::Color32::TRANSPARENT; 128])
         } else {
             visible.advance(&visual.data, now_us, window_end, future_us / time_px as u64);
-            let lit = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, crate::Perspective { far, near: 1.0 }, &mut instances);
-            let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise && far == 0.0 => 1.0, _ => -1.0 };
-            let view = gpu::NoteView { time_shift: deficit, horizontal, perspective_far: far, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
+            let lit = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, persp, &mut instances);
+            let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise && !persp.is_on() => 1.0, _ => -1.0 };
+            let view = gpu::NoteView { time_shift: deficit, horizontal, perspective_far: persp.far, perspective_near: persp.near, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
             gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, note_rect, [20, 20, 24], &mut frame);
             lit
         };
@@ -277,6 +279,19 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             let rect = egui::Rect::from_min_max(egui::pos2(strip as f32, 0.0), egui::pos2((strip + keyboard_h) as f32, height as f32));
             fill_rect(&mut frame, width, rect, [235, 235, 240]);
             keyboard(&mut frame, width, rect, lo, hi, piano.then_some(&columns), Some(side), &active, &colors);
+        } else if persp.is_on() {
+            let pt = |x: u32, y: u32| egui::pos2(x as f32, y as f32);
+            let kb = egui::Rect::from_min_max(pt(0, note_h), pt(width, height));
+            fill_rect(&mut frame, width, kb, [10, 10, 12]);
+            let mut quads = if look.pfa_style {
+                let (whites, sharps) = crate::pfa::layout(piano.then_some(&columns), lo, hi, 0.0, width as f32);
+                let lit = |p: u8| active[p as usize].then(|| { let c = colors[p as usize]; if c == egui::Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] } });
+                crate::pfa::keyboard(0.0, note_h as f32, width as f32, keyboard_h as f32, [20, 20, 24], &whites, &sharps, &lit)
+            } else {
+                crate::ui::classic_quads(kb, lo, hi, piano.then_some(&columns), &active, &colors)
+            };
+            persp.bend(egui::Rect::from_min_max(pt(0, 0), pt(width, height)), kb, &mut quads);
+            crate::pfa::fill(&mut frame, width, &quads);
         } else {
             fill(&mut frame, width, 0.0, width as f32, note_h, note_h + 1, [200, 200, 210]);
             fill(&mut frame, width, 0.0, width as f32, note_h + 1, height, [235, 235, 240]);
@@ -408,5 +423,12 @@ mod tests {
         let Some(perspective) = first_frame("kimrashi-perspective", look(ViewMode::Perspective), 1.0) else { return };
         let (v, p) = (far_end_x(&vertical), far_end_x(&perspective));
         assert!(p + 20.0 < v, "vertical {v}, perspective {p}");
+    }
+    #[test]
+    fn perspective_export_bends_the_keyboard() {
+        let look = crate::settings::Settings { view: ViewMode::Perspective, ..Default::default() };
+        let Some(frame) = first_frame("kimrashi-perspective-keys", look, 5.0) else { return };
+        assert_ne!(pixel(&frame, 1, 89), [10, 10, 12], "the bottom edge is full width");
+        assert_eq!(pixel(&frame, 1, 81), [10, 10, 12], "the keyboard line is narrower: background beside it");
     }
 }

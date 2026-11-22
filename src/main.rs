@@ -813,6 +813,17 @@ impl Perspective {
 
     /// Where key fraction `x` at depth `z` lands: (x, height), as fractions of the view.
     pub fn point(&self, x: f32, z: f32) -> (f32, f32) { (0.5 + (x - 0.5) / z, self.y_total(z)) }
+
+    /// Tilts quads drawn flat in `keyboard` (the full width of `view`, its top the keyboard line)
+    /// onto the plane: a point `d` of the way down the keyboard sits at depth `near - d (near - 1)`.
+    pub fn bend(&self, view: egui::Rect, keyboard: egui::Rect, quads: &mut [pfa::Quad]) {
+        for p in quads.iter_mut().flat_map(|q| q.p.iter_mut()) {
+            let x = (p[0] - keyboard.left()) / keyboard.width().max(1e-6);
+            let d = ((p[1] - keyboard.top()) / keyboard.height().max(1e-6)).clamp(0.0, 1.0);
+            let (x, y) = self.point(x, self.near - d * (self.near - 1.0));
+            *p = [view.left() + x * view.width(), view.bottom() - y * view.height()];
+        }
+    }
 }
 
 /// Sample time of each screen row (row 0 at the keyboard line): even steps of `height_time /

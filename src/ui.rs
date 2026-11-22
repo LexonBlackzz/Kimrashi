@@ -781,7 +781,7 @@ pub(crate) fn draw_piano_roll(
     // Parallax: no keyboard, notes fill the view, a playhead down the middle.
     let in_parallax = view == crate::settings::ViewMode::Parallax;
     // Perspective: Vertical's layout, notes through the perspective (0 = off).
-    let far = if view == crate::settings::ViewMode::Perspective { perspective_far.clamp(0.1, 0.9) } else { 0.0 };
+    let perspective = view == crate::settings::ViewMode::Perspective;
     // Horizontal without its keyboard: notes run to the edge.
     let bare = side.is_some() && !horizontal_keyboard;
     if !in_parallax { parallax.clear(); }
@@ -791,6 +791,9 @@ pub(crate) fn draw_piano_roll(
     let eased = if pfa { egui::emath::easing::cubic_out(linear) } else { 1.0 - egui::emath::easing::cubic_out(1.0 - linear) };
     let classic_height = (rect.height() * 0.12).clamp(36.0, 120.0);
     let keyboard_height = classic_height + (crate::pfa::key_height(rect.height(), rect.width(), pitch_min, pitch_max) - classic_height) * eased;
+    // Perspective: one tilted plane, the keyboard's bottom edge full width (see `crate::Perspective`).
+    let persp = if perspective { crate::Perspective::new(perspective_far, keyboard_height / rect.height().max(1.0)) }
+        else { crate::Perspective::OFF };
     let keyboard_width = (rect.width() * 0.12).clamp(36.0, 120.0);
     let (note_area, keyboard_rect, edge) = match side {
         _ if in_parallax || bare => (rect, Rect::from_min_max(rect.max, rect.max), [rect.max, rect.max]),
@@ -813,11 +816,7 @@ pub(crate) fn draw_piano_roll(
 
     painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(10, 10, 12));
     painter.rect_filled(note_area, CornerRadius::ZERO, Color32::from_rgb(20, 20, 24));
-    painter.rect_filled(
-        keyboard_rect,
-        CornerRadius::ZERO,
-        Color32::from_rgb(235, 235, 240),
-    );
+    if !persp.is_on() { painter.rect_filled(keyboard_rect, CornerRadius::ZERO, Color32::from_rgb(235, 235, 240)); }
 
     let speed = note_speed_seconds.clamp(0.01, 15.0);
     let future_us = (speed * 1_000_000.0).max(1.0) as u64;
@@ -849,7 +848,7 @@ pub(crate) fn draw_piano_roll(
         }
     }
 
-    if !in_parallax && !bare { painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210))); }
+    if !in_parallax && !bare && !persp.is_on() { painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210))); }
 
     if let Some(song) = song {
         let ppp = ui.ctx().pixels_per_point();
@@ -882,7 +881,7 @@ pub(crate) fn draw_piano_roll(
             let t0 = Instant::now();
 
             (active_keys, active_colors) = build_note_instances(
-                song, visible, now_us, window_end, speed, time_px as u32, piano_layout, crate::Perspective { far, near: 1.0 }, instances,
+                song, visible, now_us, window_end, speed, time_px as u32, piano_layout, persp, instances,
             );
 
             times.build = t0.elapsed();
@@ -896,8 +895,8 @@ pub(crate) fn draw_piano_roll(
                         0,
                         instances.clone(),
                         gpu_key_positions,
-                        gpu::NoteView { horizontal: side.is_some(), perspective_far: far, ..gpu::NoteView::vertical(speed, now_us, match side {
-                            Some(KeyboardSide::Right) => 1.0, Some(KeyboardSide::Left) => -1.0, None if notes_upwards && far == 0.0 => 1.0, None => -1.0,
+                        gpu::NoteView { horizontal: side.is_some(), perspective_far: persp.far, perspective_near: persp.near, ..gpu::NoteView::vertical(speed, now_us, match side {
+                            Some(KeyboardSide::Right) => 1.0, Some(KeyboardSide::Left) => -1.0, None if notes_upwards && !persp.is_on() => 1.0, None => -1.0,
                         }, note_mode) },
                     ));
                 }
@@ -913,12 +912,22 @@ pub(crate) fn draw_piano_roll(
         );
     }
 
-    if eased > 0.0 && side.is_none() && !in_parallax {
+    if persp.is_on() {
+        let mut quads = if pfa {
+            let (whites, sharps) = crate::pfa::layout(piano_layout.then_some(&columns), pitch_min, pitch_max, keyboard_rect.left(), keyboard_rect.width());
+            crate::pfa::keyboard(keyboard_rect.left(), keyboard_rect.top(), keyboard_rect.width(), keyboard_rect.height(), [20, 20, 24],
+                &whites, &sharps, &|p| lit_color(active_keys[p as usize], active_colors[p as usize]))
+        } else {
+            classic_quads(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors)
+        };
+        persp.bend(rect, keyboard_rect, &mut quads);
+        paint_quads(&painter, &quads);
+    } else if eased > 0.0 && side.is_none() && !in_parallax {
         let mut over = painter.clone();
         over.multiply_opacity(eased);
         draw_pfa_keyboard(&over, keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors);
     }
-    if eased < 1.0 && !in_parallax && !bare {
+    if eased < 1.0 && !in_parallax && !bare && !persp.is_on() {
         draw_keyboard(
             &painter,
             keyboard_rect,
@@ -1055,15 +1064,42 @@ fn draw_pfa_keyboard(painter: &egui::Painter, rect: Rect, lo: u8, hi: u8, column
 {
     if lo > hi { return; }
     let (whites, sharps) = crate::pfa::layout(columns, lo, hi, rect.left(), rect.width());
-    let lit = |p: u8| active[p as usize].then(|| { let c = colors[p as usize]; if c == Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] } });
+    let quads = crate::pfa::keyboard(rect.left(), rect.top(), rect.width(), rect.height(), [20, 20, 24], &whites, &sharps,
+        &|p| lit_color(active[p as usize], colors[p as usize]));
+    paint_quads(painter, &quads);
+}
+
+/// A sounding key's colour for the PFA keyboard: its note's, or the default highlight.
+fn lit_color(active: bool, c: Color32) -> Option<crate::pfa::Rgb> {
+    active.then(|| if c == Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] })
+}
+
+/// Quads (two triangles each, colour per corner) as one mesh.
+fn paint_quads(painter: &egui::Painter, quads: &[crate::pfa::Quad]) {
     let mut mesh = egui::Mesh::default();
-    for q in crate::pfa::keyboard(rect.left(), rect.top(), rect.width(), rect.height(), [20, 20, 24], &whites, &sharps, &lit) {
+    for q in quads {
         let base = mesh.vertices.len() as u32;
         for (p, c) in q.p.iter().zip(q.c) { mesh.colored_vertex(Pos2::new(p[0], p[1]), Color32::from_rgb(c[0], c[1], c[2])); }
         mesh.add_triangle(base, base + 1, base + 2);
         mesh.add_triangle(base, base + 2, base + 3);
     }
     painter.add(egui::Shape::mesh(mesh));
+}
+
+/// The classic keyboard (see `draw_keyboard`) as quads: per key an edge, then its body inset by
+/// a pixel on every side but the one facing the notes. For drawing it bent (`Perspective::bend`).
+pub(crate) fn classic_quads(rect: Rect, lo: u8, hi: u8, columns: Option<&[(f32, f32); 128]>,
+    active: &[bool; 128], colors: &[Color32; 128]) -> Vec<crate::pfa::Quad>
+{
+    let quad = |r: Rect, c: crate::pfa::Rgb| crate::pfa::Quad {
+        p: [[r.left(), r.top()], [r.right(), r.top()], [r.right(), r.bottom()], [r.left(), r.bottom()]], c: [c; 4] };
+    keyboard_rects(rect, lo, hi, columns, None).into_iter().flat_map(|(p, r)| {
+        let (edge, idle, lit) = if is_black_key(p) { ([80; 3], [25, 25, 30], [255, 160, 100]) } else { ([150, 150, 160], [245, 245, 250], [255, 220, 140]) };
+        let c = colors[p as usize];
+        let body = if !active[p as usize] { idle } else if c == Color32::TRANSPARENT { lit } else { [c.r(), c.g(), c.b()] };
+        let inner = Rect::from_min_max(Pos2::new(r.left() + 1.0, r.top()), Pos2::new(r.right() - 1.0, r.bottom() - 1.0));
+        [quad(r, edge), quad(inner, body)]
+    }).collect()
 }
 
 /// Key rectangles, whites first then sharps. `side: None` lays the keyboard along the bottom,
