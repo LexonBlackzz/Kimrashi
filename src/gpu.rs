@@ -448,12 +448,56 @@ struct NotePipeline {
     target_format: wgpu::TextureFormat,
 }
 
+/// The instance buffer's usage: storage only where the shader reads it as storage.
+fn instance_usage(relative: bool) -> wgpu::BufferUsages {
+    let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+    if relative { usage } else { usage | wgpu::BufferUsages::STORAGE }
+}
+
+/// How the note shader gets its notes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NoteInput {
+    /// A storage buffer of slots, indexed through a per-instance slot vertex buffer (the default).
+    Slots,
+    /// Notes in draw order as per-instance vertex data: for GPUs without storage buffers in vertex
+    /// shaders (e.g. Intel HD 4000, OpenGL 4.0 only on Windows). Re-uploads every note each change.
+    Vertex,
+    /// The previous shader's vertex layout (`RenderBenchmark`'s pixel comparison).
+    Reference,
+}
+
 impl NotePipeline {
+    /// The storage-buffer pipeline, or the vertex-input fallback where the device rejects it
+    /// (or `KIM_VERTEX_NOTES` is set, to try the fallback anywhere).
     fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        Self::with_shader(device, target_format, include_str!("../shaders/notes.wgsl"), false)
+        if std::env::var_os("KIM_VERTEX_NOTES").is_none() {
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let pipeline = Self::with_input(device, target_format, NoteInput::Slots);
+            match pollster_block_on(device.pop_error_scope()) {
+                None => return pipeline,
+                Some(e) => eprintln!("notes: storage buffers unsupported, using vertex input ({e})"),
+            }
+        }
+        Self::with_input(device, target_format, NoteInput::Vertex)
     }
 
-    fn with_shader(device: &wgpu::Device, target_format: wgpu::TextureFormat, source: &str, relative: bool) -> Self {
+    fn with_input(device: &wgpu::Device, target_format: wgpu::TextureFormat, input: NoteInput) -> Self {
+        let source = include_str!("../shaders/notes.wgsl").replace("\r\n", "\n");
+        if input != NoteInput::Vertex { return Self::with_shader(device, target_format, &source, input); }
+        let mut source = source;
+        for (from, to) in [
+            ("@group(0) @binding(2)\nvar<storage, read> instances: array<NoteInstance>;\n", ""),
+            ("    @location(0) slot: u32,", "    @location(0) start_us: vec2<u32>,\n    @location(1) length: f32,\n    @location(2) key_color: u32,"),
+            ("    let note = instances[input.slot];", "    let note = NoteInstance(input.start_us, input.length, input.key_color);"),
+        ] {
+            assert!(source.contains(from), "notes.wgsl changed: {from}");
+            source = source.replace(from, to);
+        }
+        Self::with_shader(device, target_format, &source, NoteInput::Vertex)
+    }
+
+    fn with_shader(device: &wgpu::Device, target_format: wgpu::TextureFormat, source: &str, input: NoteInput) -> Self {
+        let relative = input != NoteInput::Slots;
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("notes.bind_group_layout"),
             entries: &{ let mut entries = vec![
@@ -507,11 +551,18 @@ impl NotePipeline {
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: if relative { mem::size_of::<NoteInstance>() as u64 } else { 4 },
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &if relative { vec![
+                    attributes: &match input {
+                    NoteInput::Reference => vec![
                         wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
                         wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Uint32 },
                         wgpu::VertexAttribute { offset: 12, shader_location: 2, format: wgpu::VertexFormat::Uint32 },
-                    ] } else { vec![
+                    ],
+                    NoteInput::Vertex => vec![
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Uint32x2 },
+                        wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32 },
+                        wgpu::VertexAttribute { offset: 12, shader_location: 2, format: wgpu::VertexFormat::Uint32 },
+                    ],
+                    NoteInput::Slots => vec![
                         wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Uint32 },
                     ] },
                 }],
@@ -563,7 +614,7 @@ impl NotePipeline {
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("notes.instances"),
             size: 256,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: instance_usage(relative),
             mapped_at_creation: false,
         });
 
@@ -706,7 +757,7 @@ impl NotePipeline {
         let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("notes.instances.grow"),
             size: (capacity * std::mem::size_of::<NoteInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: instance_usage(self.relative),
             mapped_at_creation: false,
         });
         self.instance_buffer = new_buffer;
@@ -782,7 +833,7 @@ impl RenderBenchmark {
         source.replace_range(first..end,
             "    let start_norm = clamp(input.start_length.x / safe_height, 0.0, 2.0);\n    let end_norm = clamp((input.start_length.x + input.start_length.y) / safe_height, 0.0, 2.0);\n\n");
         source = source.replace("out.border_width = 1.0;", "out.border_width = f32(input.border_width);");
-        let reference = NotePipeline::with_shader(&device, format, &source, true);
+        let reference = NotePipeline::with_shader(&device, format, &source, NoteInput::Reference);
         let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("bench.timestamps"), ty: wgpu::QueryType::Timestamp, count: 2,
         });
@@ -1202,6 +1253,20 @@ mod tests {
         let px = draw(&mut gpu, &[LayerDraw { instances: one_note(0.8, 0.2, [255, 0, 0]), view }]);
         let brightest = (1..4).flat_map(|y| (24..40).map(move |x| (x, y))).map(|(x, y)| px(x, y)[0]).max().unwrap();
         assert!((40..=60).contains(&brightest), "brightest {brightest}");
+    }
+
+    #[test]
+    fn vertex_input_fallback_draws_like_storage() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        let n = |offset: f32, len: f32, key: u32, c: u32| NoteInstance { start_us: [(NOW as i64 + (offset * 1e6) as i64) as u32, 0], len, key_color: key | c << 8 };
+        let ring = Arc::new(InstanceRing::from_ordered([n(0.3, 0.3, 60, 0x00FF00), n(-0.1, 0.5, 60 | 0x80, 0xFF0000), n(0.1, 0.2, 60, 0x2040FF)]));
+        let views = [NoteView::vertical(1.0, NOW, -1.0, 0), NoteView { flat_mode: 2, ..persp() }, blocks()];
+        let storage: Vec<_> = views.iter().map(|&view| draw(&mut gpu, &[LayerDraw { instances: ring.clone(), view }])).collect();
+        gpu.layers = vec![NotePipeline::with_input(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, NoteInput::Vertex)];
+        for (i, &view) in views.iter().enumerate() {
+            let fallback = draw(&mut gpu, &[LayerDraw { instances: ring.clone(), view }]);
+            assert!((0..64).all(|y| (0..64).all(|x| fallback(x, y) == storage[i](x, y))), "view {i} differs");
+        }
     }
 
     #[test]
