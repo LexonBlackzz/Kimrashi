@@ -799,8 +799,9 @@ pub(crate) struct Perspective {
     pub block: f32,
 }
 
-/// Height of note blocks and raised black keys in the Blocks view (see `Perspective::lift`).
-pub(crate) const BLOCK_H: f32 = 0.015;
+/// Height of note blocks and raised black keys in the Blocks view, as a fraction of the view's
+/// height at depth 1 (`1/z` of it at depth z), whatever the far width (see `Perspective::blocks`).
+pub(crate) const BLOCK_H: f32 = 0.02;
 
 impl Perspective {
     pub const OFF: Self = Self { far: 0.0, near: 1.0, block: 0.0 };
@@ -812,6 +813,10 @@ impl Perspective {
     }
 
     pub fn is_on(&self) -> bool { self.far > 0.0 }
+
+    /// With blocks `BLOCK_H` high on screen. In camera heights that is `BLOCK_H (1 - far)`: a wider
+    /// far edge is a camera higher above the plane, which would otherwise stretch the blocks.
+    pub fn blocks(self) -> Self { Self { block: BLOCK_H * (1.0 - self.far), ..self } }
 
     /// Height of depth `z` above the screen's bottom edge, as a fraction of the view (top = 1).
     #[cfg(test)]
@@ -2856,6 +2861,15 @@ mod tests {
             assert!(rows.windows(2).all(|w| w[0] < w[1]) && rows[99] < 1_000_000, "{far}: {rows:?}");
             let (bottom, top) = (rows[1] - rows[0], rows[99] - rows[98]);
             if far == 0.3 { assert!(top > 5 * bottom, "{bottom} {top}"); }
+        }
+    }
+
+    #[test]
+    fn blocks_stand_as_high_on_screen_at_any_far_width() {
+        let rise = |far: f32| { let p = Perspective::new(far, 0.15).blocks(); p.lift(0.2, p.near, p.block).1 - p.lift(0.2, p.near, 0.0).1 };
+        for far in [0.1, 0.3, 0.9] {
+            let p = Perspective::new(far, 0.15);
+            assert!((rise(far) - BLOCK_H / p.near).abs() < 1e-4, "far {far}: {}", rise(far));
         }
     }
 

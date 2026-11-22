@@ -795,8 +795,10 @@ pub(crate) fn draw_piano_roll(
     let classic_height = (rect.height() * 0.12).clamp(36.0, 120.0);
     let keyboard_height = classic_height + (crate::pfa::key_height(rect.height(), rect.width(), pitch_min, pitch_max) - classic_height) * eased;
     // Perspective: one tilted plane, the keyboard's bottom edge full width (see `crate::Perspective`).
-    let persp = if perspective { crate::Perspective { block: if blocks { crate::BLOCK_H } else { 0.0 },
-        ..crate::Perspective::new(perspective_far, keyboard_height / rect.height().max(1.0)) } }
+    let persp = if perspective {
+        let p = crate::Perspective::new(perspective_far, keyboard_height / rect.height().max(1.0));
+        if blocks { p.blocks() } else { p }
+    }
         else { crate::Perspective::OFF };
     let keyboard_width = (rect.width() * 0.12).clamp(36.0, 120.0);
     let (note_area, keyboard_rect, edge) = match side {

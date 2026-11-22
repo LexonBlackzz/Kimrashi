@@ -185,9 +185,10 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         else { (height as f32 * 0.12) as u32 };
     let note_h = if horizontal || parallax { height } else { height - keyboard_h };
     // Perspective: one tilted plane, the keyboard's bottom edge full width (see `crate::Perspective`).
-    let persp = if matches!(cfg.look.view, ViewMode::Perspective | ViewMode::Blocks) { crate::Perspective {
-        block: if cfg.look.view == ViewMode::Blocks { crate::BLOCK_H } else { 0.0 },
-        ..crate::Perspective::new(cfg.look.perspective_far, keyboard_h as f32 / height as f32) } }
+    let persp = if matches!(cfg.look.view, ViewMode::Perspective | ViewMode::Blocks) { 
+        let p = crate::Perspective::new(cfg.look.perspective_far, keyboard_h as f32 / height as f32);
+        if cfg.look.view == ViewMode::Blocks { p.blocks() } else { p }
+    }
         else { crate::Perspective::OFF };
     let note_rect = match (horizontal, side) {
         _ if parallax || bare => [0, 0, width, height],
