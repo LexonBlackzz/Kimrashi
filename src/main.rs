@@ -782,6 +782,12 @@ impl KeyNotes {
     }
 }
 
+/// Drops everything drawn from the current song (its notes, decode workers and layers).
+fn drop_song_views(visible: &mut VisibleNotes, parallax: &mut parallax::Parallax) {
+    *visible = VisibleNotes::default();
+    parallax.clear();
+}
+
 fn render_tracks(song: &SongData) -> Vec<bool> {
     render_tracks_in(song, &vec![true; song.midi.tracks.len()])
 }
@@ -2064,7 +2070,7 @@ impl eframe::App for AppState {
 
 impl AppState {
     fn reset_visible_indices(&mut self) {
-        self.visible = VisibleNotes::default();
+        drop_song_views(&mut self.visible, &mut self.parallax);
     }
 
     /// Jump to `target_us`, keeping the clock running or paused as it was.

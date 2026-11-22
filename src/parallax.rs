@@ -3,27 +3,34 @@
 //! culling shortcuts stay correct, and is drawn as one layer with its own speed.
 
 use std::sync::Arc;
-use crate::{build_note_instances, gpu, render_tracks_in, song::SongData, VisibleNotes, VisualSong};
+use crate::{build_note_instances, gpu, parser::{Record, TrackReader}, render_tracks_in, song::SongData, VisibleNotes, VisualSong};
 
 /// Speed steps: tracks on the same step move together and are culled together.
 pub const STEPS: usize = 64;
+/// `track_steps` for a track with no notes: it is in no layer.
+pub const NO_STEP: u8 = u8::MAX;
 
-/// Speed step for each packed track, by its source track's rank (first = step 0 = nearest),
-/// and how many steps there are (one per source track, up to `STEPS`).
-// ponytail: ranks every source track that was packed, note-less ones included (usually just a
-// conductor track); rank only tracks with notes if an empty step ever shows.
+/// Speed step for each packed track, by its source track's rank among the source tracks with
+/// notes (first = step 0 = nearest; `NO_STEP` for a track without notes, such as a conductor
+/// track), and how many steps there are (one per source track with notes, up to `STEPS`).
 pub fn track_steps(song: &SongData) -> (Vec<u8>, usize) {
-    let origins = &song.midi.track_origin;
-    let mut distinct = origins.clone();
+    let midi = &song.midi;
+    // A note track stops at its first note, and a track without notes is short.
+    let has_notes: Vec<bool> = (0..midi.tracks.len()).map(|i| {
+        let mut reader = TrackReader::default();
+        std::iter::from_fn(|| reader.next(midi.track(i))).any(|(_, r)| matches!(r, Record::Note { .. }))
+    }).collect();
+    let mut distinct: Vec<u32> = midi.track_origin.iter().zip(&has_notes).filter(|(_, &n)| n).map(|(&o, _)| o).collect();
     distinct.sort_unstable();
     distinct.dedup();
-    let n = distinct.len().max(1);
+    let n = distinct.len();
     let steps = n.min(STEPS);
-    let step = |origin: u32| {
-        let rank = distinct.binary_search(&origin).unwrap_or(0);
-        if n == 1 { 0 } else { (rank * (steps - 1) + (n - 1) / 2) / (n - 1) }
+    let step = |origin: u32| match distinct.binary_search(&origin) {
+        Ok(rank) if n > 1 => ((rank * (steps - 1) + (n - 1) / 2) / (n - 1)) as u8,
+        Ok(_) => 0,
+        Err(_) => NO_STEP,
     };
-    (origins.iter().map(|&o| step(o) as u8).collect(), steps)
+    (midi.track_origin.iter().map(|&o| step(o)).collect(), steps)
 }
 
 /// 1.0 for the nearest step, `far` for the farthest, linear between.
@@ -51,10 +58,11 @@ impl Parallax {
 
     /// Advances and builds every layer for this frame, nearest first, and returns what to draw.
     /// `span_s`: the note speed (seconds from the edge to the playhead for the nearest layer);
-    /// `time_px`: pixels along the time axis; `max_instances`: the cap over all layers (0 = none).
+    /// `time_px`: pixels along the time axis; `max_instances`: the cap over all layers (0 = none);
+    /// `piano_layout`: sharps' columns overlap the naturals, so sharps draw on top.
     #[allow(clippy::too_many_arguments)]
     pub fn frame(&mut self, song: &VisualSong, now_us: u64, duration_us: u64, span_s: f32, far: f32,
-        time_px: u32, flat_mode: u32, collapse: bool, max_instances: usize) -> Vec<gpu::LayerDraw>
+        time_px: u32, flat_mode: u32, collapse: bool, max_instances: usize, piano_layout: bool) -> Vec<gpu::LayerDraw>
     {
         let current = self.built.as_ref().is_some_and(|(s, f, c)| Arc::ptr_eq(s, &song.data) && *f == far && *c == collapse);
         if !current {
@@ -84,9 +92,9 @@ impl Parallax {
             // ponytail: near the start, pixel culling maps rows from the clamped origin, up to
             // `time_shift` off; it only picks which overlapping notes survive for those seconds.
             layer.visible.advance(&song.data, origin, window_end, 2 * half_us / time_px.max(1) as u64);
-            build_note_instances(song, &mut layer.visible, origin, window_end, height_time, time_px, false, &mut layer.instances);
+            build_note_instances(song, &mut layer.visible, origin, window_end, height_time, time_px, piano_layout, &mut layer.instances);
             if max_instances > 0 && used + layer.instances.len() > max_instances {
-                Arc::make_mut(&mut layer.instances).cap(max_instances - used, origin, false);
+                Arc::make_mut(&mut layer.instances).cap(max_instances - used, origin, piano_layout);
             }
             used += layer.instances.len();
             let depth = 1.0 / count as f32;
@@ -102,7 +110,7 @@ impl Parallax {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
+    use crate::{parser, VisibleNotes};
 
     fn song_from_bodies(bodies: &[Vec<u8>]) -> VisualSong {
         let mut file = b"MThd\0\0\0\x06\0\x01".to_vec();
@@ -171,19 +179,19 @@ mod tests {
     fn layer_windows_scale_with_speed_and_survive_song_start() {
         let song = song(&[&[60], &[61], &[62]]);
         let mut parallax = Parallax::default();
-        let layers = parallax.frame(&song, 2_000_000, 4_000_000, 1.0, 0.5, 600, 1, true, 1 << 20);
+        let layers = parallax.frame(&song, 2_000_000, 4_000_000, 1.0, 0.5, 600, 1, true, 1 << 20, false);
         assert_eq!(layers.len(), 3);
         assert_eq!((layers[0].view.height_time, layers[0].view.now_us), (2.0, 1_000_000));
         assert_eq!((layers[2].view.height_time, layers[2].view.now_us, layers[2].view.time_shift), (4.0, 0, 0.0));
         assert!(layers[0].view.depth[0] < layers[2].view.depth[0] && layers[0].view.brightness > layers[2].view.brightness);
-        let layers = Parallax::default().frame(&song, 500_000, 4_000_000, 1.0, 0.5, 600, 1, true, 1 << 20);
+        let layers = Parallax::default().frame(&song, 500_000, 4_000_000, 1.0, 0.5, 600, 1, true, 1 << 20, false);
         assert_eq!((layers[2].view.now_us, layers[2].view.time_shift), (0, 1.5));
     }
 
     #[test]
     fn cap_drops_far_layers_first() {
         let song = song(&[&[60, 64, 67], &[61], &[62]]);
-        let layers = Parallax::default().frame(&song, 1_000_000, 4_000_000, 1.0, 0.5, 600, 1, true, 2);
+        let layers = Parallax::default().frame(&song, 1_000_000, 4_000_000, 1.0, 0.5, 600, 1, true, 2, false);
         assert_eq!(layers.len(), 1);
         assert_eq!((layers[0].view.depth[0], layers[0].instances.len()), (0.0, 2));
     }
@@ -201,12 +209,46 @@ mod tests {
     fn seeking_back_resets_every_layer() {
         let song = sequence(3);
         let mut parallax = Parallax::default();
-        parallax.frame(&song, 10_000_000, 12_000_000, 1.0, 0.5, 600, 1, true, 1 << 20);
-        let layers = parallax.frame(&song, 2_000_000, 12_000_000, 1.0, 0.5, 600, 1, true, 1 << 20);
+        parallax.frame(&song, 10_000_000, 12_000_000, 1.0, 0.5, 600, 1, true, 1 << 20, false);
+        let layers = parallax.frame(&song, 2_000_000, 12_000_000, 1.0, 0.5, 600, 1, true, 1 << 20, false);
         for (layer, draw) in parallax.layers.iter().zip(&layers) {
             let (lo, hi) = (draw.view.now_us, draw.view.now_us + (draw.view.height_time * 1e6) as u64);
             let notes: Vec<_> = layer.visible.window.iter().filter(|n| n.end_us > lo).map(|n| (n.start_us, n.end_us)).collect();
             assert!(!notes.is_empty() && notes.iter().all(|&(s, _)| s < hi + 1_000_000), "{lo}..{hi}: {notes:?}");
         }
+    }
+    #[test]
+    fn a_conductor_track_takes_no_speed_step() {
+        let tempo_only = vec![0, 0xff, 0x51, 3, 0x07, 0xa1, 0x20, 0, 0xff, 0x2f, 0];
+        let note = |k: u8| vec![0, 0x90, k, 100, 0x9e, 0, 0x80, k, 0, 0, 0xff, 0x2f, 0];
+        let song = song_from_bodies(&[tempo_only, note(60), note(61), note(62)]);
+        let (steps, count) = track_steps(&song.data);
+        assert_eq!(count, 3, "{steps:?}");
+        assert_eq!(steps.iter().filter(|&&s| s != NO_STEP).copied().collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn piano_layout_draws_sharps_over_naturals() {
+        // A sharp, then a newer natural beside it (their columns overlap in the piano layout).
+        let body = vec![0, 0x90, 61, 100, 0x81, 0x70, 0x90, 60, 100, 0x9e, 0, 0x80, 61, 0, 0, 0x80, 60, 0, 0, 0xff, 0x2f, 0];
+        let song = song_from_bodies(&[body]);
+        let keys = |piano| {
+            let layers = Parallax::default().frame(&song, 1_000_000, 8_000_000, 1.0, 0.5, 600, 1, true, 1 << 20, piano);
+            layers[0].instances.iter().map(|n| n.key_color & 0x7f).collect::<Vec<_>>()
+        };
+        assert_eq!(keys(false), [60, 61], "newest first");
+        assert_eq!(keys(true), [61, 60], "sharps first");
+    }
+
+    #[test]
+    fn closing_the_song_lets_go_of_it() {
+        let song = sequence(3);
+        let (mut visible, mut parallax) = (VisibleNotes::default(), Parallax::default());
+        parallax.frame(&song, 1_000_000, 12_000_000, 1.0, 0.5, 600, 1, true, 1 << 20, false);
+        crate::drop_song_views(&mut visible, &mut parallax);
+        // Decode workers exit on their own after being told to stop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while Arc::strong_count(&song.data) > 1 && std::time::Instant::now() < deadline { std::thread::yield_now(); }
+        assert_eq!(Arc::strong_count(&song.data), 1);
     }
 }

@@ -240,7 +240,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         let mut frame = free_rx.try_recv().unwrap_or_default();
         let (mut active, colors) = if parallax {
             let mut draws = layers.frame(&visual, now_us, duration_us, speed, look.parallax_far, time_px, look.note_mode(),
-                look.collapse_overlaps, look.max_instances);
+                look.collapse_overlaps, look.max_instances, piano);
             for d in &mut draws { d.view.time_shift += deficit; }
             gpu.render(&draws, &keys, note_rect, [20, 20, 24], &mut frame);
             ([false; 128], [egui::Color32::TRANSPARENT; 128])

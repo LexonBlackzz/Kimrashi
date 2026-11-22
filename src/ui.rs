@@ -837,7 +837,7 @@ pub(crate) fn draw_piano_roll(
         if in_parallax {
             let t0 = Instant::now();
             let layers = parallax.frame(song, now_us, duration_us, speed, parallax_far, time_px as u32, note_mode,
-                visible.collapse_overlaps, visible.max_instances);
+                visible.collapse_overlaps, visible.max_instances, piano_layout);
             times.build = t0.elapsed();
             times.instances = layers.iter().map(|l| l.instances.len()).sum();
             if let Some(state) = frame.wgpu_render_state() {
