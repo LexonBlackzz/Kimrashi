@@ -18,6 +18,7 @@ mod song;
 mod theme;
 mod ui;
 mod parallax;
+mod matrix;
 mod svms;
 mod sig;
 mod update;
