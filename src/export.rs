@@ -4,7 +4,7 @@
 //! The keyboard is drawn on the CPU (the live view draws it with egui).
 
 use std::{io::Write, process::{Command, Stdio}, sync::Arc, time::Instant};
-use crate::{gpu, parser::Progress, song::SongData, VisibleNotes, VisualSong};
+use crate::{gpu, parser::Progress, settings::KeyboardSide, song::SongData, VisibleNotes, VisualSong};
 
 pub const PRESETS: [&str; 9] = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
 
@@ -77,29 +77,32 @@ fn fill(buf: &mut [u8], width: u32, x0: f32, x1: f32, y0: u32, y1: u32, color: [
     }
 }
 
-/// Mirrors `ui::draw_keyboard`; `columns` is `Some` for the piano layout, else keys sit on their own grid.
-fn keyboard(buf: &mut [u8], width: u32, top: u32, bottom: u32, lo: u8, hi: u8, columns: Option<&[(f32, f32); 128]>,
-    active: &[bool; 128], colors: &[egui::Color32; 128])
+/// Fills `r` (pixels, rounded) with `color`, clipped to the frame.
+fn fill_rect(buf: &mut [u8], width: u32, r: egui::Rect, color: [u8; 3]) {
+    let height = (buf.len() / 4 / width as usize) as u32;
+    let y0 = r.top().round().max(0.0) as u32;
+    let y1 = (r.bottom().round().max(0.0) as u32).min(height);
+    fill(buf, width, r.left(), r.right(), y0, y1, color);
+}
+
+/// Draws `ui::keyboard_rects` (as `ui::draw_keyboard` does) into `rect`, in pixels.
+fn keyboard(buf: &mut [u8], width: u32, rect: egui::Rect, lo: u8, hi: u8, columns: Option<&[(f32, f32); 128]>,
+    side: Option<KeyboardSide>, active: &[bool; 128], colors: &[egui::Color32; 128])
 {
-    let w = width as f32;
-    let black_h = top + ((bottom - top) as f32 * 0.65) as u32;
-    let white_index = |p: u8| (lo..p).filter(|&q| !crate::is_black_key(q)).count() as f32;
-    let white_w = w / (lo..=hi).filter(|&q| !crate::is_black_key(q)).count().max(1) as f32;
-    for black in [false, true] {
-        for p in lo..=hi {
-            if crate::is_black_key(p) != black { continue; }
-            let (l, r) = match columns {
-                Some(c) => (c[p as usize].0 * w, c[p as usize].1 * w),
-                None if black => { let c = white_index(p) * white_w; (c - white_w * 0.35, c + white_w * 0.35) }
-                None => (white_index(p) * white_w, (white_index(p) + 1.0) * white_w),
-            };
-            let (edge, idle, lit) = if black { ([80; 3], [25, 25, 30], [255, 160, 100]) } else { ([150, 150, 160], [245, 245, 250], [255, 220, 140]) };
-            let c = colors[p as usize];
-            let body = if !active[p as usize] { idle } else if c == egui::Color32::TRANSPARENT { lit } else { [c.r(), c.g(), c.b()] };
-            let y1 = if black { black_h } else { bottom };
-            fill(buf, width, l, r, top, y1, edge);
-            fill(buf, width, l + 1.0, r - 1.0, top, y1 - 1, body);
-        }
+    use egui::{pos2, Rect};
+    for (p, r) in crate::ui::keyboard_rects(rect, lo, hi, columns, side) {
+        let black = crate::is_black_key(p);
+        let (edge, idle, lit) = if black { ([80; 3], [25, 25, 30], [255, 160, 100]) } else { ([150, 150, 160], [245, 245, 250], [255, 220, 140]) };
+        let c = colors[p as usize];
+        let body = if !active[p as usize] { idle } else if c == egui::Color32::TRANSPARENT { lit } else { [c.r(), c.g(), c.b()] };
+        fill_rect(buf, width, r, edge);
+        // A 1 px edge on every side but the one facing the notes.
+        let inner = match side {
+            None => Rect::from_min_max(pos2(r.left() + 1.0, r.top()), pos2(r.right() - 1.0, r.bottom() - 1.0)),
+            Some(KeyboardSide::Left) => Rect::from_min_max(pos2(r.left() + 1.0, r.top() + 1.0), pos2(r.right(), r.bottom() - 1.0)),
+            Some(KeyboardSide::Right) => Rect::from_min_max(pos2(r.left(), r.top() + 1.0), pos2(r.right() - 1.0, r.bottom() - 1.0)),
+        };
+        fill_rect(buf, width, inner, body);
     }
 }
 
@@ -240,7 +243,8 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             let quads = crate::pfa::keyboard(0.0, note_h as f32, width as f32, keyboard_h as f32, [20, 20, 24], &whites, &sharps, &lit);
             crate::pfa::fill(&mut frame, width, &quads);
         } else {
-            keyboard(&mut frame, width, note_h + 1, height, lo, hi, piano.then_some(&columns), &active, &colors);
+            keyboard(&mut frame, width, egui::Rect::from_min_max(egui::pos2(0.0, (note_h + 1) as f32), egui::pos2(width as f32, height as f32)),
+                lo, hi, piano.then_some(&columns), None, &active, &colors);
         }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };
         if !on_frame(&report) { result = Err("cancelled".into()); break; }

@@ -1,6 +1,7 @@
 //! The interface: toolbar pieces, the Settings window, the benchmark window, the piano roll and stats overlay.
 
 use super::*;
+use crate::settings::KeyboardSide;
 
 impl AppState {
     pub(crate) fn transport_controls(&mut self, ui: &mut egui::Ui, current_time_us: u64) {
@@ -867,6 +868,7 @@ pub(crate) fn draw_piano_roll(
             pitch_min,
             pitch_max,
             piano_layout.then_some(&columns),
+            None,
             &active_keys,
             &active_colors,
         );
@@ -1007,133 +1009,80 @@ fn draw_pfa_keyboard(painter: &egui::Painter, rect: Rect, lo: u8, hi: u8, column
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// Key rectangles, whites first then sharps. `side: None` lays the keyboard along the bottom,
+/// with sharps hanging from its top edge (the one facing the notes). `Some(side)` stands it on
+/// its side at that screen edge: low pitch at the bottom, sharps reaching in from the edge
+/// facing the notes, 65 % of the way across.
+// Where the notes' columns are, when they follow the keys (see `key_columns`);
+// otherwise the notes are on an even grid and the keys are laid out on their own.
+pub(crate) fn keyboard_rects(rect: Rect, pitch_min: u8, pitch_max: u8, columns: Option<&[(f32, f32); 128]>,
+    side: Option<KeyboardSide>) -> Vec<(u8, Rect)>
+{
+    let mut keys = Vec::new();
+    if pitch_min > pitch_max { return keys; }
+    // White-key index per pitch (None for black keys).
+    let mut white_index = [None::<u32>; 128];
+    let mut whites = 0;
+    for pitch in pitch_min..=pitch_max {
+        if !is_black_key(pitch) { white_index[pitch as usize] = Some(whites); whites += 1; }
+    }
+    if whites == 0 { return keys; }
+    let white = 1.0 / whites as f32;
+    // (pitch, along-the-keys span as fractions, depth from the note side as a fraction)
+    let mut span = |pitch: u8, (a, b): (f32, f32), depth: f32| {
+        let r = match side {
+            None => Rect::from_min_max(Pos2::new(rect.left() + a * rect.width(), rect.top()),
+                Pos2::new(rect.left() + b * rect.width(), rect.top() + depth * rect.height())),
+            Some(side) => {
+                let (y0, y1) = (rect.bottom() - b * rect.height(), rect.bottom() - a * rect.height());
+                let (x0, x1) = match side {
+                    KeyboardSide::Left => (rect.right() - depth * rect.width(), rect.right()),
+                    KeyboardSide::Right => (rect.left(), rect.left() + depth * rect.width()),
+                };
+                Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1))
+            }
+        };
+        keys.push((pitch, r));
+    };
+    for pitch in pitch_min..=pitch_max {
+        let Some(i) = white_index[pitch as usize] else { continue };
+        span(pitch, columns.map_or((i as f32 * white, (i + 1) as f32 * white), |c| c[pitch as usize]), 1.0);
+    }
+    for pitch in (pitch_min..=pitch_max).filter(|&p| is_black_key(p)) {
+        // Centred on the line between its white neighbours (or on its note column, when the
+        // notes follow the keys, so a black key at the edge is drawn too).
+        let prev = white_index[pitch.saturating_sub(1) as usize];
+        let ab = match (columns, prev) {
+            (Some(c), _) => c[pitch as usize],
+            (None, Some(i)) => { let c = (i + 1) as f32 * white; (c - white * 0.35, c + white * 0.35) }
+            (None, None) => continue,
+        };
+        span(pitch, ab, 0.65);
+    }
+    keys
+}
+
 pub(crate) fn draw_keyboard(
     painter: &egui::Painter,
     rect: Rect,
     pitch_min: u8,
     pitch_max: u8,
-    // Where the notes' columns are, when they follow the keys (see `key_columns`);
-    // otherwise the notes are on an even grid and the keys are laid out on their own.
     columns: Option<&[(f32, f32); 128]>,
+    side: Option<KeyboardSide>,
     active_keys: &[bool; 128],
     active_colors: &[Color32; 128],
 ) {
-    if pitch_min > pitch_max {
-        return;
-    }
-
-    let white_idle = Color32::from_rgb(245, 245, 250);
-    let white_active = Color32::from_rgb(255, 220, 140);
-    let black_idle = Color32::from_rgb(25, 25, 30);
-    let black_active = Color32::from_rgb(255, 160, 100);
-
-    // --- Strategy: Calculate layout based on white keys.
-    // We ignore the passed `_key_width` as it's based on a semitone-grid
-    // for the piano roll, not a realistic keyboard layout.
-
-    // White-key index per pitch (None for black keys and out-of-range pitches).
-    let mut white_key_positions = [None::<u32>; 128];
-    let mut white_key_count = 0;
-
-    // 1. Find all white keys in range and count them.
-    for pitch in pitch_min..=pitch_max {
-        if !is_black_key(pitch) {
-            white_key_positions[pitch as usize] = Some(white_key_count);
-            white_key_count += 1;
-        }
-    }
-
-    if white_key_count == 0 {
-        return; // No white keys in range, nothing to draw.
-    }
-
-    let white_key_width = rect.width() / white_key_count as f32;
-    let black_key_width = white_key_width * 0.7; // 70% of a white key's width
-    let black_key_height = rect.height() * 0.65; // 65% of the keyboard height, for overlap
-
-    // --- Draw white keys first (bottom layer)
-    for (idx, index) in white_key_positions
-        .iter()
-        .enumerate()
-        .filter_map(|(p, i)| Some((p, (*i)?)))
-    {
-        let (left, right) = match columns {
-            Some(c) => (rect.left() + c[idx].0 * rect.width(), rect.left() + c[idx].1 * rect.width()),
-            None => {
-                let left = rect.left() + (index as f32 * white_key_width);
-                (left, left + white_key_width)
-            }
-        };
-        let key_rect =
-            Rect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom()));
-
-        let color = if active_keys[idx] {
-            let channel_color = active_colors[idx]; // This is now a channel color
-            if channel_color == Color32::TRANSPARENT {
-                white_active
-            } else {
-                channel_color
-            }
+    for (pitch, key_rect) in keyboard_rects(rect, pitch_min, pitch_max, columns, side) {
+        let black = is_black_key(pitch);
+        let (idle, lit, edge, round) = if black {
+            (Color32::from_rgb(25, 25, 30), Color32::from_rgb(255, 160, 100), Color32::from_rgb(80, 80, 80), 1)
         } else {
-            white_idle
+            (Color32::from_rgb(245, 245, 250), Color32::from_rgb(255, 220, 140), Color32::from_rgb(150, 150, 160), 2)
         };
-
+        let channel = active_colors[pitch as usize];
+        let color = if !active_keys[pitch as usize] { idle } else if channel == Color32::TRANSPARENT { lit } else { channel };
         painter.rect_filled(key_rect, CornerRadius::same(1), color);
-        painter.rect_stroke(
-            key_rect,
-            CornerRadius::same(2),
-            Stroke::new(1.0_f32, Color32::from_rgb(150, 150, 160)),
-            StrokeKind::Inside,
-        );
-    }
-
-    // --- Draw black keys on top layer
-    for pitch in pitch_min..=pitch_max {
-        if is_black_key(pitch) {
-            // Find the white key *before* this black key.
-            let prev_white_key_pitch = pitch.saturating_sub(1);
-
-            // Check if the previous white key is in our visible range (when the notes
-            // follow the keys, a black key at the edge is drawn too).
-            if columns.is_some() || white_key_positions[prev_white_key_pitch as usize].is_some() {
-                let (left, right) = match columns {
-                    Some(c) => (rect.left() + c[pitch as usize].0 * rect.width(), rect.left() + c[pitch as usize].1 * rect.width()),
-                    None => {
-                        // Center the black key on the dividing line between the two white keys
-                        let prev_index = white_key_positions[prev_white_key_pitch as usize].unwrap_or(0);
-                        let center_x = rect.left() + (prev_index as f32 + 1.0) * white_key_width;
-                        let left = center_x - (black_key_width / 2.0);
-                        (left, left + black_key_width)
-                    }
-                };
-
-                let key_rect = Rect::from_min_max(
-                    Pos2::new(left, rect.top()),
-                    Pos2::new(right, rect.top() + black_key_height),
-                );
-
-                let idx = pitch as usize;
-                let color = if active_keys[idx] {
-                    let channel_color = active_colors[idx]; // This is now a channel color
-                    if channel_color == Color32::TRANSPARENT {
-                        black_active
-                    } else {
-                        channel_color
-                    }
-                } else {
-                    black_idle
-                };
-
-                painter.rect_filled(key_rect, CornerRadius::same(1), color);
-                // Add a border to black keys
-                painter.rect_stroke(
-                    key_rect,
-                    CornerRadius::same(1),
-                    Stroke::new(1.0_f32, Color32::from_rgb(80, 80, 80)),
-                    StrokeKind::Inside,
-                );
-            }
-        }
+        painter.rect_stroke(key_rect, CornerRadius::same(round), Stroke::new(1.0_f32, edge), StrokeKind::Inside);
     }
 }
 
@@ -1303,5 +1252,30 @@ pub(crate) fn format_timestamp(us: u64) -> String {
         format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
     } else {
         format!("{minutes:02}:{seconds:02}.{millis:03}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::KeyboardSide;
+
+    #[test]
+    fn sideways_keyboard_is_the_bottom_keyboard_rotated() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let bottom = keyboard_rects(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 100.0)), 48, 72, None, None);
+        for side in [KeyboardSide::Left, KeyboardSide::Right] {
+            let tall = keyboard_rects(Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 600.0)), 48, 72, None, Some(side));
+            assert_eq!(bottom.iter().map(|k| k.0).collect::<Vec<_>>(), tall.iter().map(|k| k.0).collect::<Vec<_>>());
+            for (&(pitch, b), &(_, t)) in bottom.iter().zip(&tall) {
+                // Along the keys: low pitch at the bottom.
+                assert!(close(t.top(), 600.0 - b.right()) && close(t.bottom(), 600.0 - b.left()), "{pitch}: {b:?} {t:?}");
+                // Across: as deep as before, from the edge facing the notes.
+                assert!(close(t.width(), b.height()), "{pitch}: {b:?} {t:?}");
+                let inner = match side { KeyboardSide::Left => t.right(), KeyboardSide::Right => t.left() };
+                assert!(close(inner, if side == KeyboardSide::Left { 100.0 } else { 0.0 }), "{pitch} {side:?}: {t:?}");
+            }
+        }
+        assert!(bottom.iter().any(|k| is_black_key(k.0) && k.1.height() < 100.0), "sharps are shorter");
     }
 }
