@@ -261,7 +261,33 @@ impl AppState {
                 egui::Grid::new("settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     use SettingsTab::*;
                     let c = &mut self.cfg;
-                    if show(Display, "Notes fall rise direction") {
+                    if show(Display, "View vertical horizontal parallax") {
+                        use crate::settings::{KeyboardSide, ViewMode};
+                        ui.label("View");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut c.view, ViewMode::Vertical, "Vertical");
+                            ui.selectable_value(&mut c.view, ViewMode::Horizontal, "Horizontal");
+                            ui.selectable_value(&mut c.view, ViewMode::Parallax, "Parallax")
+                                .on_hover_text("No keyboard: notes cross a line in the middle, every track at its own speed");
+                        });
+                        ui.end_row();
+                        shown += 1;
+                        if c.view == ViewMode::Horizontal {
+                            ui.label("Keyboard side");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut c.keyboard_side, KeyboardSide::Left, "Left");
+                                ui.selectable_value(&mut c.keyboard_side, KeyboardSide::Right, "Right");
+                            });
+                            ui.end_row();
+                        }
+                        if c.view == ViewMode::Parallax {
+                            ui.label("Far speed");
+                            ui.add(egui::Slider::new(&mut c.parallax_far, 0.1..=1.0).fixed_decimals(2).suffix("×"))
+                                .on_hover_text("The farthest track's speed, as a fraction of the nearest's");
+                            ui.end_row();
+                        }
+                    }
+                    if c.view == crate::settings::ViewMode::Vertical && show(Display, "Notes fall rise direction") {
                         ui.label("Notes");
                         ui.horizontal(|ui| {
                             ui.selectable_value(&mut c.notes_rise, false, "Fall");

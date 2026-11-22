@@ -16,10 +16,32 @@ pub enum StatsMode {
     Detailed,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Debug)]
+pub enum ViewMode {
+    /// Notes fall to (or rise from) a keyboard along the bottom.
+    #[default]
+    Vertical,
+    /// The keyboard stands on its side at `keyboard_side`.
+    Horizontal,
+    /// No keyboard; a playhead in the middle, every track at its own speed.
+    Parallax,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Debug)]
+pub enum KeyboardSide {
+    #[default]
+    Left,
+    Right,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Settings {
     // Display
+    pub view: ViewMode,
+    pub keyboard_side: KeyboardSide,
+    /// Parallax: the farthest track's speed, as a fraction of the nearest's.
+    pub parallax_far: f32,
     pub note_speed: f32,
     pub notes_rise: bool,
     pub piano_layout: bool,
@@ -64,6 +86,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            view: ViewMode::Vertical,
+            keyboard_side: KeyboardSide::Left,
+            parallax_far: 0.3,
             note_speed: 5.0,
             notes_rise: false,
             piano_layout: false,
@@ -148,6 +173,14 @@ mod tests {
         assert_eq!(Settings::from_json(&serde_json::to_string(&s).unwrap()), s);
         assert_eq!(Settings::from_json("not json"), Settings::default());
         assert_eq!(Settings::from_json(r#"{"vsync":false}"#), Settings { vsync: false, ..Default::default() });
+    }
+
+    #[test]
+    fn old_settings_files_get_the_vertical_view() {
+        let s: Settings = serde_json::from_str(r#"{"note_speed": 2.0}"#).unwrap();
+        assert_eq!((s.view, s.keyboard_side, s.parallax_far), (ViewMode::Vertical, KeyboardSide::Left, 0.3));
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&Settings { view: ViewMode::Parallax, ..s.clone() }).unwrap()).unwrap();
+        assert_eq!(back.view, ViewMode::Parallax);
     }
 
     #[test]
