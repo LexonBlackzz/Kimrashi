@@ -742,6 +742,7 @@ pub(crate) fn draw_piano_roll(
     notes_upwards: bool,
     note_mode: u32,
     piano_layout: bool,
+    (view, keyboard_side): (crate::settings::ViewMode, KeyboardSide),
     (stats_mode, synth_stats): (StatsMode, bool),
     visible: &mut VisibleNotes,
     instances: &mut Arc<gpu::InstanceRing>,
@@ -756,20 +757,32 @@ pub(crate) fn draw_piano_roll(
         (DEFAULT_PITCH_MIN, DEFAULT_PITCH_MAX)
     };
 
+    // Horizontal: the classic keyboard on its side (PFA's keyboard is only drawn along the bottom).
+    let side = (view == crate::settings::ViewMode::Horizontal).then_some(keyboard_side);
     // The keyboard grows to PFA's size and back, easing out in both directions.
-    let pfa = note_mode == 2;
+    let pfa = note_mode == 2 && side.is_none();
     let linear = ui.ctx().animate_bool_with_time(egui::Id::new("pfa_keyboard"), pfa, 0.4);
     let eased = if pfa { egui::emath::easing::cubic_out(linear) } else { 1.0 - egui::emath::easing::cubic_out(1.0 - linear) };
     let classic_height = (rect.height() * 0.12).clamp(36.0, 120.0);
     let keyboard_height = classic_height + (crate::pfa::key_height(rect.height(), rect.width(), pitch_min, pitch_max) - classic_height) * eased;
-    let note_area = Rect::from_min_max(
-        Pos2::new(rect.left(), rect.top()),
-        Pos2::new(rect.right(), rect.bottom() - keyboard_height),
-    );
-    let keyboard_rect = Rect::from_min_max(
-        Pos2::new(rect.left(), rect.bottom() - keyboard_height),
-        Pos2::new(rect.right(), rect.bottom()),
-    );
+    let keyboard_width = (rect.width() * 0.12).clamp(36.0, 120.0);
+    let (note_area, keyboard_rect, edge) = match side {
+        None => {
+            let y = rect.bottom() - keyboard_height;
+            (Rect::from_min_max(rect.min, Pos2::new(rect.right(), y)), Rect::from_min_max(Pos2::new(rect.left(), y), rect.max),
+                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)])
+        }
+        Some(KeyboardSide::Left) => {
+            let x = rect.left() + keyboard_width;
+            (Rect::from_min_max(Pos2::new(x, rect.top()), rect.max), Rect::from_min_max(rect.min, Pos2::new(x, rect.bottom())),
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())])
+        }
+        Some(KeyboardSide::Right) => {
+            let x = rect.right() - keyboard_width;
+            (Rect::from_min_max(rect.min, Pos2::new(x, rect.bottom())), Rect::from_min_max(Pos2::new(x, rect.top()), rect.max),
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())])
+        }
+    };
 
     painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(10, 10, 12));
     painter.rect_filled(note_area, CornerRadius::ZERO, Color32::from_rgb(20, 20, 24));
@@ -809,26 +822,21 @@ pub(crate) fn draw_piano_roll(
         }
     }
 
-    painter.line_segment(
-        [
-            Pos2::new(note_area.left(), note_area.bottom()),
-            Pos2::new(note_area.right(), note_area.bottom()),
-        ],
-        Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210)),
-    );
+    painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210)));
 
     if let Some(song) = song {
-        let px_us = future_us as f32 / (note_area.height() * ui.ctx().pixels_per_point()).max(1.0);
+        let ppp = ui.ctx().pixels_per_point();
+        // Pixels along the time axis.
+        let time_px = if side.is_some() { (note_area.right() * ppp).round() - (note_area.left() * ppp).round() }
+            else { (note_area.bottom() * ppp).round() - (note_area.top() * ppp).round() }.max(1.0);
+        let px_us = future_us as f32 / time_px;
         visible.advance(&song.data, now_us, window_end, px_us as u64);
         times.advance = visible.timing;
         times.decoded = visible.last_batch;
         let t0 = Instant::now();
 
         (active_keys, active_colors) = build_note_instances(
-            song, visible, now_us, window_end, speed,
-            ((note_area.bottom() * ui.ctx().pixels_per_point()).round()
-                - (note_area.top() * ui.ctx().pixels_per_point()).round()).max(1.0) as u32,
-            piano_layout, instances,
+            song, visible, now_us, window_end, speed, time_px as u32, piano_layout, instances,
         );
 
         times.build = t0.elapsed();
@@ -842,7 +850,9 @@ pub(crate) fn draw_piano_roll(
                     0,
                     instances.clone(),
                     gpu_key_positions,
-                    gpu::NoteView::vertical(speed, now_us, if notes_upwards { 1.0 } else { -1.0 }, note_mode),
+                    gpu::NoteView { horizontal: side.is_some(), ..gpu::NoteView::vertical(speed, now_us, match side {
+                        Some(KeyboardSide::Right) => 1.0, Some(KeyboardSide::Left) => -1.0, None if notes_upwards => 1.0, None => -1.0,
+                    }, note_mode) },
                 ));
             }
         }
@@ -868,7 +878,7 @@ pub(crate) fn draw_piano_roll(
             pitch_min,
             pitch_max,
             piano_layout.then_some(&columns),
-            None,
+            side,
             &active_keys,
             &active_colors,
         );

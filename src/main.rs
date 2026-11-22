@@ -2007,6 +2007,7 @@ impl eframe::App for AppState {
                     self.cfg.notes_rise,
                     self.cfg.note_mode(),
                     self.cfg.piano_layout,
+                    (self.cfg.view, self.cfg.keyboard_side),
                     (self.cfg.stats, self.cfg.synth_stats),
                     &mut self.visible,
                     &mut self.instances,

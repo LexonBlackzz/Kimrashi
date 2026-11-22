@@ -1,10 +1,11 @@
 //! Video export: `--export-video <midi> <out.mp4> [--width n] [--height n] [--fps n] [--speed s]`
 //! `[--lead s] [--tail s] [--encoder x264|nvenc|qsv|amf] [--preset ultrafast..veryslow] [--crf n]`
+//! `[--view vertical|horizontal|parallax] [--keyboard-side left|right]` (default: the saved settings)
 //! Renders the real note pipeline offscreen at deterministic song time and pipes raw RGBA to ffmpeg.
 //! The keyboard is drawn on the CPU (the live view draws it with egui).
 
 use std::{io::Write, process::{Command, Stdio}, sync::Arc, time::Instant};
-use crate::{gpu, parser::Progress, settings::KeyboardSide, song::SongData, VisibleNotes, VisualSong};
+use crate::{gpu, parser::Progress, settings::{KeyboardSide, ViewMode}, song::SongData, VisibleNotes, VisualSong};
 
 pub const PRESETS: [&str; 9] = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
 
@@ -170,8 +171,19 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     let first_us = first_note_us(&song);
     let mut visual = VisualSong::new(song);
     visual.set_palette(cfg.look.note_palette, &cfg.look.custom_colors, cfg.look.rainbow_size);
-    let keyboard_h = if cfg.look.pfa_style { crate::pfa::key_height(height as f32, width as f32, visual.pitch_min, visual.pitch_max) as u32 } else { (height as f32 * 0.12) as u32 };
-    let note_h = height - keyboard_h;
+    // Horizontal: the keyboard is a strip `keyboard_h` wide at `side`, and notes fill the rest.
+    let (horizontal, side) = (cfg.look.view == ViewMode::Horizontal, cfg.look.keyboard_side);
+    let keyboard_h = if horizontal { (width as f32 * 0.12) as u32 }
+        else if cfg.look.pfa_style { crate::pfa::key_height(height as f32, width as f32, visual.pitch_min, visual.pitch_max) as u32 }
+        else { (height as f32 * 0.12) as u32 };
+    let note_h = if horizontal { height } else { height - keyboard_h };
+    let note_rect = match (horizontal, side) {
+        (false, _) => [0, 0, width, note_h],
+        (true, KeyboardSide::Left) => [keyboard_h + 1, 0, width - keyboard_h - 1, height],
+        (true, KeyboardSide::Right) => [0, 0, width - keyboard_h - 1, height],
+    };
+    // Pixels along the time axis.
+    let time_px = if horizontal { note_rect[2] } else { note_h };
     let mut gpu = gpu::Offscreen::new(width, height)?;
 
     let mut ffmpeg = Command::new(&cfg.ffmpeg);
@@ -220,12 +232,13 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         let now_us = (t.max(0.0) * 1e6) as u64;
         let deficit = (-t).max(0.0) as f32;
         let window_end = (now_us + future_us).saturating_sub((deficit * 1e6) as u64).max(now_us).min(duration_us.max(now_us));
-        visible.advance(&visual.data, now_us, window_end, future_us / note_h as u64);
-        let (mut active, colors) = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, note_h, piano, &mut instances);
+        visible.advance(&visual.data, now_us, window_end, future_us / time_px as u64);
+        let (mut active, colors) = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, &mut instances);
         if deficit > 0.0 { active = [false; 128]; }
         let mut frame = free_rx.try_recv().unwrap_or_default();
-        let view = gpu::NoteView { time_shift: deficit, ..gpu::NoteView::vertical(speed, now_us, if look.notes_rise { 1.0 } else { -1.0 }, look.note_mode()) };
-        gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, [0, 0, width, note_h], [20, 20, 24], &mut frame);
+        let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise => 1.0, _ => -1.0 };
+        let view = gpu::NoteView { time_shift: deficit, horizontal, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
+        gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, note_rect, [20, 20, 24], &mut frame);
         if cfg.title && cfg.lead >= 1.0 {
             // Half-dark band behind the title, fading with it (the text itself is drawn by ffmpeg).
             let dim = 1.0 - 0.5 * intro_fade(f as f64 / cfg.fps as f64, cfg.lead as f64);
@@ -235,16 +248,24 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                 for px in rows.chunks_exact_mut(4) { for c in &mut px[..3] { *c = (*c as f64 * dim) as u8; } }
             }
         }
-        fill(&mut frame, width, 0.0, width as f32, note_h, note_h + 1, [200, 200, 210]);
-        fill(&mut frame, width, 0.0, width as f32, note_h + 1, height, [235, 235, 240]);
-        if look.pfa_style {
-            let (whites, sharps) = crate::pfa::layout(piano.then_some(&columns), lo, hi, 0.0, width as f32);
-            let lit = |p: u8| active[p as usize].then(|| { let c = colors[p as usize]; if c == egui::Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] } });
-            let quads = crate::pfa::keyboard(0.0, note_h as f32, width as f32, keyboard_h as f32, [20, 20, 24], &whites, &sharps, &lit);
-            crate::pfa::fill(&mut frame, width, &quads);
+        if horizontal {
+            let (line, strip) = match side { KeyboardSide::Left => (keyboard_h, 0), KeyboardSide::Right => (width - keyboard_h - 1, width - keyboard_h) };
+            fill(&mut frame, width, line as f32, (line + 1) as f32, 0, height, [200, 200, 210]);
+            let rect = egui::Rect::from_min_max(egui::pos2(strip as f32, 0.0), egui::pos2((strip + keyboard_h) as f32, height as f32));
+            fill_rect(&mut frame, width, rect, [235, 235, 240]);
+            keyboard(&mut frame, width, rect, lo, hi, piano.then_some(&columns), Some(side), &active, &colors);
         } else {
-            keyboard(&mut frame, width, egui::Rect::from_min_max(egui::pos2(0.0, (note_h + 1) as f32), egui::pos2(width as f32, height as f32)),
-                lo, hi, piano.then_some(&columns), None, &active, &colors);
+            fill(&mut frame, width, 0.0, width as f32, note_h, note_h + 1, [200, 200, 210]);
+            fill(&mut frame, width, 0.0, width as f32, note_h + 1, height, [235, 235, 240]);
+            if look.pfa_style {
+                let (whites, sharps) = crate::pfa::layout(piano.then_some(&columns), lo, hi, 0.0, width as f32);
+                let lit = |p: u8| active[p as usize].then(|| { let c = colors[p as usize]; if c == egui::Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] } });
+                let quads = crate::pfa::keyboard(0.0, note_h as f32, width as f32, keyboard_h as f32, [20, 20, 24], &whites, &sharps, &lit);
+                crate::pfa::fill(&mut frame, width, &quads);
+            } else {
+                keyboard(&mut frame, width, egui::Rect::from_min_max(egui::pos2(0.0, (note_h + 1) as f32), egui::pos2(width as f32, height as f32)),
+                    lo, hi, piano.then_some(&columns), None, &active, &colors);
+            }
         }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };
         if !on_frame(&report) { result = Err("cancelled".into()); break; }
@@ -263,7 +284,14 @@ pub fn run_from_args() -> bool {
     let (Some(input), Some(output)) = (args.get(i + 1), args.get(i + 2)) else { panic!("--export-video needs <midi> <out.mp4>") };
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
     let num = |name: &str, default: f32| value(name).map_or(default, |s| s.parse().unwrap_or_else(|_| panic!("bad {name}")));
-    let look = crate::settings::Settings::load();
+    let mut look = crate::settings::Settings::load();
+    if let Some(v) = value("--view") {
+        look.view = match v.as_str() { "vertical" => ViewMode::Vertical, "horizontal" => ViewMode::Horizontal, "parallax" => ViewMode::Parallax,
+            _ => panic!("view: vertical, horizontal or parallax") };
+    }
+    if let Some(v) = value("--keyboard-side") {
+        look.keyboard_side = match v.as_str() { "left" => KeyboardSide::Left, "right" => KeyboardSide::Right, _ => panic!("keyboard side: left or right") };
+    }
     let d = Settings { speed: look.note_speed, ..Default::default() };
     let cfg = Settings {
         look,
@@ -286,4 +314,45 @@ pub fn run_from_args() -> bool {
     eprintln!();
     if let Err(e) = result { eprintln!("export failed: {e}"); std::process::exit(1); }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One note on key 100 for a beat, written to the temp dir.
+    fn tiny_midi(name: &str) -> String {
+        let mut file = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();
+        let body = [0, 0x90, 100, 100, 0x83, 0x60, 0x80, 100, 0, 0, 0xff, 0x2f, 0];
+        file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        file.extend_from_slice(&body);
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, file).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The first exported frame (160 x 90), or None without ffmpeg or a GPU.
+    pub(crate) fn first_frame(name: &str, look: crate::settings::Settings) -> Option<Vec<u8>> {
+        let out = std::env::temp_dir().join(format!("{name}.mp4"));
+        let cfg = Settings { input: tiny_midi(&format!("{name}.mid")), output: out.to_string_lossy().into_owned(),
+            width: 160, height: 90, lead: 0.0, tail: 0.0, title: false, watermark: false, look, ..Default::default() };
+        let mut frame = None;
+        let result = run(&cfg, |r| { frame = Some(r.rgba.to_vec()); false });
+        if frame.is_none() { eprintln!("export unavailable, skipped: {result:?}"); }
+        frame
+    }
+
+    pub(crate) fn pixel(frame: &[u8], x: u32, y: u32) -> [u8; 3] {
+        let i = (y as usize * 160 + x as usize) * 4;
+        [frame[i], frame[i + 1], frame[i + 2]]
+    }
+
+    #[test]
+    fn horizontal_export_puts_the_keyboard_on_its_side() {
+        let look = crate::settings::Settings { view: ViewMode::Horizontal, keyboard_side: KeyboardSide::Right, ..Default::default() };
+        let Some(frame) = first_frame("kimrashi-horizontal", look) else { return };
+        let key = pixel(&frame, 155, 45);
+        assert!([[245, 245, 250], [25, 25, 30], [150, 150, 160], [80, 80, 80]].contains(&key), "keyboard on the right: {key:?}");
+        assert_eq!(pixel(&frame, 80, 89), [20, 20, 24], "no keyboard along the bottom");
+    }
 }
