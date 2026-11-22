@@ -19,6 +19,7 @@ mod theme;
 mod ui;
 mod parallax;
 mod matrix;
+mod glow;
 mod svms;
 mod sig;
 mod update;
