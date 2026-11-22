@@ -29,6 +29,8 @@ struct Globals {
     depth_scale: f32,
     /// Perspective (vertical only): the far edge's width as a fraction of the near; 0 = off.
     perspective_far: f32,
+    /// Perspective: depth at the keyboard line (the screen's bottom edge is 1; below 1 counts as 1).
+    perspective_near: f32,
 };
 
 @group(0) @binding(0)
@@ -159,18 +161,22 @@ fn vs_notes(input: VertexInput) -> VertexOutput {
         // Time n (0 at the keyboard line, 1 at the top) is depth z = 1 + (Z - 1) n; a point
         // sits (1 - 1/z) / (1 - 1/Z) up the view, and its key position shrinks toward the centre by 1/z.
         let far_z = 1.0 / globals.perspective_far;
-        let z0 = 1.0 + (far_z - 1.0) * clamp(start / safe_height, 0.0, 1.0);
-        let z1 = 1.0 + (far_z - 1.0) * clamp((start + note_length) / safe_height, 0.0, 1.0);
+        // The notes run from the keyboard line's depth, `line_z`, up to `far_z`; heights are of the
+        // whole view (keyboard included, `line` of it below the notes), then of the note area.
+        let line_z = max(globals.perspective_near, 1.0);
+        let z0 = line_z + (far_z - line_z) * clamp(start / safe_height, 0.0, 1.0);
+        let z1 = line_z + (far_z - line_z) * clamp((start + note_length) / safe_height, 0.0, 1.0);
         let up = 1.0 / (1.0 - 1.0 / far_z);
-        let y0 = (1.0 - 1.0 / z0) * up;
-        let y1 = (1.0 - 1.0 / z1) * up;
+        let line = (1.0 - 1.0 / line_z) * up;
+        let y0 = ((1.0 - 1.0 / z0) * up - line) / (1.0 - line);
+        let y1 = ((1.0 - 1.0 / z1) * up - line) / (1.0 - line);
         let z = select(z0, z1, uv.y > 0.5);
         let key = key_pos.left + (key_pos.right - key_pos.left) * uv.x;
         x = (0.5 + (key - 0.5) / z) * 2.0 - 1.0;
         y = select(y0, y1, uv.y > 0.5) * 2.0 - 1.0;
         size = vec2<f32>((key_pos.right - key_pos.left) * 2.0 / z0, (y1 - y0) * 2.0);
         // A cut piece measures its whole note, scaled as at the piece's near end (dy/dt there).
-        whole_px = whole_seconds / safe_height * (far_z - 1.0) * up / (z0 * z0) * 2.0;
+        whole_px = whole_seconds / safe_height * (far_z - line_z) * up / (z0 * z0) / (1.0 - line) * 2.0;
     }
     // Pixels along the key axis, then along the time axis.
     let win = select(vec2<f32>(globals.win_width, globals.win_height), vec2<f32>(globals.win_height, globals.win_width), horizontal);

@@ -283,7 +283,7 @@ struct GlobalsUniform {
     depth_base: f32,
     depth_scale: f32,
     perspective_far: f32,
-    _pad: [f32; 1],
+    perspective_near: f32,
 }
 
 /// How one layer of notes maps to the screen.
@@ -307,14 +307,16 @@ pub struct NoteView {
     pub brightness: f32,
     /// [base, scale]: this draw's depth range inside 0..1 (lower is nearer).
     pub depth: [f32; 2],
-    /// Perspective (vertical only): the far edge's width as a fraction of the near; 0 = off.
+    /// Perspective (vertical only): the far edge's width as a fraction of the screen's; 0 = off.
     pub perspective_far: f32,
+    /// Perspective: depth at the keyboard line (see `crate::Perspective`; below 1 counts as 1).
+    pub perspective_near: f32,
 }
 
 impl NoteView {
     pub fn vertical(height_time: f32, now_us: u64, direction_sign: f32, flat_mode: u32) -> Self {
         Self { height_time, now_us, time_shift: 0.0, direction_sign, flat_mode, horizontal: false,
-            playhead: -1.0, brightness: 1.0, depth: [0.0, 1.0], perspective_far: 0.0 }
+            playhead: -1.0, brightness: 1.0, depth: [0.0, 1.0], perspective_far: 0.0, perspective_near: 0.0 }
     }
 
     fn globals(&self, win_width: f32, win_height: f32) -> GlobalsUniform {
@@ -323,7 +325,7 @@ impl NoteView {
             flat_mode: self.flat_mode, instance_count: 0, // set in `upload`
             now_us: [self.now_us as u32, (self.now_us >> 32) as u32], time_shift: self.time_shift,
             horizontal: self.horizontal as u32, playhead: self.playhead, brightness: self.brightness,
-            depth_base: self.depth[0], depth_scale: self.depth[1], perspective_far: self.perspective_far, _pad: [0.0; 1],
+            depth_base: self.depth[0], depth_scale: self.depth[1], perspective_far: self.perspective_far, perspective_near: self.perspective_near,
         }
     }
 }
@@ -1128,6 +1130,15 @@ mod tests {
         let view = NoteView { flat_mode: 0, ..persp() };
         let px = draw(&mut gpu, &[LayerDraw { instances: Arc::new(InstanceRing::from_ordered([piece])), view }]);
         assert_eq!(px(24, 63)[0], 255, "drawn in its colour, not darkened as thin");
+    }
+
+    #[test]
+    fn perspective_near_narrows_the_keyboard_line() {
+        let Ok(mut gpu) = Offscreen::new(64, 64) else { eprintln!("no GPU, skipped"); return };
+        // The keyboard line at depth 1.5: key 0.25..0.5 lands at about x 0.33..0.5 there.
+        let view = NoteView { perspective_near: 1.5, ..persp() };
+        let px = draw(&mut gpu, &[LayerDraw { instances: one_note(0.0, 0.05, [255, 0, 0]), view }]);
+        assert_eq!((px(18, 62), px(26, 62)), ([0, 0, 0], [255, 0, 0]));
     }
 
     #[test]
