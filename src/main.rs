@@ -222,6 +222,7 @@ fn main() {
                 settings_tab: SettingsTab::Display,
                 settings_search: String::new(),
                 visible: VisibleNotes::default(),
+                parallax: parallax::Parallax::default(),
                 instances: Arc::default(),
                 refresh_rate_hz: vsync::refresh_hz(),
                 status_message: None,
@@ -1731,6 +1732,8 @@ struct AppState {
     settings_tab: SettingsTab,
     settings_search: String,
     visible: VisibleNotes,
+    /// The parallax view's layers (empty in the other views).
+    parallax: parallax::Parallax,
     /// Reused across frames; the GPU callback holds a clone until it renders.
     instances: Arc<gpu::InstanceRing>,
     /// Display refresh rate reported by the compositor (for the VSync label).
@@ -2006,6 +2009,7 @@ impl eframe::App for AppState {
             if let Some(song) = &mut self.current_song {
                 song.set_palette(look.1, &look.2, look.3);
                 self.visible.instance_ring_id = u64::MAX; // drops the cached note colors
+                self.parallax.clear();
             }
             self.applied_look = Some(look);
         }
@@ -2026,9 +2030,10 @@ impl eframe::App for AppState {
                     self.cfg.notes_rise,
                     self.cfg.note_mode(),
                     self.cfg.piano_layout,
-                    (self.cfg.view, self.cfg.keyboard_side),
+                    (self.cfg.view, self.cfg.keyboard_side, self.cfg.parallax_far),
                     (self.cfg.stats, self.cfg.synth_stats),
                     &mut self.visible,
+                    &mut self.parallax,
                     &mut self.instances,
                     &mut self.frame_times,
                 );

@@ -742,9 +742,10 @@ pub(crate) fn draw_piano_roll(
     notes_upwards: bool,
     note_mode: u32,
     piano_layout: bool,
-    (view, keyboard_side): (crate::settings::ViewMode, KeyboardSide),
+    (view, keyboard_side, parallax_far): (crate::settings::ViewMode, KeyboardSide, f32),
     (stats_mode, synth_stats): (StatsMode, bool),
     visible: &mut VisibleNotes,
+    parallax: &mut crate::parallax::Parallax,
     instances: &mut Arc<gpu::InstanceRing>,
     times: &mut FrameTimes,
 ) {
@@ -759,14 +760,18 @@ pub(crate) fn draw_piano_roll(
 
     // Horizontal: the classic keyboard on its side (PFA's keyboard is only drawn along the bottom).
     let side = (view == crate::settings::ViewMode::Horizontal).then_some(keyboard_side);
+    // Parallax: no keyboard, notes fill the view, a playhead down the middle.
+    let in_parallax = view == crate::settings::ViewMode::Parallax;
+    if !in_parallax { parallax.clear(); }
     // The keyboard grows to PFA's size and back, easing out in both directions.
-    let pfa = note_mode == 2 && side.is_none();
+    let pfa = note_mode == 2 && side.is_none() && !in_parallax;
     let linear = ui.ctx().animate_bool_with_time(egui::Id::new("pfa_keyboard"), pfa, 0.4);
     let eased = if pfa { egui::emath::easing::cubic_out(linear) } else { 1.0 - egui::emath::easing::cubic_out(1.0 - linear) };
     let classic_height = (rect.height() * 0.12).clamp(36.0, 120.0);
     let keyboard_height = classic_height + (crate::pfa::key_height(rect.height(), rect.width(), pitch_min, pitch_max) - classic_height) * eased;
     let keyboard_width = (rect.width() * 0.12).clamp(36.0, 120.0);
     let (note_area, keyboard_rect, edge) = match side {
+        _ if in_parallax => (rect, Rect::from_min_max(rect.max, rect.max), [rect.max, rect.max]),
         None => {
             let y = rect.bottom() - keyboard_height;
             (Rect::from_min_max(rect.min, Pos2::new(rect.right(), y)), Rect::from_min_max(Pos2::new(rect.left(), y), rect.max),
@@ -822,38 +827,57 @@ pub(crate) fn draw_piano_roll(
         }
     }
 
-    painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210)));
+    if !in_parallax { painter.line_segment(edge, Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 210))); }
 
     if let Some(song) = song {
         let ppp = ui.ctx().pixels_per_point();
         // Pixels along the time axis.
-        let time_px = if side.is_some() { (note_area.right() * ppp).round() - (note_area.left() * ppp).round() }
+        let time_px = if side.is_some() || in_parallax { (note_area.right() * ppp).round() - (note_area.left() * ppp).round() }
             else { (note_area.bottom() * ppp).round() - (note_area.top() * ppp).round() }.max(1.0);
-        let px_us = future_us as f32 / time_px;
-        visible.advance(&song.data, now_us, window_end, px_us as u64);
-        times.advance = visible.timing;
-        times.decoded = visible.last_batch;
-        let t0 = Instant::now();
+        if in_parallax {
+            let t0 = Instant::now();
+            let layers = parallax.frame(song, now_us, duration_us, speed, parallax_far, time_px as u32, note_mode,
+                visible.collapse_overlaps, visible.max_instances);
+            times.build = t0.elapsed();
+            times.instances = layers.iter().map(|l| l.instances.len()).sum();
+            if let Some(state) = frame.wgpu_render_state() {
+                if !gpu::no_notes() {
+                    // Nearest first, so farther layers skip pixels it already covers.
+                    for (k, layer) in layers.into_iter().enumerate().filter(|(_, l)| !l.instances.is_empty()) {
+                        painter.add(gpu::NotesCallback::new(note_area, state.target_format, k, layer.instances, gpu_key_positions, layer.view));
+                    }
+                }
+            }
+            let x = note_area.center().x;
+            painter.line_segment([Pos2::new(x, note_area.top()), Pos2::new(x, note_area.bottom())],
+                Stroke::new(2.0_f32, Color32::from_rgb(255, 220, 140)));
+        } else {
+            let px_us = future_us as f32 / time_px;
+            visible.advance(&song.data, now_us, window_end, px_us as u64);
+            times.advance = visible.timing;
+            times.decoded = visible.last_batch;
+            let t0 = Instant::now();
 
-        (active_keys, active_colors) = build_note_instances(
-            song, visible, now_us, window_end, speed, time_px as u32, piano_layout, instances,
-        );
+            (active_keys, active_colors) = build_note_instances(
+                song, visible, now_us, window_end, speed, time_px as u32, piano_layout, instances,
+            );
 
-        times.build = t0.elapsed();
-        times.profile = visible.build_profile;
-        times.instances = instances.len();
-        if let Some(state) = frame.wgpu_render_state() {
-            if !instances.is_empty() && !gpu::no_notes() {
-                painter.add(gpu::NotesCallback::new(
-                    note_area,
-                    state.target_format,
-                    0,
-                    instances.clone(),
-                    gpu_key_positions,
-                    gpu::NoteView { horizontal: side.is_some(), ..gpu::NoteView::vertical(speed, now_us, match side {
-                        Some(KeyboardSide::Right) => 1.0, Some(KeyboardSide::Left) => -1.0, None if notes_upwards => 1.0, None => -1.0,
-                    }, note_mode) },
-                ));
+            times.build = t0.elapsed();
+            times.profile = visible.build_profile;
+            times.instances = instances.len();
+            if let Some(state) = frame.wgpu_render_state() {
+                if !instances.is_empty() && !gpu::no_notes() {
+                    painter.add(gpu::NotesCallback::new(
+                        note_area,
+                        state.target_format,
+                        0,
+                        instances.clone(),
+                        gpu_key_positions,
+                        gpu::NoteView { horizontal: side.is_some(), ..gpu::NoteView::vertical(speed, now_us, match side {
+                            Some(KeyboardSide::Right) => 1.0, Some(KeyboardSide::Left) => -1.0, None if notes_upwards => 1.0, None => -1.0,
+                        }, note_mode) },
+                    ));
+                }
             }
         }
     } else {
@@ -871,7 +895,7 @@ pub(crate) fn draw_piano_roll(
         over.multiply_opacity(eased);
         draw_pfa_keyboard(&over, keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors);
     }
-    if eased < 1.0 {
+    if eased < 1.0 && !in_parallax {
         draw_keyboard(
             &painter,
             keyboard_rect,

@@ -1,6 +1,6 @@
 //! Video export: `--export-video <midi> <out.mp4> [--width n] [--height n] [--fps n] [--speed s]`
 //! `[--lead s] [--tail s] [--encoder x264|nvenc|qsv|amf] [--preset ultrafast..veryslow] [--crf n]`
-//! `[--view vertical|horizontal|parallax] [--keyboard-side left|right]` (default: the saved settings)
+//! `[--view vertical|horizontal|parallax] [--keyboard-side left|right] [--parallax-far 0.1..1]` (default: the saved settings)
 //! Renders the real note pipeline offscreen at deterministic song time and pipes raw RGBA to ffmpeg.
 //! The keyboard is drawn on the CPU (the live view draws it with egui).
 
@@ -172,18 +172,22 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     let mut visual = VisualSong::new(song);
     visual.set_palette(cfg.look.note_palette, &cfg.look.custom_colors, cfg.look.rainbow_size);
     // Horizontal: the keyboard is a strip `keyboard_h` wide at `side`, and notes fill the rest.
+    // Parallax: no keyboard, notes fill the frame, a playhead down the middle.
+    let parallax = cfg.look.view == ViewMode::Parallax;
     let (horizontal, side) = (cfg.look.view == ViewMode::Horizontal, cfg.look.keyboard_side);
-    let keyboard_h = if horizontal { (width as f32 * 0.12) as u32 }
+    let keyboard_h = if parallax { 0 }
+        else if horizontal { (width as f32 * 0.12) as u32 }
         else if cfg.look.pfa_style { crate::pfa::key_height(height as f32, width as f32, visual.pitch_min, visual.pitch_max) as u32 }
         else { (height as f32 * 0.12) as u32 };
-    let note_h = if horizontal { height } else { height - keyboard_h };
+    let note_h = if horizontal || parallax { height } else { height - keyboard_h };
     let note_rect = match (horizontal, side) {
+        _ if parallax => [0, 0, width, height],
         (false, _) => [0, 0, width, note_h],
         (true, KeyboardSide::Left) => [keyboard_h + 1, 0, width - keyboard_h - 1, height],
         (true, KeyboardSide::Right) => [0, 0, width - keyboard_h - 1, height],
     };
     // Pixels along the time axis.
-    let time_px = if horizontal { note_rect[2] } else { note_h };
+    let time_px = if horizontal || parallax { note_rect[2] } else { note_h };
     let mut gpu = gpu::Offscreen::new(width, height)?;
 
     let mut ffmpeg = Command::new(&cfg.ffmpeg);
@@ -220,6 +224,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     let mut keys = [gpu::KeyPosition { left: 0.0, right: 0.0, _pad0: 0.0, _pad1: 0.0 }; 256];
     for p in lo..=hi { keys[p as usize].left = columns[p as usize].0; keys[p as usize].right = columns[p as usize].1; }
 
+    let mut layers = crate::parallax::Parallax::default();
     let mut visible = VisibleNotes::default();
     visible.set_collapse(look.collapse_overlaps);
     visible.set_max_instances(look.max_instances);
@@ -232,13 +237,22 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
         let now_us = (t.max(0.0) * 1e6) as u64;
         let deficit = (-t).max(0.0) as f32;
         let window_end = (now_us + future_us).saturating_sub((deficit * 1e6) as u64).max(now_us).min(duration_us.max(now_us));
-        visible.advance(&visual.data, now_us, window_end, future_us / time_px as u64);
-        let (mut active, colors) = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, &mut instances);
-        if deficit > 0.0 { active = [false; 128]; }
         let mut frame = free_rx.try_recv().unwrap_or_default();
-        let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise => 1.0, _ => -1.0 };
-        let view = gpu::NoteView { time_shift: deficit, horizontal, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
-        gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, note_rect, [20, 20, 24], &mut frame);
+        let (mut active, colors) = if parallax {
+            let mut draws = layers.frame(&visual, now_us, duration_us, speed, look.parallax_far, time_px, look.note_mode(),
+                look.collapse_overlaps, look.max_instances);
+            for d in &mut draws { d.view.time_shift += deficit; }
+            gpu.render(&draws, &keys, note_rect, [20, 20, 24], &mut frame);
+            ([false; 128], [egui::Color32::TRANSPARENT; 128])
+        } else {
+            visible.advance(&visual.data, now_us, window_end, future_us / time_px as u64);
+            let lit = crate::build_note_instances(&visual, &mut visible, now_us, window_end, speed, time_px, piano, &mut instances);
+            let sign = match (horizontal, side) { (true, KeyboardSide::Right) => 1.0, (true, _) => -1.0, _ if look.notes_rise => 1.0, _ => -1.0 };
+            let view = gpu::NoteView { time_shift: deficit, horizontal, ..gpu::NoteView::vertical(speed, now_us, sign, look.note_mode()) };
+            gpu.render(&[gpu::LayerDraw { instances: instances.clone(), view }], &keys, note_rect, [20, 20, 24], &mut frame);
+            lit
+        };
+        if deficit > 0.0 { active = [false; 128]; }
         if cfg.title && cfg.lead >= 1.0 {
             // Half-dark band behind the title, fading with it (the text itself is drawn by ffmpeg).
             let dim = 1.0 - 0.5 * intro_fade(f as f64 / cfg.fps as f64, cfg.lead as f64);
@@ -248,7 +262,10 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                 for px in rows.chunks_exact_mut(4) { for c in &mut px[..3] { *c = (*c as f64 * dim) as u8; } }
             }
         }
-        if horizontal {
+        if parallax {
+            let x = width / 2;
+            fill(&mut frame, width, (x - 1) as f32, (x + 1) as f32, 0, height, [255, 220, 140]);
+        } else if horizontal {
             let (line, strip) = match side { KeyboardSide::Left => (keyboard_h, 0), KeyboardSide::Right => (width - keyboard_h - 1, width - keyboard_h) };
             fill(&mut frame, width, line as f32, (line + 1) as f32, 0, height, [200, 200, 210]);
             let rect = egui::Rect::from_min_max(egui::pos2(strip as f32, 0.0), egui::pos2((strip + keyboard_h) as f32, height as f32));
@@ -292,6 +309,7 @@ pub fn run_from_args() -> bool {
     if let Some(v) = value("--keyboard-side") {
         look.keyboard_side = match v.as_str() { "left" => KeyboardSide::Left, "right" => KeyboardSide::Right, _ => panic!("keyboard side: left or right") };
     }
+    if let Some(v) = value("--parallax-far") { look.parallax_far = v.parse::<f32>().expect("bad --parallax-far").clamp(0.1, 1.0); }
     let d = Settings { speed: look.note_speed, ..Default::default() };
     let cfg = Settings {
         look,
@@ -354,5 +372,12 @@ mod tests {
         let key = pixel(&frame, 155, 45);
         assert!([[245, 245, 250], [25, 25, 30], [150, 150, 160], [80, 80, 80]].contains(&key), "keyboard on the right: {key:?}");
         assert_eq!(pixel(&frame, 80, 89), [20, 20, 24], "no keyboard along the bottom");
+    }
+    #[test]
+    fn parallax_export_draws_a_playhead_and_no_keyboard() {
+        let look = crate::settings::Settings { view: ViewMode::Parallax, ..Default::default() };
+        let Some(frame) = first_frame("kimrashi-parallax", look) else { return };
+        assert_eq!(pixel(&frame, 80, 45), [255, 220, 140], "playhead in the middle");
+        assert_eq!(pixel(&frame, 20, 85), [20, 20, 24], "no keyboard along the bottom");
     }
 }

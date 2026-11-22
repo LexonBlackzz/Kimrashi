@@ -187,4 +187,26 @@ mod tests {
         assert_eq!(layers.len(), 1);
         assert_eq!((layers[0].view.depth[0], layers[0].instances.len()), (0.0, 2));
     }
+    /// `tracks` tracks of 24 half-second notes in a row (12 s), track t on key 60 + t.
+    fn sequence(tracks: u8) -> VisualSong {
+        song_from_bodies(&(0..tracks).map(|t| {
+            let mut body = Vec::new();
+            for _ in 0..24 { body.extend_from_slice(&[0, 0x90 | t, 60 + t, 100, 0x83, 0x60, 0x80 | t, 60 + t, 0]); }
+            body.extend_from_slice(&[0, 0xff, 0x2f, 0]);
+            body
+        }).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn seeking_back_resets_every_layer() {
+        let song = sequence(3);
+        let mut parallax = Parallax::default();
+        parallax.frame(&song, 10_000_000, 12_000_000, 1.0, 0.5, 600, 1, true, 1 << 20);
+        let layers = parallax.frame(&song, 2_000_000, 12_000_000, 1.0, 0.5, 600, 1, true, 1 << 20);
+        for (layer, draw) in parallax.layers.iter().zip(&layers) {
+            let (lo, hi) = (draw.view.now_us, draw.view.now_us + (draw.view.height_time * 1e6) as u64);
+            let notes: Vec<_> = layer.visible.window.iter().filter(|n| n.end_us > lo).map(|n| (n.start_us, n.end_us)).collect();
+            assert!(!notes.is_empty() && notes.iter().all(|&(s, _)| s < hi + 1_000_000), "{lo}..{hi}: {notes:?}");
+        }
+    }
 }
