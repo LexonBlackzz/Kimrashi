@@ -920,11 +920,15 @@ pub(crate) fn draw_piano_roll(
         let mut quads = if pfa {
             let (whites, sharps) = crate::pfa::layout(piano_layout.then_some(&columns), pitch_min, pitch_max, keyboard_rect.left(), keyboard_rect.width());
             crate::pfa::keyboard(keyboard_rect.left(), keyboard_rect.top(), keyboard_rect.width(), keyboard_rect.height(), [20, 20, 24],
-                &whites, &sharps, &|p| lit_color(active_keys[p as usize], active_colors[p as usize]))
+                &whites, if persp.block > 0.0 { &[] } else { &sharps }, &|p| lit_color(active_keys[p as usize], active_colors[p as usize]))
         } else {
-            classic_quads(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors)
+            classic_quads(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), &active_keys, &active_colors, persp.block == 0.0)
         };
         persp.bend(rect, keyboard_rect, &mut quads);
+        if persp.block > 0.0 {
+            quads.extend(persp.raise(rect, keyboard_rect,
+                &black_keys(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), pfa, &active_keys, &active_colors)));
+        }
         paint_quads(&painter, &quads);
     } else if eased > 0.0 && side.is_none() && !in_parallax {
         let mut over = painter.clone();
@@ -1093,11 +1097,11 @@ fn paint_quads(painter: &egui::Painter, quads: &[crate::pfa::Quad]) {
 /// The classic keyboard (see `draw_keyboard`) as quads: per key an edge, then its body inset by
 /// a pixel on every side but the one facing the notes. For drawing it bent (`Perspective::bend`).
 pub(crate) fn classic_quads(rect: Rect, lo: u8, hi: u8, columns: Option<&[(f32, f32); 128]>,
-    active: &[bool; 128], colors: &[Color32; 128]) -> Vec<crate::pfa::Quad>
+    active: &[bool; 128], colors: &[Color32; 128], with_black: bool) -> Vec<crate::pfa::Quad>
 {
     let quad = |r: Rect, c: crate::pfa::Rgb| crate::pfa::Quad {
         p: [[r.left(), r.top()], [r.right(), r.top()], [r.right(), r.bottom()], [r.left(), r.bottom()]], c: [c; 4] };
-    keyboard_rects(rect, lo, hi, columns, None).into_iter().flat_map(|(p, r)| {
+    keyboard_rects(rect, lo, hi, columns, None).into_iter().filter(|&(p, _)| with_black || !is_black_key(p)).flat_map(|(p, r)| {
         let (edge, idle, lit) = if is_black_key(p) { ([80; 3], [25, 25, 30], [255, 160, 100]) } else { ([150, 150, 160], [245, 245, 250], [255, 220, 140]) };
         let c = colors[p as usize];
         let body = if !active[p as usize] { idle } else if c == Color32::TRANSPARENT { lit } else { [c.r(), c.g(), c.b()] };
@@ -1374,5 +1378,24 @@ mod tests {
             }
         }
         assert!(bottom.iter().any(|k| is_black_key(k.0) && k.1.height() < 100.0), "sharps are shorter");
+    }
+}
+
+/// The black keys' flat footprints and top colours, for standing them up (`Perspective::raise`):
+/// the classic keyboard's black keys, or the PFA sharps.
+pub(crate) fn black_keys(rect: Rect, lo: u8, hi: u8, columns: Option<&[(f32, f32); 128]>, pfa: bool,
+    active: &[bool; 128], colors: &[Color32; 128]) -> Vec<(Rect, crate::pfa::Rgb)>
+{
+    let lit = |p: u8, idle: crate::pfa::Rgb| {
+        let c = colors[p as usize];
+        if !active[p as usize] { idle } else if c == Color32::TRANSPARENT { if pfa { [255, 220, 140] } else { [255, 160, 100] } } else { [c.r(), c.g(), c.b()] }
+    };
+    if pfa {
+        let (top, bottom) = crate::pfa::sharp_rows(rect.top(), rect.height());
+        crate::pfa::layout(columns, lo, hi, rect.left(), rect.width()).1.into_iter()
+            .map(|(p, l, r)| (Rect::from_min_max(Pos2::new(l, top), Pos2::new(r, bottom)), lit(p, [40, 40, 44]))).collect()
+    } else {
+        keyboard_rects(rect, lo, hi, columns, None).into_iter().filter(|&(p, _)| is_black_key(p))
+            .map(|(p, r)| (r, lit(p, [25, 25, 30]))).collect()
     }
 }

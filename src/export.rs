@@ -288,11 +288,16 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             let mut quads = if look.pfa_style {
                 let (whites, sharps) = crate::pfa::layout(piano.then_some(&columns), lo, hi, 0.0, width as f32);
                 let lit = |p: u8| active[p as usize].then(|| { let c = colors[p as usize]; if c == egui::Color32::TRANSPARENT { [255, 220, 140] } else { [c.r(), c.g(), c.b()] } });
-                crate::pfa::keyboard(0.0, note_h as f32, width as f32, keyboard_h as f32, [20, 20, 24], &whites, &sharps, &lit)
+                crate::pfa::keyboard(0.0, note_h as f32, width as f32, keyboard_h as f32, [20, 20, 24], &whites,
+                    if persp.block > 0.0 { &[] } else { &sharps }, &lit)
             } else {
-                crate::ui::classic_quads(kb, lo, hi, piano.then_some(&columns), &active, &colors)
+                crate::ui::classic_quads(kb, lo, hi, piano.then_some(&columns), &active, &colors, persp.block == 0.0)
             };
-            persp.bend(egui::Rect::from_min_max(pt(0, 0), pt(width, height)), kb, &mut quads);
+            let view = egui::Rect::from_min_max(pt(0, 0), pt(width, height));
+            persp.bend(view, kb, &mut quads);
+            if persp.block > 0.0 {
+                quads.extend(persp.raise(view, kb, &crate::ui::black_keys(kb, lo, hi, piano.then_some(&columns), look.pfa_style, &active, &colors)));
+            }
             crate::pfa::fill(&mut frame, width, &quads);
         } else {
             fill(&mut frame, width, 0.0, width as f32, note_h, note_h + 1, [200, 200, 210]);
@@ -432,5 +437,15 @@ mod tests {
         let Some(frame) = first_frame("kimrashi-perspective-keys", look, 5.0) else { return };
         assert_ne!(pixel(&frame, 1, 89), [20, 20, 24], "the bottom edge is full width");
         assert_eq!(pixel(&frame, 1, 81), [20, 20, 24], "the keyboard line is narrower: background beside it");
+    }
+    #[test]
+    fn blocks_export_raises_the_black_keys() {
+        let look = |view, pfa_style| crate::settings::Settings { view, pfa_style, ..Default::default() };
+        for pfa in [false, true] {
+            let Some(flat) = first_frame("kimrashi-blocks-flat", look(ViewMode::Perspective, pfa), 5.0) else { return };
+            let Some(raised) = first_frame("kimrashi-blocks", look(ViewMode::Blocks, pfa), 5.0) else { return };
+            let changed = (78..90).flat_map(|y| (0..160).map(move |x| (x, y))).filter(|&(x, y)| pixel(&flat, x, y) != pixel(&raised, x, y)).count();
+            assert!(changed > 20, "pfa {pfa}: {changed} keyboard pixels changed");
+        }
     }
 }

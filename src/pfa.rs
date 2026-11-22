@@ -50,6 +50,15 @@ pub fn layout(columns: Option<&[(f32, f32); 128]>, lo: u8, hi: u8, x0: f32, w: f
 
 /// The keyboard filling `(x0, y0, w, h)`. `whites` / `sharps` are `(pitch, left, right)` in pixels,
 /// `active[p]` is `Some(color)` for a pressed key (`None` color = default lit).
+/// Where the sharps start and end down a keyboard at `y0`, `h` high.
+pub fn sharp_rows(y0: f32, h: f32) -> (f32, f32) {
+    let trans = (h * 0.02).round().max(3.0);
+    let red_h = (h * 0.05).round();
+    let top = ((h - 2.0 - red_h - trans) * 0.95).round();
+    let keys_y = y0 + trans + red_h + 2.0;
+    (keys_y, keys_y + top * 0.67)
+}
+
 pub fn keyboard(x0: f32, y0: f32, w: f32, h: f32, background: Rgb, whites: &[(u8, f32, f32)], sharps: &[(u8, f32, f32)],
     active: &dyn Fn(u8) -> Option<Rgb>) -> Vec<Quad>
 {
@@ -59,8 +68,8 @@ pub fn keyboard(x0: f32, y0: f32, w: f32, h: f32, background: Rgb, whites: &[(u8
     let spacer = 2.0;
     let top = ((h - spacer - red_h - trans) * 0.95).round();
     let near = h - spacer - red_h - trans - top;
-    let keys_y = y0 + trans + red_h + spacer;
-    let sharp_h = top * 0.67;
+    let (keys_y, sharp_end) = sharp_rows(y0, h);
+    let sharp_h = sharp_end - keys_y;
     let mut q = Vec::new();
 
     rect(&mut q, x0, y0, w, h, [kb[2]; 4]);
