@@ -54,6 +54,12 @@ pub struct Settings {
     pub perspective_far: f32,
     /// Matrix: seconds a cell takes to fade out after its last note ends; 0 = off at once.
     pub matrix_fade: f32,
+    /// Key glow (Vertical view): hit keys emit light (see `crate::glow`).
+    pub glow: bool,
+    pub glow_intensity: f32,
+    pub glow_decay: f32,
+    pub glow_spread: f32,
+    pub glow_reach: f32,
     pub note_speed: f32,
     pub notes_rise: bool,
     pub piano_layout: bool,
@@ -104,6 +110,11 @@ impl Default for Settings {
             parallax_far: 0.3,
             perspective_far: 0.3,
             matrix_fade: 0.0,
+            glow: false,
+            glow_intensity: 1.0,
+            glow_decay: 0.3,
+            glow_spread: 2.0,
+            glow_reach: 0.25,
             note_speed: 5.0,
             notes_rise: false,
             piano_layout: false,
@@ -142,6 +153,12 @@ fn dir() -> Option<std::path::PathBuf> {
 
 impl Settings {
     /// The note shader's `flat_mode`: 0 shaded, 1 flat, 2 Piano From Above.
+    /// The key glow's look, when it is on.
+    pub fn glow_look(&self) -> Option<crate::glow::GlowLook> {
+        self.glow.then_some(crate::glow::GlowLook { intensity: self.glow_intensity, decay: self.glow_decay,
+            spread: self.glow_spread, reach: self.glow_reach })
+    }
+
     pub fn note_mode(&self) -> u32 { if self.pfa_style { 2 } else { self.flat_notes as u32 } }
 
     pub fn load() -> Self {

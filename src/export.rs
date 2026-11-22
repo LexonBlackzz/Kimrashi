@@ -79,6 +79,20 @@ fn fill(buf: &mut [u8], width: u32, x0: f32, x1: f32, y0: u32, y1: u32, color: [
     }
 }
 
+/// Adds the key glow's `strip` (one colour per column) over the keys at `ON_KEYS` and, falling off,
+/// up from the keyboard line at row `line` (see `crate::glow`, and `ui::paint_glow` for the window).
+fn add_glow(buf: &mut [u8], width: u32, line: u32, strip: &[[f32; 3]], reach_px: f32) {
+    let height = (buf.len() / 4 / width as usize) as u32;
+    for y in 0..height {
+        let f = if y >= line { crate::glow::ON_KEYS } else { crate::glow::falloff((line - y) as f32 - 0.5, reach_px) };
+        if f < 1.0 / 255.0 { continue; }
+        let row = &mut buf[y as usize * width as usize * 4..][..width as usize * 4];
+        for (px, c) in row.chunks_exact_mut(4).zip(strip) {
+            for k in 0..3 { px[k] = (px[k] as f32 + c[k] * f * 255.0).min(255.0) as u8; }
+        }
+    }
+}
+
 /// Fills `r` (pixels, rounded) with `color`, clipped to the frame.
 fn fill_rect(buf: &mut [u8], width: u32, r: egui::Rect, color: [u8; 3]) {
     let height = (buf.len() / 4 / width as usize) as u32;
@@ -238,6 +252,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
 
     let mut layers = crate::parallax::Parallax::default();
     let mut cells = crate::matrix::Matrix::new();
+    let (mut glow, glow_look) = (crate::glow::Glow::default(), look.glow_look());
     let mut visible = VisibleNotes::default();
     visible.set_collapse(look.collapse_overlaps);
     visible.set_max_instances(look.max_instances);
@@ -324,6 +339,10 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                 keyboard(&mut frame, width, egui::Rect::from_min_max(egui::pos2(0.0, (note_h + 1) as f32), egui::pos2(width as f32, height as f32)),
                     lo, hi, piano.then_some(&columns), None, &active, &colors);
             }
+            if let Some(gl) = &glow_look {
+                glow.update(now_us, &active, &colors, gl);
+                if !glow.is_dark() { add_glow(&mut frame, width, note_h, &glow.strip(&columns, width as usize, gl), gl.reach * note_h as f32); }
+            }
         }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };
         if !on_frame(&report) { result = Err("cancelled".into()); break; }
@@ -350,6 +369,11 @@ pub fn run_from_args() -> bool {
     if let Some(v) = value("--keyboard-side") {
         look.keyboard_side = match v.as_str() { "left" => KeyboardSide::Left, "right" => KeyboardSide::Right, _ => panic!("keyboard side: left or right") };
     }
+    if args.iter().any(|a| a == "--glow") { look.glow = true; }
+    if let Some(v) = value("--glow-intensity") { look.glow_intensity = v.parse::<f32>().expect("bad --glow-intensity").clamp(0.0, 3.0); }
+    if let Some(v) = value("--glow-decay") { look.glow_decay = v.parse::<f32>().expect("bad --glow-decay").clamp(0.05, 2.0); }
+    if let Some(v) = value("--glow-spread") { look.glow_spread = v.parse::<f32>().expect("bad --glow-spread").clamp(0.5, 8.0); }
+    if let Some(v) = value("--glow-reach") { look.glow_reach = v.parse::<f32>().expect("bad --glow-reach").clamp(0.02, 1.0); }
     if let Some(v) = value("--matrix-fade") { look.matrix_fade = v.parse::<f32>().expect("bad --matrix-fade").clamp(0.0, 2.0); }
     if let Some(v) = value("--perspective-far") { look.perspective_far = v.parse::<f32>().expect("bad --perspective-far").clamp(0.1, 0.9); }
     if let Some(v) = value("--parallax-far") { look.parallax_far = v.parse::<f32>().expect("bad --parallax-far").clamp(0.1, 1.0); }
@@ -451,6 +475,15 @@ mod tests {
         let Some(frame) = first_frame("kimrashi-perspective-keys", look, 5.0) else { return };
         assert_ne!(pixel(&frame, 1, 89), [20, 20, 24], "the bottom edge is full width");
         assert_eq!(pixel(&frame, 1, 81), [20, 20, 24], "the keyboard line is narrower: background beside it");
+    }
+    #[test]
+    fn glow_brightens_above_the_sounding_key_only() {
+        let look = |glow| crate::settings::Settings { glow, ..Default::default() };
+        let Some(plain) = first_frame("kimrashi-glow-off", look(false), 1.0) else { return };
+        let Some(lit) = first_frame("kimrashi-glow-on", look(true), 1.0) else { return };
+        let sum = |f: &[u8], y| (0..160).map(|x| pixel(f, x, y).iter().map(|&c| c as u32).sum::<u32>()).sum::<u32>();
+        assert!(sum(&lit, 70) > sum(&plain, 70) + 100, "light rises above the keyboard line");
+        assert_eq!(pixel(&lit, 2, 70), pixel(&plain, 2, 70), "far from key 100 nothing changes");
     }
     #[test]
     fn matrix_export_lights_the_sounding_cell() {

@@ -303,6 +303,28 @@ impl AppState {
                             }
                             ui.end_row();
                         }
+                        if c.view == ViewMode::Vertical {
+                            ui.label("Key glow");
+                            ui.checkbox(&mut c.glow, "On").on_hover_text("Hit keys light up and spill light over the keys and up into the notes");
+                            ui.end_row();
+                            if c.glow {
+                                ui.label("  Intensity");
+                                ui.add(egui::Slider::new(&mut c.glow_intensity, 0.0..=3.0).fixed_decimals(2));
+                                ui.end_row();
+                                ui.label("  Decay");
+                                ui.add(egui::Slider::new(&mut c.glow_decay, 0.05..=2.0).fixed_decimals(2).suffix(" s"))
+                                    .on_hover_text("How fast the light fades after a key is released");
+                                ui.end_row();
+                                ui.label("  Spread");
+                                ui.add(egui::Slider::new(&mut c.glow_spread, 0.5..=8.0).fixed_decimals(1).suffix(" keys"))
+                                    .on_hover_text("How far the light spills sideways");
+                                ui.end_row();
+                                ui.label("  Reach");
+                                ui.add(egui::Slider::new(&mut c.glow_reach, 0.02..=1.0).fixed_decimals(2))
+                                    .on_hover_text("How far up the light rises, as a fraction of the note area");
+                                ui.end_row();
+                            }
+                        }
                         if c.view == ViewMode::Matrix {
                             ui.label("Fade");
                             ui.add(egui::Slider::new(&mut c.matrix_fade, 0.0..=2.0).fixed_decimals(2).suffix(" s"))
@@ -775,6 +797,7 @@ pub(crate) fn draw_piano_roll(
     visible: &mut VisibleNotes,
     parallax: &mut crate::parallax::Parallax,
     matrix: &mut crate::matrix::Matrix,
+    (glow, glow_look): (&mut crate::glow::Glow, Option<crate::glow::GlowLook>),
     instances: &mut Arc<gpu::InstanceRing>,
     times: &mut FrameTimes,
 ) {
@@ -973,6 +996,16 @@ pub(crate) fn draw_piano_roll(
         );
     }
 
+    // Key glow (Vertical only): light from hit keys, added over the keys and up into the notes.
+    let along_bottom = side.is_none() && !in_parallax && !in_matrix && !persp.is_on();
+    match glow_look.filter(|_| along_bottom && song.is_some()) {
+        Some(look) => {
+            glow.update(now_us, &active_keys, &active_colors, &look);
+            if !glow.is_dark() { paint_glow(&painter, glow, &columns, note_area, keyboard_rect, &look); }
+        }
+        None => *glow = Default::default(),
+    }
+
     let detailed_stats = stats_mode == StatsMode::Detailed;
     let mut stats_text = if detailed_stats {
         format!(
@@ -1100,6 +1133,40 @@ fn draw_pfa_keyboard(painter: &egui::Painter, rect: Rect, lo: u8, hi: u8, column
     let quads = crate::pfa::keyboard(rect.left(), rect.top(), rect.width(), rect.height(), [20, 20, 24], &whites, &sharps,
         &|p| lit_color(active[p as usize], colors[p as usize]));
     paint_quads(painter, &quads);
+}
+
+/// The key glow as additive gradients (premultiplied colours with alpha 0 add to what is below):
+/// columns 2 points wide, over the keys at `ON_KEYS` and falling off up into the note area.
+fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32, f32); 128], notes: Rect, keys: Rect,
+    look: &crate::glow::GlowLook)
+{
+    let bins = (notes.width() / 2.0).ceil().max(1.0) as usize;
+    let strip = glow.strip(columns, bins, look);
+    let reach = (look.reach * notes.height()).max(1.0);
+    let add = |c: [f32; 3], f: f32| Color32::from_rgba_premultiplied(
+        (c[0] * f * 255.0) as u8, (c[1] * f * 255.0) as u8, (c[2] * f * 255.0) as u8, 0);
+    let (line, w) = (notes.bottom(), notes.width() / bins as f32);
+    let mut mesh = egui::Mesh::default();
+    let mut band = |x0: f32, x1: f32, top: f32, bottom: f32, ct: Color32, cb: Color32| {
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(x0, top), ct);
+        mesh.colored_vertex(Pos2::new(x1, top), ct);
+        mesh.colored_vertex(Pos2::new(x1, bottom), cb);
+        mesh.colored_vertex(Pos2::new(x0, bottom), cb);
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base, base + 2, base + 3);
+    };
+    for (i, &c) in strip.iter().enumerate() {
+        if c.iter().all(|&v| v < 1.0 / 255.0) { continue; }
+        let (x0, x1) = (notes.left() + i as f32 * w, notes.left() + (i + 1) as f32 * w);
+        band(x0, x1, line, keys.bottom(), add(c, crate::glow::ON_KEYS), add(c, crate::glow::ON_KEYS));
+        for s in [0.0f32, 0.35, 1.0, 2.0, 3.5, 5.0].windows(2) {
+            let (top, bottom) = ((line - s[1] * reach).max(notes.top()), line - s[0] * reach);
+            if bottom <= notes.top() { break; }
+            band(x0, x1, top, bottom, add(c, crate::glow::falloff(line - top, reach)), add(c, crate::glow::falloff(s[0] * reach, reach)));
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// A sounding key's colour for the PFA keyboard: its note's, or the default highlight.
