@@ -1177,10 +1177,16 @@ fn draw_pfa_keyboard(painter: &egui::Painter, rect: Rect, lo: u8, hi: u8, column
 fn line_room(notes: Rect) -> f32 { notes.height() }
 
 /// Heights above the line to sample the glow at: fine near the line (the core), coarser away from
-/// it, out to five reaches, clamped to the `room` there is (so a long reach runs to the top).
-fn up_rows(reach: f32, room: f32) -> Vec<f32> {
+/// it, on until the light (with its `tail`, see `glow::stacked`) has faded below one colour step,
+/// clamped to the `room` there is (so a long reach runs to the top, and a short one leaves no edge).
+fn up_rows(reach: f32, room: f32, tail: f32) -> Vec<f32> {
     let mut up: Vec<f32> = [0.0, 2.0, 5.0, 10.0, reach * 0.5, reach, reach * 2.0, reach * 3.5, reach * 5.0]
         .map(|d| d.min(room)).to_vec();
+    let mut d = reach * 5.0;
+    while d < room && crate::glow::stacked(d, reach, tail) >= 1.0 / 255.0 {
+        d *= 1.5;
+        up.push(d.min(room));
+    }
     up.sort_by(f32::total_cmp);
     up.dedup();
     up
@@ -1200,7 +1206,7 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
         Color32::from_rgba_premultiplied((tint[0] * 255.0) as u8, (tint[1] * 255.0) as u8, (tint[2] * 255.0) as u8, (alpha * 255.0) as u8)
     };
     // Rows to sample the light at: fine near the line (the core), coarser away from it.
-    let up = up_rows(reach, line_room(notes));
+    let up = up_rows(reach, line_room(notes), look.tail);
     let mut down: Vec<f32> = [0.0, 2.0, 5.0, kh * 0.25, kh * 0.5, kh].into_iter().filter(|&d| d <= kh).collect();
     down.sort_by(f32::total_cmp);
     down.dedup();
@@ -1235,7 +1241,7 @@ fn paint_bar(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32,
     let bins = (notes.width() / 2.0).ceil().max(1.0) as usize;
     let (w, h, line) = (notes.width() / bins as f32, (look.bar_height * keys.height()).max(1.0), keys.top());
     let rgb = |c: [f32; 3], f: f32, a: u8| Color32::from_rgba_premultiplied((c[0] * f * 255.0) as u8, (c[1] * f * 255.0) as u8, (c[2] * f * 255.0) as u8, a);
-    let up = up_rows(h * 2.0, line_room(notes));
+    let up = up_rows(h * 2.0, line_room(notes), look.tail);
     let mut mesh = egui::Mesh::default();
     let mut band = |x0: f32, x1: f32, top: f32, bottom: f32, ct: Color32, cb: Color32| {
         let base = mesh.vertices.len() as u32;
@@ -1578,9 +1584,14 @@ mod tests {
 
     #[test]
     fn a_long_reach_glows_all_the_way_up() {
-        let rows = up_rows(300.0, 500.0);
+        let rows = up_rows(300.0, 500.0, 0.5);
         assert_eq!(rows.last(), Some(&500.0), "{rows:?}");
-        assert_eq!(up_rows(20.0, 500.0).last(), Some(&100.0));
+        // Short reach, long tail: drawn until the light has faded (no hard edge), short of the top.
+        for tail in [0.0, 0.5, 0.9] {
+            let rows = up_rows(20.0, 2000.0, tail);
+            let last = *rows.last().unwrap();
+            assert!(last < 2000.0 && crate::glow::stacked(last, 20.0, tail) < 1.0 / 255.0, "tail {tail}: {rows:?}");
+        }
     }
 
     #[test]
