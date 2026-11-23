@@ -98,9 +98,10 @@ const NOTE_HOLD_MICROS: u64 = 1_000; // keep notes visible 1ms after Note Off to
 
 /// Warnings and errors from wgpu, egui and the rest, to stderr: on an old GPU this is where its
 /// driver says what it can't do.
-/// Some old OpenGL drivers (an HD 4000's, for one) drop egui's partial texture updates, and every
-/// glyph reaches the font atlas as one, so text never shows. On OpenGL (or with KIM_FONT_FIX=1),
-/// whenever the atlas has gained glyphs, upload it whole; a frame late, which nobody sees.
+/// Some old OpenGL drivers (an HD 4000's, for one) never show updates to a texture after its first
+/// upload, and every glyph reaches the font atlas as one, so text never shows. On OpenGL (or with
+/// KIM_FONT_FIX=1), whenever the atlas has gained glyphs, replace the texture with a new one holding
+/// all of it; a frame late, which nobody sees.
 fn reupload_fonts(ctx: &egui::Context, frame: &eframe::Frame, last_fill: &mut f32) {
     let Some(rs) = frame.wgpu_render_state() else { return };
     let gl = rs.adapter.get_info().backend == eframe::wgpu::Backend::Gl;
@@ -110,7 +111,11 @@ fn reupload_fonts(ctx: &egui::Context, frame: &eframe::Frame, last_fill: &mut f3
     *last_fill = fill;
     let image = ctx.fonts(|f| f.image());
     let delta = egui::epaint::ImageDelta::full(image, egui::epaint::TextureAtlas::texture_options());
-    rs.renderer.write().update_texture(&rs.device, &rs.queue, egui::TextureId::default(), &delta);
+    // A fresh texture, not an update: the HD 4000 stores updates (the self-test reads them back) but
+    // keeps drawing from what was first uploaded.
+    let mut renderer = rs.renderer.write();
+    renderer.free_texture(&egui::TextureId::default());
+    renderer.update_texture(&rs.device, &rs.queue, egui::TextureId::default(), &delta);
 }
 
 /// Writes a texture the way egui writes its font atlas (whole, then a small patch at an offset) and
@@ -265,7 +270,7 @@ fn main() {
                 eprintln!("GPU: {} ({:?}, driver {} {}), max texture {} px", info.name, info.backend,
                     info.driver, info.driver_info, limits.max_texture_dimension_2d);
                 if info.backend == eframe::wgpu::Backend::Gl || std::env::var("KIM_FONT_FIX").is_ok_and(|v| v == "1") {
-                    eprintln!("font fix on (build 2). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
+                    eprintln!("font fix on (build 3). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
                 }
             }
             let timer_guard = create_timer_guard();
