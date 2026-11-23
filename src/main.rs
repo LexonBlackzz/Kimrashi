@@ -98,6 +98,21 @@ const NOTE_HOLD_MICROS: u64 = 1_000; // keep notes visible 1ms after Note Off to
 
 /// Warnings and errors from wgpu, egui and the rest, to stderr: on an old GPU this is where its
 /// driver says what it can't do.
+/// Some old OpenGL drivers (an HD 4000's, for one) drop egui's partial texture updates, and every
+/// glyph reaches the font atlas as one, so text never shows. On OpenGL (or with KIM_FONT_FIX=1),
+/// whenever the atlas has gained glyphs, upload it whole; a frame late, which nobody sees.
+fn reupload_fonts(ctx: &egui::Context, frame: &eframe::Frame, last_fill: &mut f32) {
+    let Some(rs) = frame.wgpu_render_state() else { return };
+    let gl = rs.adapter.get_info().backend == eframe::wgpu::Backend::Gl;
+    if !(gl || std::env::var("KIM_FONT_FIX").is_ok_and(|v| v == "1")) { return; }
+    let fill = ctx.fonts(|f| f.texture_atlas().lock().fill_ratio());
+    if fill == *last_fill { return; }
+    *last_fill = fill;
+    let image = ctx.fonts(|f| f.image());
+    let delta = egui::epaint::ImageDelta::full(image, egui::epaint::TextureAtlas::texture_options());
+    rs.renderer.write().update_texture(&rs.device, &rs.queue, egui::TextureId::default(), &delta);
+}
+
 struct StderrLog;
 
 impl log::Log for StderrLog {
@@ -246,6 +261,7 @@ fn main() {
                 parallax: parallax::Parallax::default(),
                 matrix: matrix::Matrix::new(),
                 glow: glow::Glow::default(),
+                font_fill: 0.0,
                 instances: Arc::default(),
                 refresh_rate_hz: vsync::refresh_hz(),
                 status_message: None,
@@ -1861,6 +1877,8 @@ struct AppState {
     parallax: parallax::Parallax,
     matrix: matrix::Matrix,
     glow: glow::Glow,
+    /// Font atlas fill last uploaded whole (see `reupload_fonts`).
+    font_fill: f32,
     /// Reused across frames; the GPU callback holds a clone until it renders.
     instances: Arc<gpu::InstanceRing>,
     /// Display refresh rate reported by the compositor (for the VSync label).
@@ -1894,6 +1912,7 @@ enum SettingsTab {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        reupload_fonts(ctx, frame, &mut self.font_fill);
         // Before the frame limiter's sleep, so that sleep is not counted as time outside.
         let outside = self.last_update_end.map_or(Duration::ZERO, |end| end.elapsed());
         if self.current_song.is_some() && !self.seek_script.is_empty() {
