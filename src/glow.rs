@@ -88,7 +88,12 @@ impl Glow {
                 for c in 0..3 { px[c] += w * color[c]; }
             }
         }
-        for px in &mut light { for c in px.iter_mut() { *c = 1.0 - (-*c).exp(); } }
+        // Tone map by the brightest channel so hot light keeps its hue ("fake HDR"), not per channel
+        // (which drives every channel to 1 and washes colours out to pastel).
+        for px in &mut light {
+            let m = px[0].max(px[1]).max(px[2]);
+            if m > 0.0 { let k = (1.0 - (-m).exp()) / m; for c in px.iter_mut() { *c *= k; } }
+        }
         light
     }
 }
@@ -156,6 +161,16 @@ mod tests {
         let (deep, _) = weights(-36.0, 20.0, 40.0);
         assert!(deep > 0.4, "most of the way down the keys: {deep}");
         assert_eq!(GlowLook { glass: true, ..LOOK }.keys_tint(), LOOK.on_keys, "glass keys take the full tint");
+    }
+
+    #[test]
+    fn bright_light_keeps_its_colour() {
+        let columns: [(f32, f32); 128] = std::array::from_fn(|p| (p as f32 / 128.0, (p + 1) as f32 / 128.0));
+        let mut g = Glow::default();
+        let hot = GlowLook { intensity: 3.0, ..LOOK };
+        g.update(0, &one_key(64), &[Color32::from_rgb(255, 128, 51); 128], &hot);
+        let [r, gr, b] = g.strip(&columns, 1280, &hot)[645];
+        assert!(r < 1.0 && (gr / r - 0.5).abs() < 0.02 && (b / r - 0.2).abs() < 0.02, "orange stays orange, not pastel: {r} {gr} {b}");
     }
 
     #[test]
