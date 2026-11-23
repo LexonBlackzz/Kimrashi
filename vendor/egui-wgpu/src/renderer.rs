@@ -125,6 +125,16 @@ pub trait CallbackTrait: Send + Sync {
 /// drivers whose samplers return nothing. Set before the renderer is created.
 pub static TEXEL_FETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Kimrashi patch: a texture's size for the texel-fetch shaders (which must not ask the texture:
+/// on the HD 4000 that fails like sampling does).
+fn texture_size_buffer(device: &wgpu::Device, [w, h]: [u32; 2]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("egui_texture_size"),
+        contents: bytemuck::cast_slice(&[w as f32, h as f32, 0.0, 0.0]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
+}
+
 pub struct ScreenDescriptor {
     /// Size of the window in physical pixels.
     pub size_in_pixels: [u32; 2],
@@ -291,6 +301,17 @@ impl Renderer {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // Kimrashi patch: the texture's size, for the texel-fetch shaders.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -661,6 +682,10 @@ impl Renderer {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: texture_size_buffer(device, [texture.width(), texture.height()]).as_entire_binding(),
+                    },
                 ],
             })
         });
@@ -770,6 +795,12 @@ impl Renderer {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
+                // Kimrashi patch: a view does not give its size; the texel-fetch shaders (OpenGL)
+                // would read these textures wrong. Kimrashi registers none.
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: texture_size_buffer(device, [1, 1]).as_entire_binding(),
+                },
             ],
         });
 
@@ -825,6 +856,12 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                // Kimrashi patch: a view does not give its size; the texel-fetch shaders (OpenGL)
+                // would read these textures wrong. Kimrashi registers none.
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: texture_size_buffer(device, [1, 1]).as_entire_binding(),
                 },
             ],
         });

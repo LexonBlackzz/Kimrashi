@@ -127,10 +127,13 @@ fn fs_main_gamma_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 // Kimrashi patch: the same two fragment shaders, reading the texture with texel fetches and
-// filtering bilinearly by hand (clamped to the edge). For OpenGL drivers whose samplers return
+// filtering bilinearly by hand (clamped to the edge), the size from a uniform (asking the texture
+// fails there too). For OpenGL drivers whose samplers return
 // nothing (an Intel HD 4000's); chosen in renderer.rs when TEXEL_FETCH is set.
+@group(1) @binding(2) var<uniform> r_tex_size: vec4<f32>;
+
 fn sample_fetch(uv: vec2<f32>) -> vec4<f32> {
-    let size = vec2<i32>(textureDimensions(r_tex_color));
+    let size = vec2<i32>(r_tex_size.xy);
     let p = uv * vec2<f32>(size) - vec2<f32>(0.5);
     let f = fract(p);
     let i = vec2<i32>(floor(p));

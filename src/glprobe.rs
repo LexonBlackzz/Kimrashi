@@ -25,6 +25,8 @@ pub fn shader_variants(device: &wgpu::Device, queue: &wgpu::Queue) -> String {
 @fragment fn fs(i: O) -> @location(0) vec4<f32> {{ return textureSample(t, s, i.uv) * i.col; }}")),
         ("texel fetch", false, format!("{O_UV_COL}\n{VS}
 @fragment fn fs(i: O) -> @location(0) vec4<f32> {{ return textureLoad(t, vec2<i32>(i.uv * vec2<f32>(4.0, 1.0)), 0) * i.col; }}")),
+        ("fetch, size asked", false, format!("{O_UV_COL}\n{VS}
+@fragment fn fs(i: O) -> @location(0) vec4<f32> {{ return textureLoad(t, vec2<i32>(i.uv * vec2<f32>(textureDimensions(t))), 0) * i.col; }}")),
         ("from position", false, "struct O { @location(0) col: vec4<f32>, @builtin(position) p: vec4<f32> };
 @vertex fn vs(i: In) -> O { var o: O; o.col = unpack(i.col); o.p = vec4<f32>(i.pos, 0.0, 1.0); return o; }
 @fragment fn fs(i: O) -> @location(0) vec4<f32> { return textureSample(t, s, i.p.xy / vec2<f32>(64.0, 16.0)) * i.col; }".into()),
