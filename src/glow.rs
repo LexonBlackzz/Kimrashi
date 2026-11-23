@@ -63,6 +63,11 @@ impl Glow {
         self.strip_with(columns, width, look.spread, 0.0)
     }
 
+    /// The bloom over the keys: three times as wide as the halo above them.
+    pub fn wide(&self, columns: &[(f32, f32); 128], width: usize, look: &GlowLook) -> Vec<[f32; 3]> {
+        self.strip_with(columns, width, look.spread * 3.0, 0.0)
+    }
+
     /// The hot spot where notes meet the keys: a narrow strip, its colour 60 % of the way to white.
     pub fn core(&self, columns: &[(f32, f32); 128], width: usize, _look: &GlowLook) -> Vec<[f32; 3]> {
         self.strip_with(columns, width, 0.35, 0.6)
@@ -92,11 +97,11 @@ impl Glow {
 pub fn falloff(dy: f32, reach_px: f32) -> f32 { (-dy.max(0.0) / reach_px.max(1.0)).exp() }
 
 /// (halo, core) strength `dy` pixels above the keyboard line (negative: down into the keys, which
-/// are `keys_px` tall). The halo rises `reach_px` and blooms most of the way down the keys; the
-/// core stays within a few pixels of the line.
+/// are `keys_px` tall). The halo rises `reach_px`; over the keys (where the `wide` strip stands in
+/// for it) it stays strong all the way down. The core stays within a few pixels of the line.
 pub fn weights(dy: f32, reach_px: f32, keys_px: f32) -> (f32, f32) {
     if dy >= 0.0 { (falloff(dy, reach_px), falloff(dy, (keys_px * 0.08).max(2.0))) }
-    else { (falloff(-dy, keys_px * 0.7), falloff(-dy, keys_px * 0.25)) }
+    else { (falloff(-dy, keys_px * 3.0), falloff(-dy, keys_px * 0.25)) }
 }
 
 /// The light at one point: `halo` and `core` (per column, from `strip` and `core`) weighted.
@@ -105,9 +110,9 @@ pub fn mix(halo: [f32; 3], core: [f32; 3], (h, c): (f32, f32)) -> [f32; 3] {
 }
 
 impl GlowLook {
-    /// How strongly the light colours the keys: glass keys carry their own light, so the
-    /// spill over them is kept soft, or it would cover the lit keys.
-    pub fn keys_tint(&self) -> f32 { if self.glass { self.on_keys * 0.7 } else { self.on_keys } }
+    /// How strongly the light colours the keys (the bloom fades down them, so it leaves lit keys
+    /// showing, glass or not).
+    pub fn keys_tint(&self) -> f32 { self.on_keys }
 }
 
 /// Over the keys the light's colour is blended in rather than added (white keys can't get
@@ -139,6 +144,18 @@ mod tests {
         let (halo, core) = (g.strip(&columns, 1280, &LOOK), g.core(&columns, 1280, &LOOK));
         assert!(halo[645][1] == 0.0 && core[645][1] > 0.1, "the core is whiter: {:?} {:?}", halo[645], core[645]);
         assert!(core[665][0] < halo[665][0], "and narrower");
+    }
+
+    #[test]
+    fn the_keys_bloom_wide_and_deep() {
+        let columns: [(f32, f32); 128] = std::array::from_fn(|p| (p as f32 / 128.0, (p + 1) as f32 / 128.0));
+        let mut g = Glow::default();
+        g.update(0, &one_key(64), &[Color32::WHITE; 128], &LOOK);
+        let (halo, wide) = (g.strip(&columns, 1280, &LOOK), g.wide(&columns, 1280, &LOOK));
+        assert!(halo[700][0] < 0.01 && wide[700][0] > 0.1, "four keys out the keys still glow: {} {}", halo[700][0], wide[700][0]);
+        let (deep, _) = weights(-36.0, 20.0, 40.0);
+        assert!(deep > 0.4, "most of the way down the keys: {deep}");
+        assert_eq!(GlowLook { glass: true, ..LOOK }.keys_tint(), LOOK.on_keys, "glass keys take the full tint");
     }
 
     #[test]

@@ -82,7 +82,7 @@ fn fill(buf: &mut [u8], width: u32, x0: f32, x1: f32, y0: u32, y1: u32, color: [
 /// The key glow (halo and core strips, one colour per column, see `crate::glow`): blended onto the
 /// keys below row `line` (`glow::on_keys`), added above it, both falling off (`glow::weights`).
 /// `ui::paint_glow` draws the same live.
-fn add_glow(buf: &mut [u8], width: u32, line: u32, (halo, core): (&[[f32; 3]], &[[f32; 3]]), reach_px: f32, on_keys: f32) {
+fn add_glow(buf: &mut [u8], width: u32, line: u32, (halo, core, wide): (&[[f32; 3]], &[[f32; 3]], &[[f32; 3]]), reach_px: f32, on_keys: f32) {
     let height = (buf.len() / 4 / width as usize) as u32;
     let keys_px = (height - line) as f32;
     for y in 0..height {
@@ -90,7 +90,8 @@ fn add_glow(buf: &mut [u8], width: u32, line: u32, (halo, core): (&[[f32; 3]], &
         let dy = line as f32 - y as f32 - 0.5; // above the line: positive
         let w = crate::glow::weights(dy, reach_px, keys_px);
         if w.0.max(w.1) < 1.0 / 255.0 { continue; }
-        for ((px, &h), &c) in row.chunks_exact_mut(4).zip(halo).zip(core) {
+        let spread = if dy < 0.0 { wide } else { halo };
+        for ((px, &h), &c) in row.chunks_exact_mut(4).zip(spread).zip(core) {
             let light = crate::glow::mix(h, c, w);
             if dy < 0.0 {
                 let (tint, a) = crate::glow::on_keys(light, on_keys);
@@ -355,8 +356,9 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                     crate::pfa::fill(&mut frame, width, &crate::ui::glass_quads(kb, lo, hi, piano.then_some(&columns), &glow, gl.intensity));
                 }
                 if !glow.is_dark() {
-                    let (halo, core) = (glow.strip(&columns, width as usize, gl), glow.core(&columns, width as usize, gl));
-                    add_glow(&mut frame, width, note_h, (&halo, &core), gl.reach * note_h as f32, gl.keys_tint());
+                    let w = width as usize;
+                    let (halo, core, wide) = (glow.strip(&columns, w, gl), glow.core(&columns, w, gl), glow.wide(&columns, w, gl));
+                    add_glow(&mut frame, width, note_h, (&halo, &core, &wide), gl.reach * note_h as f32, gl.keys_tint());
                 }
             }
         }

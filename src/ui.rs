@@ -1154,7 +1154,7 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
     look: &crate::glow::GlowLook)
 {
     let bins = (notes.width() / 2.0).ceil().max(1.0) as usize;
-    let (strip, core) = (glow.strip(columns, bins, look), glow.core(columns, bins, look));
+    let (strip, core, wide) = (glow.strip(columns, bins, look), glow.core(columns, bins, look), glow.wide(columns, bins, look));
     let reach = (look.reach * notes.height()).max(1.0);
     let kh = keys.height().max(1.0);
     let over = |c: [f32; 3]| {
@@ -1183,10 +1183,10 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
         mesh.add_triangle(base, base + 2, base + 3);
     };
     for i in 0..bins {
-        let (h, c) = (strip[i], core[i]);
-        if h.iter().chain(&c).all(|&v| v < 1.0 / 255.0) { continue; }
+        let (h, c, wd) = (strip[i], core[i], wide[i]);
+        if h.iter().chain(&c).chain(&wd).all(|&v| v < 1.0 / 255.0) { continue; }
         let (x0, x1) = (notes.left() + i as f32 * w, notes.left() + (i + 1) as f32 * w);
-        let at = |dy: f32| crate::glow::mix(h, c, crate::glow::weights(dy, reach, kh));
+        let at = |dy: f32| crate::glow::mix(if dy < 0.0 { wd } else { h }, c, crate::glow::weights(dy, reach, kh));
         for s in down.windows(2) { band(x0, x1, line + s[0], line + s[1], over(at(-s[0])), over(at(-s[1]))); }
         for s in up.windows(2) { band(x0, x1, line - s[1], line - s[0], add(at(s[1]), 1.0), add(at(s[0]), 1.0)); }
     }
