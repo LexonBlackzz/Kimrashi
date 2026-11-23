@@ -360,6 +360,13 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                     let (halo, core, wide) = (glow.strip(&columns, w, gl), glow.core(&columns, w, gl), glow.wide(&columns, w, gl));
                     add_glow(&mut frame, width, note_h, (&halo, &core, &wide), gl.reach * note_h as f32, gl.keys_tint());
                 }
+                if gl.bar_height > 0.0 {
+                    let bar = glow.bar(&columns, width as usize, gl, crate::glow::bar_phase(now_us, gl));
+                    let rows = ((gl.bar_height * keyboard_h as f32).round() as u32).max(1).min(height - note_h);
+                    for row in frame[(note_h * width * 4) as usize..][..(rows * width * 4) as usize].chunks_exact_mut(width as usize * 4) {
+                        for (px, c) in row.chunks_exact_mut(4).zip(&bar) { for k in 0..3 { px[k] = (c[k] * 255.0).round() as u8; } }
+                    }
+                }
             }
         }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };
@@ -393,6 +400,9 @@ pub fn run_from_args() -> bool {
     if let Some(v) = value("--glow-spread") { look.glow_spread = v.parse::<f32>().expect("bad --glow-spread").clamp(0.5, 8.0); }
     if args.iter().any(|a| a == "--glow-glass") { look.glow_glass = true; }
     if let Some(v) = value("--glow-keys") { look.glow_on_keys = v.parse::<f32>().expect("bad --glow-keys").clamp(0.0, 1.0); }
+    if args.iter().any(|a| a == "--glow-bar") { look.glow_bar = true; }
+    if let Some(v) = value("--glow-bar-height") { look.glow_bar_height = v.parse::<f32>().expect("bad --glow-bar-height").clamp(0.02, 0.5); }
+    if let Some(v) = value("--glow-bar-speed") { look.glow_bar_speed = v.parse::<f32>().expect("bad --glow-bar-speed").clamp(-1.0, 1.0); }
     if let Some(v) = value("--glow-reach") { look.glow_reach = v.parse::<f32>().expect("bad --glow-reach").clamp(0.02, 1.0); }
     if let Some(v) = value("--matrix-fade") { look.matrix_fade = v.parse::<f32>().expect("bad --matrix-fade").clamp(0.0, 2.0); }
     if let Some(v) = value("--perspective-far") { look.perspective_far = v.parse::<f32>().expect("bad --perspective-far").clamp(0.1, 0.9); }
@@ -519,6 +529,16 @@ mod tests {
         let x = (0..40).find(|&x| level(pixel(&plain, x, 86)) > 200).expect("a white key on the left");
         assert!(level(pixel(&glass, x, 86)) < 80, "unlit white keys go dark: {:?}", pixel(&glass, x, 86));
         assert_eq!(pixel(&glass, 2, 40), pixel(&plain, 2, 40), "the note area is untouched");
+    }
+    #[test]
+    fn the_rainbow_bar_tops_the_keys() {
+        let look = |glow_bar| crate::settings::Settings { glow: true, glow_bar, glow_bar_height: 0.5, ..Default::default() };
+        let Some(plain) = first_frame("kimrashi-bar-off", look(false), 1.0) else { return };
+        let Some(bar) = first_frame("kimrashi-bar-on", look(true), 1.0) else { return };
+        let spread = |c: [u8; 3]| *c.iter().max().unwrap() as i32 - *c.iter().min().unwrap() as i32;
+        assert!(spread(pixel(&bar, 2, 82)) > 40 && spread(pixel(&plain, 2, 82)) < 20, "a coloured bar over the top of the keys: {:?}", pixel(&bar, 2, 82));
+        assert_eq!(pixel(&bar, 2, 89), pixel(&plain, 2, 89), "only the top");
+        assert_eq!(pixel(&bar, 2, 40), pixel(&plain, 2, 40), "the note area is untouched");
     }
     #[test]
     fn matrix_export_lights_the_sounding_cell() {

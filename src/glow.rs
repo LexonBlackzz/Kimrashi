@@ -18,6 +18,10 @@ pub struct GlowLook {
     pub on_keys: f32,
     /// Glass keys: frosted keys, dark at rest, lit from inside by their light (`ui::glass_quads`).
     pub glass: bool,
+    /// Rainbow bar along the top of the keys, as a fraction of their height (0: off).
+    pub bar_height: f32,
+    /// How fast the rainbow moves, in turns per second (of song time).
+    pub bar_speed: f32,
 }
 
 pub struct Glow {
@@ -68,6 +72,29 @@ impl Glow {
         self.strip_with(columns, width, look.spread * 3.0, 0.0)
     }
 
+    /// The rainbow bar's colour (0..1) for each of `width` columns: a rainbow across the width,
+    /// shifted by `phase` turns, dim at rest and flaring bright and whiter over lit keys.
+    pub fn bar(&self, columns: &[(f32, f32); 128], width: usize, look: &GlowLook, phase: f32) -> Vec<[f32; 3]> {
+        let mut lit = vec![0.0f32; width];
+        for p in 0..128 {
+            let level = self.level[p] / look.intensity.max(1e-3);
+            if level < 1e-3 { continue; }
+            let (l, r) = columns[p];
+            let (centre, sigma) = ((l + r) * 0.5 * width as f32, ((r - l) * width as f32).max(0.5));
+            let (x0, x1) = ((centre - 3.0 * sigma).max(0.0) as usize, ((centre + 3.0 * sigma) as usize + 1).min(width));
+            for (x, v) in lit.iter_mut().enumerate().take(x1).skip(x0) {
+                let d = (x as f32 + 0.5 - centre) / sigma;
+                *v += level * (-d * d).exp();
+            }
+        }
+        lit.iter().enumerate().map(|(x, &l)| {
+            let f = 1.0 - (-2.0 * l).exp();
+            let hue = ((x as f32 + 0.5) / width as f32 + phase).rem_euclid(1.0);
+            let v = 0.35 + 0.65 * f;
+            egui::ecolor::Hsva::new(hue, 1.0, 1.0, 1.0).to_srgb().map(|c| { let c = c as f32 / 255.0 * v; c + (1.0 - c) * 0.5 * f })
+        }).collect()
+    }
+
     /// The hot spot where notes meet the keys: a narrow strip, its colour 60 % of the way to white.
     pub fn core(&self, columns: &[(f32, f32); 128], width: usize, _look: &GlowLook) -> Vec<[f32; 3]> {
         self.strip_with(columns, width, 0.35, 0.6)
@@ -97,6 +124,9 @@ impl Glow {
         light
     }
 }
+
+/// Where the rainbow bar's hues stand at `now_us` of song time, in turns.
+pub fn bar_phase(now_us: u64, look: &GlowLook) -> f32 { (now_us as f64 / 1e6 * look.bar_speed as f64).fract() as f32 }
 
 /// How much of a column's light reaches `dy` pixels above the keyboard line.
 pub fn falloff(dy: f32, reach_px: f32) -> f32 { (-dy.max(0.0) / reach_px.max(1.0)).exp() }
@@ -131,7 +161,7 @@ pub fn on_keys(c: [f32; 3], strength: f32) -> ([f32; 3], f32) {
 mod tests {
     use super::*;
 
-    const LOOK: GlowLook = GlowLook { intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25, on_keys: 0.8, glass: false };
+    const LOOK: GlowLook = GlowLook { intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25, on_keys: 0.8, glass: false, bar_height: 0.1, bar_speed: 0.2 };
 
     fn one_key(p: usize) -> [bool; 128] { let mut a = [false; 128]; a[p] = true; a }
 
@@ -171,6 +201,22 @@ mod tests {
         g.update(0, &one_key(64), &[Color32::from_rgb(255, 128, 51); 128], &hot);
         let [r, gr, b] = g.strip(&columns, 1280, &hot)[645];
         assert!(r < 1.0 && (gr / r - 0.5).abs() < 0.02 && (b / r - 0.2).abs() < 0.02, "orange stays orange, not pastel: {r} {gr} {b}");
+    }
+
+    #[test]
+    fn the_rainbow_bar_moves_and_flares_at_hit_keys() {
+        let columns: [(f32, f32); 128] = std::array::from_fn(|p| (p as f32 / 128.0, (p + 1) as f32 / 128.0));
+        let mut g = Glow::default();
+        let rest = g.bar(&columns, 1280, &LOOK, 0.0);
+        let luma = |c: [f32; 3]| c[0] + c[1] + c[2];
+        assert!(rest[10][0] > rest[10][2] && rest[650][2] > rest[650][0], "red at the left, blue past the middle: {:?} {:?}", rest[10], rest[650]);
+        assert!(rest.iter().all(|&c| luma(c) < 1.2), "dim at rest");
+        let moved = g.bar(&columns, 1280, &LOOK, 0.25);
+        for c in 0..3 { assert!((moved[100][c] - rest[420][c]).abs() < 0.02, "a quarter turn moves the rainbow a quarter of the way"); }
+        g.update(0, &one_key(64), &[Color32::RED; 128], &LOOK);
+        let lit = g.bar(&columns, 1280, &LOOK, 0.0);
+        assert!(luma(lit[645]) > luma(rest[645]) + 0.8, "the hit key flares: {:?} {:?}", lit[645], rest[645]);
+        assert!((luma(lit[100]) - luma(rest[100])).abs() < 1e-3, "far keys don't");
     }
 
     #[test]

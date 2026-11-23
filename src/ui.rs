@@ -330,6 +330,19 @@ impl AppState {
                                 ui.add(egui::Slider::new(&mut c.glow_reach, 0.02..=1.0).fixed_decimals(2))
                                     .on_hover_text("How far up the light rises, as a fraction of the note area");
                                 ui.end_row();
+                                ui.label("  Rainbow bar");
+                                ui.checkbox(&mut c.glow_bar, "On").on_hover_text("A moving rainbow along the top of the keys that flares where keys are hit");
+                                ui.end_row();
+                                if c.glow_bar {
+                                    ui.label("    Height");
+                                    ui.add(egui::Slider::new(&mut c.glow_bar_height, 0.02..=0.5).fixed_decimals(2))
+                                        .on_hover_text("As a fraction of the keys' height");
+                                    ui.end_row();
+                                    ui.label("    Speed");
+                                    ui.add(egui::Slider::new(&mut c.glow_bar_speed, -1.0..=1.0).fixed_decimals(2).suffix(" turns/s"))
+                                        .on_hover_text("How fast the rainbow moves (negative: the other way; 0: still)");
+                                    ui.end_row();
+                                }
                             }
                         }
                         if c.view == ViewMode::Matrix {
@@ -1012,6 +1025,15 @@ pub(crate) fn draw_piano_roll(
                 paint_quads(&painter, &glass_quads(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), glow, look.intensity));
             }
             if !glow.is_dark() { paint_glow(&painter, glow, &columns, note_area, keyboard_rect, &look); }
+            if look.bar_height > 0.0 {
+                let bins = (note_area.width() / 2.0).ceil().max(1.0) as usize;
+                let (w, h) = (note_area.width() / bins as f32, (look.bar_height * keyboard_rect.height()).max(1.0));
+                for (i, c) in glow.bar(&columns, bins, &look, crate::glow::bar_phase(now_us, &look)).into_iter().enumerate() {
+                    let x = note_area.left() + i as f32 * w;
+                    let rect = Rect::from_min_max(egui::pos2(x, keyboard_rect.top()), egui::pos2(x + w + 0.5, keyboard_rect.top() + h));
+                    painter.rect_filled(rect, 0.0, Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
+                }
+            }
         }
         None => *glow = Default::default(),
     }

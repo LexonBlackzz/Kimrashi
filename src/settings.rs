@@ -62,6 +62,11 @@ pub struct Settings {
     pub glow_reach: f32,
     pub glow_on_keys: f32,
     pub glow_glass: bool,
+    /// Rainbow bar along the top of the keys (part of the key glow), its height as a fraction of
+    /// the keys' and its speed in turns per second.
+    pub glow_bar: bool,
+    pub glow_bar_height: f32,
+    pub glow_bar_speed: f32,
     pub note_speed: f32,
     pub notes_rise: bool,
     pub piano_layout: bool,
@@ -119,6 +124,9 @@ impl Default for Settings {
             glow_reach: 0.05,
             glow_on_keys: 0.8,
             glow_glass: false,
+            glow_bar: false,
+            glow_bar_height: 0.1,
+            glow_bar_speed: 0.2,
             note_speed: 5.0,
             notes_rise: false,
             piano_layout: false,
@@ -160,7 +168,8 @@ impl Settings {
     /// The key glow's look, when it is on.
     pub fn glow_look(&self) -> Option<crate::glow::GlowLook> {
         self.glow.then_some(crate::glow::GlowLook { intensity: self.glow_intensity, decay: self.glow_decay,
-            spread: self.glow_spread, reach: self.glow_reach, on_keys: self.glow_on_keys, glass: self.glow_glass })
+            spread: self.glow_spread, reach: self.glow_reach, on_keys: self.glow_on_keys, glass: self.glow_glass,
+            bar_height: if self.glow_bar { self.glow_bar_height } else { 0.0 }, bar_speed: self.glow_bar_speed })
     }
 
     pub fn note_mode(&self) -> u32 { if self.pfa_style { 2 } else { self.flat_notes as u32 } }
