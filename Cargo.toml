@@ -55,8 +55,8 @@ codegen-units = 16
 incremental = true
 panic = "abort"
 
-# egui-wgpu with its shader sampling at mip level 0 (textureSampleLevel): old Intel OpenGL drivers
-# (an HD 4000) break implicit-LOD sampling and draw no text. Egui textures have one level, so nothing
-# else changes. Drop when upgrading egui if upstream does the same.
+# egui-wgpu with texel-fetch fragment shaders (hand bilinear filtering), used on OpenGL via
+# egui_wgpu::TEXEL_FETCH: an HD 4000's samplers return nothing, so egui drew no text. Other backends
+# use the stock shader. Re-apply (egui.wgsl, renderer.rs) or drop when upgrading egui.
 [patch.crates-io]
 egui-wgpu = { path = "vendor/egui-wgpu" }
