@@ -61,6 +61,7 @@ pub struct Settings {
     pub glow_spread: f32,
     pub glow_reach: f32,
     pub glow_on_keys: f32,
+    pub glow_glass: bool,
     pub note_speed: f32,
     pub notes_rise: bool,
     pub piano_layout: bool,
@@ -117,6 +118,7 @@ impl Default for Settings {
             glow_spread: 2.0,
             glow_reach: 0.15,
             glow_on_keys: 0.8,
+            glow_glass: false,
             note_speed: 5.0,
             notes_rise: false,
             piano_layout: false,
@@ -158,7 +160,7 @@ impl Settings {
     /// The key glow's look, when it is on.
     pub fn glow_look(&self) -> Option<crate::glow::GlowLook> {
         self.glow.then_some(crate::glow::GlowLook { intensity: self.glow_intensity, decay: self.glow_decay,
-            spread: self.glow_spread, reach: self.glow_reach, on_keys: self.glow_on_keys })
+            spread: self.glow_spread, reach: self.glow_reach, on_keys: self.glow_on_keys, glass: self.glow_glass })
     }
 
     pub fn note_mode(&self) -> u32 { if self.pfa_style { 2 } else { self.flat_notes as u32 } }

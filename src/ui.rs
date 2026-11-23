@@ -319,6 +319,9 @@ impl AppState {
                                 ui.add(egui::Slider::new(&mut c.glow_spread, 0.5..=8.0).fixed_decimals(1).suffix(" keys"))
                                     .on_hover_text("How far the light spills sideways");
                                 ui.end_row();
+                                ui.label("  Glass keys");
+                                ui.checkbox(&mut c.glow_glass, "On").on_hover_text("Darken the keyboard like smoked glass, so the light stands out");
+                                ui.end_row();
                                 ui.label("  On keys");
                                 ui.add(egui::Slider::new(&mut c.glow_on_keys, 0.0..=1.0).fixed_decimals(2))
                                     .on_hover_text("How strongly the light colours the keys themselves");
@@ -1004,6 +1007,10 @@ pub(crate) fn draw_piano_roll(
     let along_bottom = side.is_none() && !in_parallax && !in_matrix && !persp.is_on();
     match glow_look.filter(|_| along_bottom && song.is_some()) {
         Some(look) => {
+            if look.glass {
+                let keep = (crate::glow::GLASS * 255.0) as u8;
+                painter.rect_filled(keyboard_rect, CornerRadius::ZERO, Color32::from_black_alpha(255 - keep));
+            }
             glow.update(now_us, &active_keys, &active_colors, &look);
             if !glow.is_dark() { paint_glow(&painter, glow, &columns, note_area, keyboard_rect, &look); }
         }

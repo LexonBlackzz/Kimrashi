@@ -16,7 +16,12 @@ pub struct GlowLook {
     pub reach: f32,
     /// How strongly the light colours the keys themselves (0..1).
     pub on_keys: f32,
+    /// Glass keys: the keyboard is darkened to `GLASS` of itself first, so the light stands out.
+    pub glass: bool,
 }
+
+/// What glass keys keep of the keyboard's brightness.
+pub const GLASS: f32 = 0.25;
 
 pub struct Glow {
     level: [f32; 128],
@@ -87,7 +92,7 @@ pub fn on_keys(c: [f32; 3], strength: f32) -> ([f32; 3], f32) {
 mod tests {
     use super::*;
 
-    const LOOK: GlowLook = GlowLook { intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25, on_keys: 0.8 };
+    const LOOK: GlowLook = GlowLook { intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25, on_keys: 0.8, glass: false };
 
     fn one_key(p: usize) -> [bool; 128] { let mut a = [false; 128]; a[p] = true; a }
 

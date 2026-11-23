@@ -347,6 +347,9 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                     lo, hi, piano.then_some(&columns), None, &active, &colors);
             }
             if let Some(gl) = &glow_look {
+                if gl.glass {
+                    for v in &mut frame[note_h as usize * width as usize * 4..] { *v = (*v as f32 * crate::glow::GLASS) as u8; }
+                }
                 glow.update(now_us, &active, &colors, gl);
                 if !glow.is_dark() { add_glow(&mut frame, width, note_h, &glow.strip(&columns, width as usize, gl), gl.reach * note_h as f32, gl.on_keys); }
             }
@@ -380,6 +383,7 @@ pub fn run_from_args() -> bool {
     if let Some(v) = value("--glow-intensity") { look.glow_intensity = v.parse::<f32>().expect("bad --glow-intensity").clamp(0.0, 3.0); }
     if let Some(v) = value("--glow-decay") { look.glow_decay = v.parse::<f32>().expect("bad --glow-decay").clamp(0.05, 2.0); }
     if let Some(v) = value("--glow-spread") { look.glow_spread = v.parse::<f32>().expect("bad --glow-spread").clamp(0.5, 8.0); }
+    if args.iter().any(|a| a == "--glow-glass") { look.glow_glass = true; }
     if let Some(v) = value("--glow-keys") { look.glow_on_keys = v.parse::<f32>().expect("bad --glow-keys").clamp(0.0, 1.0); }
     if let Some(v) = value("--glow-reach") { look.glow_reach = v.parse::<f32>().expect("bad --glow-reach").clamp(0.02, 1.0); }
     if let Some(v) = value("--matrix-fade") { look.matrix_fade = v.parse::<f32>().expect("bad --matrix-fade").clamp(0.0, 2.0); }
@@ -497,6 +501,16 @@ mod tests {
         let near: Vec<_> = (100..160).flat_map(|x| (80..88).map(move |y| (x, y))).filter(|&(x, y)| pixel(&plain, x, y)[0] > 230).collect();
         assert!(!near.is_empty());
         assert!(near.iter().any(|&(x, y)| spread(pixel(&lit, x, y)) > spread(pixel(&plain, x, y)) + 40), "white keys beside the lit one are tinted");
+    }
+    #[test]
+    fn glass_keys_darken_the_keyboard_but_not_the_light() {
+        let look = |glow_glass| crate::settings::Settings { glow: true, glow_glass, ..Default::default() };
+        let Some(plain) = first_frame("kimrashi-glass-off", look(false), 1.0) else { return };
+        let Some(glass) = first_frame("kimrashi-glass-on", look(true), 1.0) else { return };
+        let level = |c: [u8; 3]| c.iter().map(|&v| v as u32).sum::<u32>() / 3;
+        let x = (0..40).find(|&x| level(pixel(&plain, x, 86)) > 200).expect("a white key on the left");
+        assert!(level(pixel(&glass, x, 86)) < 80, "unlit white keys go dark: {:?}", pixel(&glass, x, 86));
+        assert_eq!(pixel(&glass, 2, 40), pixel(&plain, 2, 40), "the note area is untouched");
     }
     #[test]
     fn matrix_export_lights_the_sounding_cell() {
