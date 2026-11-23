@@ -1148,6 +1148,16 @@ fn draw_pfa_keyboard(painter: &egui::Painter, rect: Rect, lo: u8, hi: u8, column
 /// Room above the keyboard line for the glow (the note area's height).
 fn line_room(notes: Rect) -> f32 { notes.height() }
 
+/// Heights above the line to sample the glow at: fine near the line (the core), coarser away from
+/// it, out to five reaches, clamped to the `room` there is (so a long reach runs to the top).
+fn up_rows(reach: f32, room: f32) -> Vec<f32> {
+    let mut up: Vec<f32> = [0.0, 2.0, 5.0, 10.0, reach * 0.5, reach, reach * 2.0, reach * 3.5, reach * 5.0]
+        .map(|d| d.min(room)).to_vec();
+    up.sort_by(f32::total_cmp);
+    up.dedup();
+    up
+}
+
 /// The key glow as additive gradients (premultiplied colours with alpha 0 add to what is below):
 /// columns 2 points wide, blended onto the keys (`glow::on_keys`) and falling off up into the notes.
 fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32, f32); 128], notes: Rect, keys: Rect,
@@ -1162,10 +1172,7 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
         Color32::from_rgba_premultiplied((tint[0] * 255.0) as u8, (tint[1] * 255.0) as u8, (tint[2] * 255.0) as u8, (alpha * 255.0) as u8)
     };
     // Rows to sample the light at: fine near the line (the core), coarser away from it.
-    let mut up: Vec<f32> = [0.0, 2.0, 5.0, 10.0, reach * 0.5, reach, reach * 2.0, reach * 3.5, reach * 5.0].into_iter()
-        .filter(|&d| d <= line_room(notes)).collect();
-    up.sort_by(f32::total_cmp);
-    up.dedup();
+    let up = up_rows(reach, line_room(notes));
     let mut down: Vec<f32> = [0.0, 2.0, 5.0, kh * 0.25, kh * 0.5, kh].into_iter().filter(|&d| d <= kh).collect();
     down.sort_by(f32::total_cmp);
     down.dedup();
@@ -1516,6 +1523,13 @@ pub(crate) fn format_timestamp(us: u64) -> String {
 mod tests {
     use super::*;
     use crate::settings::KeyboardSide;
+
+    #[test]
+    fn a_long_reach_glows_all_the_way_up() {
+        let rows = up_rows(300.0, 500.0);
+        assert_eq!(rows.last(), Some(&500.0), "{rows:?}");
+        assert_eq!(up_rows(20.0, 500.0).last(), Some(&100.0));
+    }
 
     #[test]
     fn glass_keys_light_from_inside_with_a_pale_top() {
