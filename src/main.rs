@@ -113,6 +113,38 @@ fn reupload_fonts(ctx: &egui::Context, frame: &eframe::Frame, last_fill: &mut f3
     rs.renderer.write().update_texture(&rs.device, &rs.queue, egui::TextureId::default(), &delta);
 }
 
+/// Writes a texture the way egui writes its font atlas (whole, then a small patch at an offset) and
+/// reads it back: where a driver loses uploads, this says which kind, as "got (want)" values.
+fn texture_selftest(device: &eframe::wgpu::Device, queue: &eframe::wgpu::Queue) -> String {
+    use eframe::wgpu;
+    let (w, h) = (64u32, 32u32);
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("selftest"), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1,
+        sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+    });
+    let write = |x: u32, y: u32, pw: u32, ph: u32, v: u8| queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+        &vec![v; (pw * ph * 4) as usize],
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pw * 4), rows_per_image: Some(ph) },
+        wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 });
+    write(0, 0, w, h, 10);
+    write(20, 8, 6, 5, 200);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: Some("selftest"), size: (256 * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: None } },
+        tex.size());
+    queue.submit([encoder.finish()]);
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    if device.poll(wgpu::PollType::Wait).is_err() { return "readback failed".into(); }
+    let data = buffer.slice(..).get_mapped_range();
+    let at = |x: u32, y: u32| data[(y * 256 + x * 4) as usize];
+    format!("whole {} (10), patch {} (200), beside it {} (10), corner {} (10)", at(2, 2), at(22, 10), at(19, 10), at(63, 31))
+}
+
 struct StderrLog;
 
 impl log::Log for StderrLog {
@@ -232,6 +264,9 @@ fn main() {
                 let (info, limits) = (rs.adapter.get_info(), rs.device.limits());
                 eprintln!("GPU: {} ({:?}, driver {} {}), max texture {} px", info.name, info.backend,
                     info.driver, info.driver_info, limits.max_texture_dimension_2d);
+                if info.backend == eframe::wgpu::Backend::Gl || std::env::var("KIM_FONT_FIX").is_ok_and(|v| v == "1") {
+                    eprintln!("font fix on (build 2). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
+                }
             }
             let timer_guard = create_timer_guard();
             let mut state = AppState {
