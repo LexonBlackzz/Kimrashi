@@ -326,6 +326,10 @@ impl AppState {
                                 ui.add(egui::Slider::new(&mut c.glow_on_keys, 0.0..=1.0).fixed_decimals(2))
                                     .on_hover_text("How strongly the light colours the keys themselves");
                                 ui.end_row();
+                                ui.label("  Tail");
+                                ui.add(egui::Slider::new(&mut c.glow_tail, 0.0..=0.9).fixed_decimals(2))
+                                    .on_hover_text("Sapphire-style: wider, fainter glows stacked around the light (0: one soft glow)");
+                                ui.end_row();
                                 ui.label("  Reach");
                                 ui.add(egui::Slider::new(&mut c.glow_reach, 0.02..=1.0).fixed_decimals(2))
                                     .on_hover_text("How far up the light rises, as a fraction of the note area");
@@ -341,6 +345,16 @@ impl AppState {
                                     ui.label("    Speed");
                                     ui.add(egui::Slider::new(&mut c.glow_bar_speed, -1.0..=1.0).fixed_decimals(2).suffix(" turns/s"))
                                         .on_hover_text("How fast the rainbow moves (negative: the other way; 0: still)");
+                                    ui.end_row();
+                                    ui.label("    Brightness");
+                                    ui.add(egui::Slider::new(&mut c.glow_bar_rest, 0.0..=1.0).fixed_decimals(2))
+                                        .on_hover_text("How bright the bar is at rest; hits flare it toward white");
+                                    ui.end_row();
+                                    ui.label("    One colour");
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(&mut c.glow_bar_single, "");
+                                        if c.glow_bar_single { ui.color_edit_button_srgb(&mut c.glow_bar_color); }
+                                    }).response.on_hover_text("One colour instead of the moving rainbow");
                                     ui.end_row();
                                 }
                             }
@@ -1025,15 +1039,7 @@ pub(crate) fn draw_piano_roll(
                 paint_quads(&painter, &glass_quads(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), glow, look.intensity));
             }
             if !glow.is_dark() { paint_glow(&painter, glow, &columns, note_area, keyboard_rect, &look); }
-            if look.bar_height > 0.0 {
-                let bins = (note_area.width() / 2.0).ceil().max(1.0) as usize;
-                let (w, h) = (note_area.width() / bins as f32, (look.bar_height * keyboard_rect.height()).max(1.0));
-                for (i, c) in glow.bar(&columns, bins, &look, crate::glow::bar_phase(now_us, &look)).into_iter().enumerate() {
-                    let x = note_area.left() + i as f32 * w;
-                    let rect = Rect::from_min_max(egui::pos2(x, keyboard_rect.top()), egui::pos2(x + w + 0.5, keyboard_rect.top() + h));
-                    painter.rect_filled(rect, 0.0, Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
-                }
-            }
+            if look.bar_height > 0.0 { paint_bar(&painter, glow, &columns, note_area, keyboard_rect, &look, now_us); }
         }
         None => *glow = Default::default(),
     }
@@ -1215,9 +1221,33 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
         let (h, c, wd) = (strip[i], core[i], wide[i]);
         if h.iter().chain(&c).chain(&wd).all(|&v| v < 1.0 / 255.0) { continue; }
         let (x0, x1) = (notes.left() + i as f32 * w, notes.left() + (i + 1) as f32 * w);
-        let at = |dy: f32| crate::glow::mix(if dy < 0.0 { wd } else { h }, c, crate::glow::weights(dy, reach, kh));
+        let at = |dy: f32| crate::glow::mix(if dy < 0.0 { wd } else { h }, c, crate::glow::weights(dy, reach, kh, look.tail));
         for s in down.windows(2) { band(x0, x1, line + s[0], line + s[1], over(at(-s[0])), over(at(-s[1]))); }
         for s in up.windows(2) { band(x0, x1, line - s[1], line - s[0], add(at(s[1]), 1.0), add(at(s[0]), 1.0)); }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// The rainbow bar (`Glow::bar`) over the top of the keys, and its glow up into the notes.
+fn paint_bar(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32, f32); 128], notes: Rect, keys: Rect,
+    look: &crate::glow::GlowLook, now_us: u64)
+{
+    let bins = (notes.width() / 2.0).ceil().max(1.0) as usize;
+    let (w, h, line) = (notes.width() / bins as f32, (look.bar_height * keys.height()).max(1.0), keys.top());
+    let rgb = |c: [f32; 3], f: f32, a: u8| Color32::from_rgba_premultiplied((c[0] * f * 255.0) as u8, (c[1] * f * 255.0) as u8, (c[2] * f * 255.0) as u8, a);
+    let up = up_rows(h * 2.0, line_room(notes));
+    let mut mesh = egui::Mesh::default();
+    let mut band = |x0: f32, x1: f32, top: f32, bottom: f32, ct: Color32, cb: Color32| {
+        let base = mesh.vertices.len() as u32;
+        for (p, c) in [(Pos2::new(x0, top), ct), (Pos2::new(x1, top), ct), (Pos2::new(x1, bottom), cb), (Pos2::new(x0, bottom), cb)] { mesh.colored_vertex(p, c); }
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base, base + 2, base + 3);
+    };
+    for (i, c) in glow.bar(columns, bins, look, crate::glow::bar_phase(now_us, look)).into_iter().enumerate() {
+        let (x0, x1) = (notes.left() + i as f32 * w, notes.left() + (i + 1) as f32 * w + 0.5);
+        band(x0, x1, line, line + h, rgb(c, 1.0, 255), rgb(c, 1.0, 255));
+        let at = |dy: f32| rgb(c, crate::glow::bar_glow(dy, h, look.tail), 0);
+        for s in up.windows(2) { band(x0, x1, line - s[1], line - s[0], at(s[1]), at(s[0])); }
     }
     painter.add(egui::Shape::mesh(mesh));
 }

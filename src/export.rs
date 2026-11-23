@@ -82,13 +82,13 @@ fn fill(buf: &mut [u8], width: u32, x0: f32, x1: f32, y0: u32, y1: u32, color: [
 /// The key glow (halo and core strips, one colour per column, see `crate::glow`): blended onto the
 /// keys below row `line` (`glow::on_keys`), added above it, both falling off (`glow::weights`).
 /// `ui::paint_glow` draws the same live.
-fn add_glow(buf: &mut [u8], width: u32, line: u32, (halo, core, wide): (&[[f32; 3]], &[[f32; 3]], &[[f32; 3]]), reach_px: f32, on_keys: f32) {
+fn add_glow(buf: &mut [u8], width: u32, line: u32, (halo, core, wide): (&[[f32; 3]], &[[f32; 3]], &[[f32; 3]]), reach_px: f32, on_keys: f32, tail: f32) {
     let height = (buf.len() / 4 / width as usize) as u32;
     let keys_px = (height - line) as f32;
     for y in 0..height {
         let row = &mut buf[y as usize * width as usize * 4..][..width as usize * 4];
         let dy = line as f32 - y as f32 - 0.5; // above the line: positive
-        let w = crate::glow::weights(dy, reach_px, keys_px);
+        let w = crate::glow::weights(dy, reach_px, keys_px, tail);
         if w.0.max(w.1) < 1.0 / 255.0 { continue; }
         let spread = if dy < 0.0 { wide } else { halo };
         for ((px, &h), &c) in row.chunks_exact_mut(4).zip(spread).zip(core) {
@@ -358,13 +358,20 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                 if !glow.is_dark() {
                     let w = width as usize;
                     let (halo, core, wide) = (glow.strip(&columns, w, gl), glow.core(&columns, w, gl), glow.wide(&columns, w, gl));
-                    add_glow(&mut frame, width, note_h, (&halo, &core, &wide), gl.reach * note_h as f32, gl.keys_tint());
+                    add_glow(&mut frame, width, note_h, (&halo, &core, &wide), gl.reach * note_h as f32, gl.keys_tint(), gl.tail);
                 }
                 if gl.bar_height > 0.0 {
                     let bar = glow.bar(&columns, width as usize, gl, crate::glow::bar_phase(now_us, gl));
                     let rows = ((gl.bar_height * keyboard_h as f32).round() as u32).max(1).min(height - note_h);
                     for row in frame[(note_h * width * 4) as usize..][..(rows * width * 4) as usize].chunks_exact_mut(width as usize * 4) {
                         for (px, c) in row.chunks_exact_mut(4).zip(&bar) { for k in 0..3 { px[k] = (c[k] * 255.0).round() as u8; } }
+                    }
+                    for y in 0..note_h {
+                        let g = crate::glow::bar_glow((note_h - y) as f32 - 0.5, rows as f32, gl.tail);
+                        if g < 1.0 / 255.0 { continue; }
+                        for (px, c) in frame[(y * width * 4) as usize..][..(width * 4) as usize].chunks_exact_mut(4).zip(&bar) {
+                            for k in 0..3 { px[k] = (px[k] as f32 + c[k] * g * 255.0).min(255.0) as u8; }
+                        }
                     }
                 }
             }
@@ -403,6 +410,13 @@ pub fn run_from_args() -> bool {
     if args.iter().any(|a| a == "--glow-bar") { look.glow_bar = true; }
     if let Some(v) = value("--glow-bar-height") { look.glow_bar_height = v.parse::<f32>().expect("bad --glow-bar-height").clamp(0.02, 0.5); }
     if let Some(v) = value("--glow-bar-speed") { look.glow_bar_speed = v.parse::<f32>().expect("bad --glow-bar-speed").clamp(-1.0, 1.0); }
+    if let Some(v) = value("--glow-tail") { look.glow_tail = v.parse::<f32>().expect("bad --glow-tail").clamp(0.0, 0.9); }
+    if let Some(v) = value("--glow-bar-brightness") { look.glow_bar_rest = v.parse::<f32>().expect("bad --glow-bar-brightness").clamp(0.0, 1.0); }
+    if let Some(v) = value("--glow-bar-color") {
+        let n = u32::from_str_radix(v.trim_start_matches('#'), 16).expect("--glow-bar-color: a hex colour like 50c8ff");
+        look.glow_bar_single = true;
+        look.glow_bar_color = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+    }
     if let Some(v) = value("--glow-reach") { look.glow_reach = v.parse::<f32>().expect("bad --glow-reach").clamp(0.02, 1.0); }
     if let Some(v) = value("--matrix-fade") { look.matrix_fade = v.parse::<f32>().expect("bad --matrix-fade").clamp(0.0, 2.0); }
     if let Some(v) = value("--perspective-far") { look.perspective_far = v.parse::<f32>().expect("bad --perspective-far").clamp(0.1, 0.9); }
@@ -538,7 +552,8 @@ mod tests {
         let spread = |c: [u8; 3]| *c.iter().max().unwrap() as i32 - *c.iter().min().unwrap() as i32;
         assert!(spread(pixel(&bar, 2, 82)) > 40 && spread(pixel(&plain, 2, 82)) < 20, "a coloured bar over the top of the keys: {:?}", pixel(&bar, 2, 82));
         assert_eq!(pixel(&bar, 2, 89), pixel(&plain, 2, 89), "only the top");
-        assert_eq!(pixel(&bar, 2, 40), pixel(&plain, 2, 40), "the note area is untouched");
+        assert!(pixel(&bar, 2, 78)[0] > pixel(&plain, 2, 78)[0] + 10, "the bar glows up into the notes: {:?}", pixel(&bar, 2, 78));
+        assert!(pixel(&bar, 2, 10)[0] <= pixel(&plain, 2, 10)[0] + 5, "only a faint tail far up: {:?}", pixel(&bar, 2, 10));
     }
     #[test]
     fn matrix_export_lights_the_sounding_cell() {
