@@ -121,6 +121,10 @@ pub trait CallbackTrait: Send + Sync {
 }
 
 /// Information about the screen used for rendering.
+/// Kimrashi patch: read textures with texel fetches and filter by hand (`egui.wgsl`), for OpenGL
+/// drivers whose samplers return nothing. Set before the renderer is created.
+pub static TEXEL_FETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct ScreenDescriptor {
     /// Size of the window in physical pixels.
     pub size_in_pixels: [u32; 2],
@@ -343,11 +347,11 @@ impl Renderer {
 
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
-                    entry_point: Some(if output_color_format.is_srgb() {
-                        log::warn!("Detected a linear (sRGBA aware) framebuffer {:?}. egui prefers Rgba8Unorm or Bgra8Unorm", output_color_format);
-                        "fs_main_linear_framebuffer"
-                    } else {
-                        "fs_main_gamma_framebuffer" // this is what we prefer
+                    entry_point: Some(match (output_color_format.is_srgb(), TEXEL_FETCH.load(std::sync::atomic::Ordering::Relaxed)) {
+                        (true, false) => "fs_main_linear_framebuffer",
+                        (false, false) => "fs_main_gamma_framebuffer", // this is what we prefer
+                        (true, true) => "fs_main_linear_framebuffer_fetch",
+                        (false, true) => "fs_main_gamma_framebuffer_fetch",
                     }),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: output_color_format,

@@ -98,7 +98,7 @@ fn vs_main(
 @fragment
 fn fs_main_linear_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
     // We expect "normal" textures that are NOT sRGB-aware.
-    let tex_gamma = textureSampleLevel(r_tex_color, r_tex_sampler, in.tex_coord, 0.0);
+    let tex_gamma = textureSample(r_tex_color, r_tex_sampler, in.tex_coord);
     var out_color_gamma = in.color * tex_gamma;
     // Dither the float color down to eight bits to reduce banding.
     // This step is optional for egui backends.
@@ -115,10 +115,47 @@ fn fs_main_linear_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main_gamma_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
     // We expect "normal" textures that are NOT sRGB-aware.
-    let tex_gamma = textureSampleLevel(r_tex_color, r_tex_sampler, in.tex_coord, 0.0);
+    let tex_gamma = textureSample(r_tex_color, r_tex_sampler, in.tex_coord);
     var out_color_gamma = in.color * tex_gamma;
     // Dither the float color down to eight bits to reduce banding.
     // This step is optional for egui backends.
+    if r_locals.dithering == 1 {
+        let out_color_gamma_rgb = dither_interleaved(out_color_gamma.rgb, 256.0, in.position);
+        out_color_gamma = vec4<f32>(out_color_gamma_rgb, out_color_gamma.a);
+    }
+    return out_color_gamma;
+}
+
+// Kimrashi patch: the same two fragment shaders, reading the texture with texel fetches and
+// filtering bilinearly by hand (clamped to the edge). For OpenGL drivers whose samplers return
+// nothing (an Intel HD 4000's); chosen in renderer.rs when TEXEL_FETCH is set.
+fn sample_fetch(uv: vec2<f32>) -> vec4<f32> {
+    let size = vec2<i32>(textureDimensions(r_tex_color));
+    let p = uv * vec2<f32>(size) - vec2<f32>(0.5);
+    let f = fract(p);
+    let i = vec2<i32>(floor(p));
+    let hi = size - vec2<i32>(1);
+    let a = textureLoad(r_tex_color, clamp(i, vec2<i32>(0), hi), 0);
+    let b = textureLoad(r_tex_color, clamp(i + vec2<i32>(1, 0), vec2<i32>(0), hi), 0);
+    let c = textureLoad(r_tex_color, clamp(i + vec2<i32>(0, 1), vec2<i32>(0), hi), 0);
+    let d = textureLoad(r_tex_color, clamp(i + vec2<i32>(1, 1), vec2<i32>(0), hi), 0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+@fragment
+fn fs_main_linear_framebuffer_fetch(in: VertexOutput) -> @location(0) vec4<f32> {
+    var out_color_gamma = in.color * sample_fetch(in.tex_coord);
+    if r_locals.dithering == 1 {
+        let out_color_gamma_rgb = dither_interleaved(out_color_gamma.rgb, 256.0, in.position);
+        out_color_gamma = vec4<f32>(out_color_gamma_rgb, out_color_gamma.a);
+    }
+    let out_color_linear = linear_from_gamma_rgb(out_color_gamma.rgb);
+    return vec4<f32>(out_color_linear, out_color_gamma.a);
+}
+
+@fragment
+fn fs_main_gamma_framebuffer_fetch(in: VertexOutput) -> @location(0) vec4<f32> {
+    var out_color_gamma = in.color * sample_fetch(in.tex_coord);
     if r_locals.dithering == 1 {
         let out_color_gamma_rgb = dither_interleaved(out_color_gamma.rgb, 256.0, in.position);
         out_color_gamma = vec4<f32>(out_color_gamma_rgb, out_color_gamma.a);

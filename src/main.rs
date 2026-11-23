@@ -322,6 +322,12 @@ fn main() {
                     // egui makes its font atlas as wide as the device allows; on OpenGL keep that to 4096
                     // (still a 4K window), since old drivers (an HD 4000's) claim 8192 and draw no text.
                     // KIM_MAX_TEXTURE overrides it, on any backend.
+                    // Some OpenGL drivers (an HD 4000's) return nothing from texture samplers, so
+                    // egui draws no text: there egui reads its textures by texel fetch instead.
+                    let gl = adapter.get_info().backend == eframe::wgpu::Backend::Gl;
+                    if gl || std::env::var("KIM_TEXEL_FETCH").is_ok_and(|v| v == "1") {
+                        egui_wgpu::TEXEL_FETCH.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let cap = std::env::var("KIM_MAX_TEXTURE").ok().and_then(|v| v.parse().ok())
                         .or((adapter.get_info().backend == eframe::wgpu::Backend::Gl).then_some(4096));
                     if let Some(cap) = cap {
@@ -359,7 +365,7 @@ fn main() {
                 eprintln!("GPU: {} ({:?}, driver {} {}), max texture {} px", info.name, info.backend,
                     info.driver, info.driver_info, limits.max_texture_dimension_2d);
                 if info.backend == eframe::wgpu::Backend::Gl || std::env::var("KIM_FONT_FIX").is_ok_and(|v| v == "1") {
-                    eprintln!("font fix on (build 7, LOD 0 shader). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
+                    eprintln!("font fix on (build 8, texel fetch). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
                 }
             }
             let timer_guard = create_timer_guard();
