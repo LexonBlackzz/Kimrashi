@@ -14,6 +14,8 @@ pub struct GlowLook {
     pub spread: f32,
     /// How far up the light reaches (1/e), as a fraction of the note area's height.
     pub reach: f32,
+    /// How strongly the light colours the keys themselves (0..1).
+    pub on_keys: f32,
 }
 
 pub struct Glow {
@@ -74,14 +76,18 @@ impl Glow {
 /// How much of a column's light reaches `dy` pixels above the keyboard line.
 pub fn falloff(dy: f32, reach_px: f32) -> f32 { (-dy.max(0.0) / reach_px.max(1.0)).exp() }
 
-/// Over the keys, light is added at this strength.
-pub const ON_KEYS: f32 = 0.5;
+/// Over the keys the light's colour is blended in rather than added (white keys can't get
+/// brighter): as a premultiplied colour (0..1) and its opacity, for `c` from `Glow::strip`.
+pub fn on_keys(c: [f32; 3], strength: f32) -> ([f32; 3], f32) {
+    let k = strength.clamp(0.0, 1.0);
+    (c.map(|v| v * k), c.iter().cloned().fold(0.0, f32::max) * k)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const LOOK: GlowLook = GlowLook { intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25 };
+    const LOOK: GlowLook = GlowLook { intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25, on_keys: 0.8 };
 
     fn one_key(p: usize) -> [bool; 128] { let mut a = [false; 128]; a[p] = true; a }
 

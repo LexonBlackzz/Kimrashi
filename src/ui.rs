@@ -319,6 +319,10 @@ impl AppState {
                                 ui.add(egui::Slider::new(&mut c.glow_spread, 0.5..=8.0).fixed_decimals(1).suffix(" keys"))
                                     .on_hover_text("How far the light spills sideways");
                                 ui.end_row();
+                                ui.label("  On keys");
+                                ui.add(egui::Slider::new(&mut c.glow_on_keys, 0.0..=1.0).fixed_decimals(2))
+                                    .on_hover_text("How strongly the light colours the keys themselves");
+                                ui.end_row();
                                 ui.label("  Reach");
                                 ui.add(egui::Slider::new(&mut c.glow_reach, 0.02..=1.0).fixed_decimals(2))
                                     .on_hover_text("How far up the light rises, as a fraction of the note area");
@@ -1136,7 +1140,7 @@ fn draw_pfa_keyboard(painter: &egui::Painter, rect: Rect, lo: u8, hi: u8, column
 }
 
 /// The key glow as additive gradients (premultiplied colours with alpha 0 add to what is below):
-/// columns 2 points wide, over the keys at `ON_KEYS` and falling off up into the note area.
+/// columns 2 points wide, blended onto the keys (`glow::on_keys`) and falling off up into the notes.
 fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32, f32); 128], notes: Rect, keys: Rect,
     look: &crate::glow::GlowLook)
 {
@@ -1159,7 +1163,9 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
     for (i, &c) in strip.iter().enumerate() {
         if c.iter().all(|&v| v < 1.0 / 255.0) { continue; }
         let (x0, x1) = (notes.left() + i as f32 * w, notes.left() + (i + 1) as f32 * w);
-        band(x0, x1, line, keys.bottom(), add(c, crate::glow::ON_KEYS), add(c, crate::glow::ON_KEYS));
+        let (tint, alpha) = crate::glow::on_keys(c, look.on_keys);
+        let over = Color32::from_rgba_premultiplied((tint[0] * 255.0) as u8, (tint[1] * 255.0) as u8, (tint[2] * 255.0) as u8, (alpha * 255.0) as u8);
+        band(x0, x1, line, keys.bottom(), over, over);
         for s in [0.0f32, 0.35, 1.0, 2.0, 3.5, 5.0].windows(2) {
             let (top, bottom) = ((line - s[1] * reach).max(notes.top()), line - s[0] * reach);
             if bottom <= notes.top() { break; }

@@ -79,14 +79,21 @@ fn fill(buf: &mut [u8], width: u32, x0: f32, x1: f32, y0: u32, y1: u32, color: [
     }
 }
 
-/// Adds the key glow's `strip` (one colour per column) over the keys at `ON_KEYS` and, falling off,
-/// up from the keyboard line at row `line` (see `crate::glow`, and `ui::paint_glow` for the window).
-fn add_glow(buf: &mut [u8], width: u32, line: u32, strip: &[[f32; 3]], reach_px: f32) {
+/// The key glow's `strip` (one colour per column): blended onto the keys below row `line`
+/// (`glow::on_keys`), and added, falling off, above it (see `crate::glow`; `ui::paint_glow` live).
+fn add_glow(buf: &mut [u8], width: u32, line: u32, strip: &[[f32; 3]], reach_px: f32, on_keys: f32) {
     let height = (buf.len() / 4 / width as usize) as u32;
     for y in 0..height {
-        let f = if y >= line { crate::glow::ON_KEYS } else { crate::glow::falloff((line - y) as f32 - 0.5, reach_px) };
-        if f < 1.0 / 255.0 { continue; }
         let row = &mut buf[y as usize * width as usize * 4..][..width as usize * 4];
+        if y >= line {
+            for (px, &c) in row.chunks_exact_mut(4).zip(strip) {
+                let (tint, a) = crate::glow::on_keys(c, on_keys);
+                for k in 0..3 { px[k] = (px[k] as f32 * (1.0 - a) + tint[k] * 255.0).round().min(255.0) as u8; }
+            }
+            continue;
+        }
+        let f = crate::glow::falloff((line - y) as f32 - 0.5, reach_px);
+        if f < 1.0 / 255.0 { continue; }
         for (px, c) in row.chunks_exact_mut(4).zip(strip) {
             for k in 0..3 { px[k] = (px[k] as f32 + c[k] * f * 255.0).min(255.0) as u8; }
         }
@@ -341,7 +348,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             }
             if let Some(gl) = &glow_look {
                 glow.update(now_us, &active, &colors, gl);
-                if !glow.is_dark() { add_glow(&mut frame, width, note_h, &glow.strip(&columns, width as usize, gl), gl.reach * note_h as f32); }
+                if !glow.is_dark() { add_glow(&mut frame, width, note_h, &glow.strip(&columns, width as usize, gl), gl.reach * note_h as f32, gl.on_keys); }
             }
         }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };
@@ -373,6 +380,7 @@ pub fn run_from_args() -> bool {
     if let Some(v) = value("--glow-intensity") { look.glow_intensity = v.parse::<f32>().expect("bad --glow-intensity").clamp(0.0, 3.0); }
     if let Some(v) = value("--glow-decay") { look.glow_decay = v.parse::<f32>().expect("bad --glow-decay").clamp(0.05, 2.0); }
     if let Some(v) = value("--glow-spread") { look.glow_spread = v.parse::<f32>().expect("bad --glow-spread").clamp(0.5, 8.0); }
+    if let Some(v) = value("--glow-keys") { look.glow_on_keys = v.parse::<f32>().expect("bad --glow-keys").clamp(0.0, 1.0); }
     if let Some(v) = value("--glow-reach") { look.glow_reach = v.parse::<f32>().expect("bad --glow-reach").clamp(0.02, 1.0); }
     if let Some(v) = value("--matrix-fade") { look.matrix_fade = v.parse::<f32>().expect("bad --matrix-fade").clamp(0.0, 2.0); }
     if let Some(v) = value("--perspective-far") { look.perspective_far = v.parse::<f32>().expect("bad --perspective-far").clamp(0.1, 0.9); }
@@ -484,6 +492,11 @@ mod tests {
         let sum = |f: &[u8], y| (0..160).map(|x| pixel(f, x, y).iter().map(|&c| c as u32).sum::<u32>()).sum::<u32>();
         assert!(sum(&lit, 70) > sum(&plain, 70) + 100, "light rises above the keyboard line");
         assert_eq!(pixel(&lit, 2, 70), pixel(&plain, 2, 70), "far from key 100 nothing changes");
+        // Near key 100 (x ~144 with the default range), white keys take on the light's colour: not grey any more.
+        let spread = |c: [u8; 3]| *c.iter().max().unwrap() as i32 - *c.iter().min().unwrap() as i32;
+        let near: Vec<_> = (100..160).flat_map(|x| (80..88).map(move |y| (x, y))).filter(|&(x, y)| pixel(&plain, x, y)[0] > 230).collect();
+        assert!(!near.is_empty());
+        assert!(near.iter().any(|&(x, y)| spread(pixel(&lit, x, y)) > spread(pixel(&plain, x, y)) + 40), "white keys beside the lit one are tinted");
     }
     #[test]
     fn matrix_export_lights_the_sounding_cell() {
