@@ -1014,7 +1014,7 @@ impl Offscreen {
     }
 }
 
-fn pollster_block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+pub(crate) fn pollster_block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     use std::{sync::Arc, task::{Context, Poll, Wake, Waker}};
     struct Unpark(std::thread::Thread);
     impl Wake for Unpark { fn wake(self: Arc<Self>) { self.0.unpark(); } }

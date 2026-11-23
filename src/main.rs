@@ -20,6 +20,7 @@ mod ui;
 mod parallax;
 mod matrix;
 mod glow;
+mod glprobe;
 mod svms;
 mod sig;
 mod update;
@@ -164,7 +165,8 @@ fn draw_selftest(ctx: &egui::Context, rs: &eframe::egui_wgpu::RenderState) -> St
     let fresh = draw_probe(ctx, rs, &mut Renderer::new(&rs.device, screen, None, 1, false), screen, false);
     let plain = draw_probe(ctx, rs, &mut Renderer::new(&rs.device, eframe::wgpu::TextureFormat::Rgba8Unorm, None, 1, false),
         eframe::wgpu::TextureFormat::Rgba8Unorm, false);
-    format!("screen format {screen:?}{nl}  app renderer: {own}{nl}  fresh, screen format: {fresh}{nl}  fresh, RGBA: {plain}", nl = "\n")
+    format!("screen format {screen:?}{nl}  app renderer: {own}{nl}  fresh, screen format: {fresh}{nl}  fresh, RGBA: {plain}{nl}{}",
+        glprobe::shader_variants(&rs.device, &rs.queue), nl = "\n")
 }
 
 fn draw_probe(ctx: &egui::Context, rs: &eframe::egui_wgpu::RenderState, renderer: &mut eframe::egui_wgpu::Renderer,
@@ -357,7 +359,7 @@ fn main() {
                 eprintln!("GPU: {} ({:?}, driver {} {}), max texture {} px", info.name, info.backend,
                     info.driver, info.driver_info, limits.max_texture_dimension_2d);
                 if info.backend == eframe::wgpu::Backend::Gl || std::env::var("KIM_FONT_FIX").is_ok_and(|v| v == "1") {
-                    eprintln!("font fix on (build 6, LOD 0 shader). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
+                    eprintln!("font fix on (build 7, LOD 0 shader). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
                 }
             }
             let timer_guard = create_timer_guard();
