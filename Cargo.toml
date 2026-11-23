@@ -54,3 +54,9 @@ lto = false
 codegen-units = 16
 incremental = true
 panic = "abort"
+
+# egui-wgpu with its shader sampling at mip level 0 (textureSampleLevel): old Intel OpenGL drivers
+# (an HD 4000) break implicit-LOD sampling and draw no text. Egui textures have one level, so nothing
+# else changes. Drop when upgrading egui if upstream does the same.
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }

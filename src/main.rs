@@ -357,7 +357,7 @@ fn main() {
                 eprintln!("GPU: {} ({:?}, driver {} {}), max texture {} px", info.name, info.backend,
                     info.driver, info.driver_info, limits.max_texture_dimension_2d);
                 if info.backend == eframe::wgpu::Backend::Gl || std::env::var("KIM_FONT_FIX").is_ok_and(|v| v == "1") {
-                    eprintln!("font fix on (build 5, 4096 cap). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
+                    eprintln!("font fix on (build 6, LOD 0 shader). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
                 }
             }
             let timer_guard = create_timer_guard();
