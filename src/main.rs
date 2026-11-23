@@ -20,7 +20,6 @@ mod ui;
 mod parallax;
 mod matrix;
 mod glow;
-mod glprobe;
 mod svms;
 mod sig;
 mod update;
@@ -99,137 +98,6 @@ const NOTE_HOLD_MICROS: u64 = 1_000; // keep notes visible 1ms after Note Off to
 
 /// Warnings and errors from wgpu, egui and the rest, to stderr: on an old GPU this is where its
 /// driver says what it can't do.
-/// Some old OpenGL drivers (an HD 4000's, for one) never show updates to a texture after its first
-/// upload, and every glyph reaches the font atlas as one, so text never shows. On OpenGL (or with
-/// KIM_FONT_FIX=1), whenever the atlas has gained glyphs, replace the texture with a new one holding
-/// all of it; a frame late, which nobody sees.
-fn reupload_fonts(ctx: &egui::Context, frame: &eframe::Frame, last_fill: &mut f32) {
-    let Some(rs) = frame.wgpu_render_state() else { return };
-    let gl = rs.adapter.get_info().backend == eframe::wgpu::Backend::Gl;
-    if !(gl || std::env::var("KIM_FONT_FIX").is_ok_and(|v| v == "1")) { return; }
-    // A second in, once the atlas holds the UI's glyphs, draw it through egui's shader and report.
-    static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 60 { eprintln!("draw self-test: {}", draw_selftest(ctx, rs)); }
-    let fill = ctx.fonts(|f| f.texture_atlas().lock().fill_ratio());
-    if fill == *last_fill { return; }
-    *last_fill = fill;
-    let image = ctx.fonts(|f| f.image());
-    let delta = egui::epaint::ImageDelta::full(image, egui::epaint::TextureAtlas::texture_options());
-    // A fresh texture, not an update: the HD 4000 stores updates (the self-test reads them back) but
-    // keeps drawing from what was first uploaded.
-    let mut renderer = rs.renderer.write();
-    renderer.free_texture(&egui::TextureId::default());
-    renderer.update_texture(&rs.device, &rs.queue, egui::TextureId::default(), &delta);
-}
-
-/// Writes a texture the way egui writes its font atlas (whole, then a small patch at an offset) and
-/// reads it back: where a driver loses uploads, this says which kind, as "got (want)" values.
-fn texture_selftest(device: &eframe::wgpu::Device, queue: &eframe::wgpu::Queue) -> String {
-    use eframe::wgpu;
-    let (w, h) = (64u32, 32u32);
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("selftest"), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1,
-        sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-    });
-    let write = |x: u32, y: u32, pw: u32, ph: u32, v: u8| queue.write_texture(
-        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
-        &vec![v; (pw * ph * 4) as usize],
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pw * 4), rows_per_image: Some(ph) },
-        wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 });
-    write(0, 0, w, h, 10);
-    write(20, 8, 6, 5, 200);
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: Some("selftest"), size: (256 * h) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-    let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: None } },
-        tex.size());
-    queue.submit([encoder.finish()]);
-    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    if device.poll(wgpu::PollType::Wait).is_err() { return "readback failed".into(); }
-    let data = buffer.slice(..).get_mapped_range();
-    let at = |x: u32, y: u32| data[(y * 256 + x * 4) as usize];
-    format!("whole {} (10), patch {} (200), beside it {} (10), corner {} (10)", at(2, 2), at(22, 10), at(19, 10), at(63, 31))
-}
-
-/// Draws through egui's shader into a small image and reads it back, three ways: with the app's own
-/// renderer (screen format, depth buffer), and with fresh renderers in the screen format and in plain
-/// RGBA. Each draws a 4-texel strip (white, red, green, blue) once with texture coordinates varying
-/// across it (as text does) and once fixed at the top-left texel (as boxes do), and the font atlas.
-fn draw_selftest(ctx: &egui::Context, rs: &eframe::egui_wgpu::RenderState) -> String {
-    use eframe::egui_wgpu::Renderer;
-    let screen = rs.target_format;
-    let own = draw_probe(ctx, rs, &mut rs.renderer.write(), screen, true);
-    let fresh = draw_probe(ctx, rs, &mut Renderer::new(&rs.device, screen, None, 1, false), screen, false);
-    let plain = draw_probe(ctx, rs, &mut Renderer::new(&rs.device, eframe::wgpu::TextureFormat::Rgba8Unorm, None, 1, false),
-        eframe::wgpu::TextureFormat::Rgba8Unorm, false);
-    format!("screen format {screen:?}{nl}  app renderer: {own}{nl}  fresh, screen format: {fresh}{nl}  fresh, RGBA: {plain}{nl}{}",
-        glprobe::shader_variants(&rs.device, &rs.queue), nl = "\n")
-}
-
-fn draw_probe(ctx: &egui::Context, rs: &eframe::egui_wgpu::RenderState, renderer: &mut eframe::egui_wgpu::Renderer,
-    format: eframe::wgpu::TextureFormat, depth: bool) -> String
-{
-    use eframe::{egui_wgpu, wgpu};
-    let (device, queue, (w, h)) = (&rs.device, &rs.queue, (256u32, 64u32));
-    let strip = egui::TextureId::User(0x5e1f);
-    let texels = [255, 255, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255];
-    renderer.update_texture(device, queue, strip, &egui::epaint::ImageDelta::full(
-        egui::ColorImage::from_rgba_unmultiplied([4, 1], &texels), egui::TextureOptions::NEAREST));
-    let atlas = ctx.fonts(|f| f.image());
-    if !depth {
-        renderer.update_texture(device, queue, egui::TextureId::default(), &egui::epaint::ImageDelta::full(
-            atlas.clone(), egui::epaint::TextureAtlas::texture_options()));
-    }
-    let quad = |id, top: f32, height: f32, uv: egui::Rect| {
-        let mut mesh = egui::Mesh::with_texture(id);
-        mesh.add_rect_with_uv(egui::Rect::from_min_size(egui::pos2(0.0, top), egui::vec2(w as f32, height)), uv, egui::Color32::WHITE);
-        egui::ClippedPrimitive { clip_rect: egui::Rect::EVERYTHING, primitive: egui::epaint::Primitive::Mesh(mesh) }
-    };
-    let (all, corner) = (egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO));
-    let jobs = [quad(strip, 0.0, 16.0, all), quad(strip, 16.0, 16.0, corner), quad(egui::TextureId::default(), 32.0, 32.0, all)];
-    let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
-    let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("draw selftest"), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1,
-        sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[],
-    });
-    let target = texture(format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
-    let depth_texture = texture(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT);
-    let (view, depth_view) = (target.create_view(&Default::default()), depth_texture.create_view(&Default::default()));
-    let mut encoder = device.create_command_encoder(&Default::default());
-    let extra = renderer.update_buffers(device, queue, &mut encoder, &jobs, &screen);
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("draw selftest"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view, resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: depth.then(|| wgpu::RenderPassDepthStencilAttachment {
-                view: &depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }), stencil_ops: None,
-            }),
-            timestamp_writes: None, occlusion_query_set: None,
-        }).forget_lifetime();
-        renderer.render(&mut pass, &jobs, &screen);
-    }
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: Some("draw selftest"), size: (w * 4 * h) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-    encoder.copy_texture_to_buffer(target.as_image_copy(),
-        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None } },
-        target.size());
-    queue.submit(extra.into_iter().chain([encoder.finish()]));
-    renderer.free_texture(&strip);
-    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    if device.poll(wgpu::PollType::Wait).is_err() { return "readback failed".into(); }
-    let data = buffer.slice(..).get_mapped_range();
-    let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; [data[i], data[i + 1], data[i + 2], data[i + 3]] };
-    let lit = (h / 2..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| px(x, y)[3] > 0).count();
-    format!("varying {:?} {:?} {:?} {:?} (white red green blue), fixed {:?} (white), atlas {}x{} drew {} lit pixels",
-        px(32, 8), px(96, 8), px(160, 8), px(224, 8), px(128, 24), atlas.size[0], atlas.size[1], lit)
-}
-
 struct StderrLog;
 
 impl log::Log for StderrLog {
@@ -319,20 +187,12 @@ fn main() {
                     let mut desc = (egui_wgpu::WgpuSetupCreateNew::default().device_descriptor)(adapter);
                     desc.required_limits.max_buffer_size = adapter.limits().max_buffer_size;
                     desc.required_limits.max_storage_buffer_binding_size = adapter.limits().max_storage_buffer_binding_size;
-                    // egui makes its font atlas as wide as the device allows; on OpenGL keep that to 4096
-                    // (still a 4K window), since old drivers (an HD 4000's) claim 8192 and draw no text.
-                    // KIM_MAX_TEXTURE overrides it, on any backend.
-                    // Some OpenGL drivers (an HD 4000's) return nothing from texture samplers, so
-                    // egui draws no text: there egui reads its textures by texel fetch instead.
+                    // Some OpenGL drivers (an HD 4000's) return nothing from texture samplers, so egui
+                    // drew no text: on OpenGL egui reads its textures by texel fetch instead (see the
+                    // patched vendor/egui-wgpu). KIM_TEXEL_FETCH=1 forces it on other backends.
                     let gl = adapter.get_info().backend == eframe::wgpu::Backend::Gl;
                     if gl || std::env::var("KIM_TEXEL_FETCH").is_ok_and(|v| v == "1") {
                         egui_wgpu::TEXEL_FETCH.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    let cap = std::env::var("KIM_MAX_TEXTURE").ok().and_then(|v| v.parse().ok())
-                        .or((adapter.get_info().backend == eframe::wgpu::Backend::Gl).then_some(4096));
-                    if let Some(cap) = cap {
-                        let max = &mut desc.required_limits.max_texture_dimension_2d;
-                        *max = (*max).min(cap);
                     }
                     desc
                 }),
@@ -364,9 +224,6 @@ fn main() {
                 let (info, limits) = (rs.adapter.get_info(), rs.device.limits());
                 eprintln!("GPU: {} ({:?}, driver {} {}), max texture {} px", info.name, info.backend,
                     info.driver, info.driver_info, limits.max_texture_dimension_2d);
-                if info.backend == eframe::wgpu::Backend::Gl || std::env::var("KIM_FONT_FIX").is_ok_and(|v| v == "1") {
-                    eprintln!("font fix on (build 9, texel fetch, size uniform). Texture self-test: {}", texture_selftest(&rs.device, &rs.queue));
-                }
             }
             let timer_guard = create_timer_guard();
             let mut state = AppState {
@@ -396,7 +253,6 @@ fn main() {
                 parallax: parallax::Parallax::default(),
                 matrix: matrix::Matrix::new(),
                 glow: glow::Glow::default(),
-                font_fill: 0.0,
                 instances: Arc::default(),
                 refresh_rate_hz: vsync::refresh_hz(),
                 status_message: None,
@@ -2012,8 +1868,6 @@ struct AppState {
     parallax: parallax::Parallax,
     matrix: matrix::Matrix,
     glow: glow::Glow,
-    /// Font atlas fill last uploaded whole (see `reupload_fonts`).
-    font_fill: f32,
     /// Reused across frames; the GPU callback holds a clone until it renders.
     instances: Arc<gpu::InstanceRing>,
     /// Display refresh rate reported by the compositor (for the VSync label).
@@ -2047,7 +1901,6 @@ enum SettingsTab {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        reupload_fonts(ctx, frame, &mut self.font_fill);
         // Before the frame limiter's sleep, so that sleep is not counted as time outside.
         let outside = self.last_update_end.map_or(Duration::ZERO, |end| end.elapsed());
         if self.current_song.is_some() && !self.seek_script.is_empty() {
