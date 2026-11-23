@@ -60,17 +60,27 @@ impl Glow {
     /// Tone-mapped light (0..1 per channel) for each of `width` columns; `columns[p]` is key p's
     /// (left, right) as fractions of the width.
     pub fn strip(&self, columns: &[(f32, f32); 128], width: usize, look: &GlowLook) -> Vec<[f32; 3]> {
+        self.strip_with(columns, width, look.spread, 0.0)
+    }
+
+    /// The hot spot where notes meet the keys: a narrow strip, its colour 60 % of the way to white.
+    pub fn core(&self, columns: &[(f32, f32); 128], width: usize, _look: &GlowLook) -> Vec<[f32; 3]> {
+        self.strip_with(columns, width, 0.35, 0.6)
+    }
+
+    fn strip_with(&self, columns: &[(f32, f32); 128], width: usize, spread: f32, whiten: f32) -> Vec<[f32; 3]> {
         let mut light = vec![[0.0f32; 3]; width];
         for p in 0..128 {
             let level = self.level[p];
             if level < 1e-3 { continue; }
             let (l, r) = columns[p];
-            let (centre, sigma) = ((l + r) * 0.5 * width as f32, ((r - l) * width as f32 * look.spread).max(0.5));
+            let (centre, sigma) = ((l + r) * 0.5 * width as f32, ((r - l) * width as f32 * spread).max(0.5));
+            let color = self.color[p].map(|c| c + (1.0 - c) * whiten);
             let (x0, x1) = ((centre - 3.0 * sigma).max(0.0) as usize, ((centre + 3.0 * sigma) as usize + 1).min(width));
             for (x, px) in light.iter_mut().enumerate().take(x1).skip(x0) {
                 let d = (x as f32 + 0.5 - centre) / sigma;
                 let w = level * (-d * d).exp();
-                for c in 0..3 { px[c] += w * self.color[p][c]; }
+                for c in 0..3 { px[c] += w * color[c]; }
             }
         }
         for px in &mut light { for c in px.iter_mut() { *c = 1.0 - (-*c).exp(); } }
@@ -81,10 +91,23 @@ impl Glow {
 /// How much of a column's light reaches `dy` pixels above the keyboard line.
 pub fn falloff(dy: f32, reach_px: f32) -> f32 { (-dy.max(0.0) / reach_px.max(1.0)).exp() }
 
+/// (halo, core) strength `dy` pixels above the keyboard line (negative: down into the keys, which
+/// are `keys_px` tall). The halo rises `reach_px` and blooms most of the way down the keys; the
+/// core stays within a few pixels of the line.
+pub fn weights(dy: f32, reach_px: f32, keys_px: f32) -> (f32, f32) {
+    if dy >= 0.0 { (falloff(dy, reach_px), falloff(dy, (keys_px * 0.08).max(2.0))) }
+    else { (falloff(-dy, keys_px * 0.7), falloff(-dy, keys_px * 0.25)) }
+}
+
+/// The light at one point: `halo` and `core` (per column, from `strip` and `core`) weighted.
+pub fn mix(halo: [f32; 3], core: [f32; 3], (h, c): (f32, f32)) -> [f32; 3] {
+    std::array::from_fn(|i| (halo[i] * h + core[i] * c).min(1.0))
+}
+
 impl GlowLook {
     /// How strongly the light colours the keys: glass keys carry their own light, so the
     /// spill over them is kept soft, or it would cover the lit keys.
-    pub fn keys_tint(&self) -> f32 { if self.glass { self.on_keys * 0.3 } else { self.on_keys } }
+    pub fn keys_tint(&self) -> f32 { if self.glass { self.on_keys * 0.7 } else { self.on_keys } }
 }
 
 /// Over the keys the light's colour is blended in rather than added (white keys can't get
@@ -101,6 +124,22 @@ mod tests {
     const LOOK: GlowLook = GlowLook { intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25, on_keys: 0.8, glass: false };
 
     fn one_key(p: usize) -> [bool; 128] { let mut a = [false; 128]; a[p] = true; a }
+
+    #[test]
+    fn light_is_hottest_at_the_line_and_blooms_down_into_the_keys() {
+        let (reach, keys) = (20.0, 40.0);
+        assert_eq!(weights(0.0, reach, keys), (1.0, 1.0));
+        let (halo_up, core_up) = weights(10.0, reach, keys);
+        let (halo_down, core_down) = weights(-10.0, reach, keys);
+        assert!(core_up < 0.2 && core_down < 0.5, "the core is tight: {core_up} {core_down}");
+        assert!(halo_down > halo_up, "the halo reaches further into the keys than up: {halo_down} {halo_up}");
+        let columns: [(f32, f32); 128] = std::array::from_fn(|p| (p as f32 / 128.0, (p + 1) as f32 / 128.0));
+        let mut g = Glow::default();
+        g.update(0, &one_key(64), &[Color32::RED; 128], &LOOK);
+        let (halo, core) = (g.strip(&columns, 1280, &LOOK), g.core(&columns, 1280, &LOOK));
+        assert!(halo[645][1] == 0.0 && core[645][1] > 0.1, "the core is whiter: {:?} {:?}", halo[645], core[645]);
+        assert!(core[665][0] < halo[665][0], "and narrower");
+    }
 
     #[test]
     fn released_light_decays_and_seeks_clear_it() {

@@ -116,7 +116,7 @@ impl Default for Settings {
             glow_intensity: 1.0,
             glow_decay: 0.3,
             glow_spread: 2.0,
-            glow_reach: 0.15,
+            glow_reach: 0.05,
             glow_on_keys: 0.8,
             glow_glass: false,
             note_speed: 5.0,

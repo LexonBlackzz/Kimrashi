@@ -1145,14 +1145,30 @@ fn draw_pfa_keyboard(painter: &egui::Painter, rect: Rect, lo: u8, hi: u8, column
     paint_quads(painter, &quads);
 }
 
+/// Room above the keyboard line for the glow (the note area's height).
+fn line_room(notes: Rect) -> f32 { notes.height() }
+
 /// The key glow as additive gradients (premultiplied colours with alpha 0 add to what is below):
 /// columns 2 points wide, blended onto the keys (`glow::on_keys`) and falling off up into the notes.
 fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32, f32); 128], notes: Rect, keys: Rect,
     look: &crate::glow::GlowLook)
 {
     let bins = (notes.width() / 2.0).ceil().max(1.0) as usize;
-    let strip = glow.strip(columns, bins, look);
+    let (strip, core) = (glow.strip(columns, bins, look), glow.core(columns, bins, look));
     let reach = (look.reach * notes.height()).max(1.0);
+    let kh = keys.height().max(1.0);
+    let over = |c: [f32; 3]| {
+        let (tint, alpha) = crate::glow::on_keys(c, look.keys_tint());
+        Color32::from_rgba_premultiplied((tint[0] * 255.0) as u8, (tint[1] * 255.0) as u8, (tint[2] * 255.0) as u8, (alpha * 255.0) as u8)
+    };
+    // Rows to sample the light at: fine near the line (the core), coarser away from it.
+    let mut up: Vec<f32> = [0.0, 2.0, 5.0, 10.0, reach * 0.5, reach, reach * 2.0, reach * 3.5, reach * 5.0].into_iter()
+        .filter(|&d| d <= line_room(notes)).collect();
+    up.sort_by(f32::total_cmp);
+    up.dedup();
+    let mut down: Vec<f32> = [0.0, 2.0, 5.0, kh * 0.25, kh * 0.5, kh].into_iter().filter(|&d| d <= kh).collect();
+    down.sort_by(f32::total_cmp);
+    down.dedup();
     let add = |c: [f32; 3], f: f32| Color32::from_rgba_premultiplied(
         (c[0] * f * 255.0) as u8, (c[1] * f * 255.0) as u8, (c[2] * f * 255.0) as u8, 0);
     let (line, w) = (notes.bottom(), notes.width() / bins as f32);
@@ -1166,17 +1182,13 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
         mesh.add_triangle(base, base + 1, base + 2);
         mesh.add_triangle(base, base + 2, base + 3);
     };
-    for (i, &c) in strip.iter().enumerate() {
-        if c.iter().all(|&v| v < 1.0 / 255.0) { continue; }
+    for i in 0..bins {
+        let (h, c) = (strip[i], core[i]);
+        if h.iter().chain(&c).all(|&v| v < 1.0 / 255.0) { continue; }
         let (x0, x1) = (notes.left() + i as f32 * w, notes.left() + (i + 1) as f32 * w);
-        let (tint, alpha) = crate::glow::on_keys(c, look.keys_tint());
-        let over = Color32::from_rgba_premultiplied((tint[0] * 255.0) as u8, (tint[1] * 255.0) as u8, (tint[2] * 255.0) as u8, (alpha * 255.0) as u8);
-        band(x0, x1, line, keys.bottom(), over, over);
-        for s in [0.0f32, 0.35, 1.0, 2.0, 3.5, 5.0].windows(2) {
-            let (top, bottom) = ((line - s[1] * reach).max(notes.top()), line - s[0] * reach);
-            if bottom <= notes.top() { break; }
-            band(x0, x1, top, bottom, add(c, crate::glow::falloff(line - top, reach)), add(c, crate::glow::falloff(s[0] * reach, reach)));
-        }
+        let at = |dy: f32| crate::glow::mix(h, c, crate::glow::weights(dy, reach, kh));
+        for s in down.windows(2) { band(x0, x1, line + s[0], line + s[1], over(at(-s[0])), over(at(-s[1]))); }
+        for s in up.windows(2) { band(x0, x1, line - s[1], line - s[0], add(at(s[1]), 1.0), add(at(s[0]), 1.0)); }
     }
     painter.add(egui::Shape::mesh(mesh));
 }

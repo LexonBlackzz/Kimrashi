@@ -79,23 +79,25 @@ fn fill(buf: &mut [u8], width: u32, x0: f32, x1: f32, y0: u32, y1: u32, color: [
     }
 }
 
-/// The key glow's `strip` (one colour per column): blended onto the keys below row `line`
-/// (`glow::on_keys`), and added, falling off, above it (see `crate::glow`; `ui::paint_glow` live).
-fn add_glow(buf: &mut [u8], width: u32, line: u32, strip: &[[f32; 3]], reach_px: f32, on_keys: f32) {
+/// The key glow (halo and core strips, one colour per column, see `crate::glow`): blended onto the
+/// keys below row `line` (`glow::on_keys`), added above it, both falling off (`glow::weights`).
+/// `ui::paint_glow` draws the same live.
+fn add_glow(buf: &mut [u8], width: u32, line: u32, (halo, core): (&[[f32; 3]], &[[f32; 3]]), reach_px: f32, on_keys: f32) {
     let height = (buf.len() / 4 / width as usize) as u32;
+    let keys_px = (height - line) as f32;
     for y in 0..height {
         let row = &mut buf[y as usize * width as usize * 4..][..width as usize * 4];
-        if y >= line {
-            for (px, &c) in row.chunks_exact_mut(4).zip(strip) {
-                let (tint, a) = crate::glow::on_keys(c, on_keys);
+        let dy = line as f32 - y as f32 - 0.5; // above the line: positive
+        let w = crate::glow::weights(dy, reach_px, keys_px);
+        if w.0.max(w.1) < 1.0 / 255.0 { continue; }
+        for ((px, &h), &c) in row.chunks_exact_mut(4).zip(halo).zip(core) {
+            let light = crate::glow::mix(h, c, w);
+            if dy < 0.0 {
+                let (tint, a) = crate::glow::on_keys(light, on_keys);
                 for k in 0..3 { px[k] = (px[k] as f32 * (1.0 - a) + tint[k] * 255.0).round().min(255.0) as u8; }
+            } else {
+                for k in 0..3 { px[k] = (px[k] as f32 + light[k] * 255.0).min(255.0) as u8; }
             }
-            continue;
-        }
-        let f = crate::glow::falloff((line - y) as f32 - 0.5, reach_px);
-        if f < 1.0 / 255.0 { continue; }
-        for (px, c) in row.chunks_exact_mut(4).zip(strip) {
-            for k in 0..3 { px[k] = (px[k] as f32 + c[k] * f * 255.0).min(255.0) as u8; }
         }
     }
 }
@@ -352,7 +354,10 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                     let kb = egui::Rect::from_min_max(egui::pos2(0.0, note_h as f32), egui::pos2(width as f32, height as f32));
                     crate::pfa::fill(&mut frame, width, &crate::ui::glass_quads(kb, lo, hi, piano.then_some(&columns), &glow, gl.intensity));
                 }
-                if !glow.is_dark() { add_glow(&mut frame, width, note_h, &glow.strip(&columns, width as usize, gl), gl.reach * note_h as f32, gl.keys_tint()); }
+                if !glow.is_dark() {
+                    let (halo, core) = (glow.strip(&columns, width as usize, gl), glow.core(&columns, width as usize, gl));
+                    add_glow(&mut frame, width, note_h, (&halo, &core), gl.reach * note_h as f32, gl.keys_tint());
+                }
             }
         }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };
