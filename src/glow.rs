@@ -16,12 +16,9 @@ pub struct GlowLook {
     pub reach: f32,
     /// How strongly the light colours the keys themselves (0..1).
     pub on_keys: f32,
-    /// Glass keys: the keyboard is darkened to `GLASS` of itself first, so the light stands out.
+    /// Glass keys: frosted keys, dark at rest, lit from inside by their light (`ui::glass_quads`).
     pub glass: bool,
 }
-
-/// What glass keys keep of the keyboard's brightness.
-pub const GLASS: f32 = 0.25;
 
 pub struct Glow {
     level: [f32; 128],
@@ -55,6 +52,9 @@ impl Glow {
         }
     }
 
+    /// Key `p`'s light level and colour (0..1 per channel).
+    pub fn key(&self, p: u8) -> (f32, [f32; 3]) { (self.level[p as usize & 127], self.color[p as usize & 127]) }
+
     pub fn is_dark(&self) -> bool { self.level.iter().all(|&l| l < 1e-3) }
 
     /// Tone-mapped light (0..1 per channel) for each of `width` columns; `columns[p]` is key p's
@@ -80,6 +80,12 @@ impl Glow {
 
 /// How much of a column's light reaches `dy` pixels above the keyboard line.
 pub fn falloff(dy: f32, reach_px: f32) -> f32 { (-dy.max(0.0) / reach_px.max(1.0)).exp() }
+
+impl GlowLook {
+    /// How strongly the light colours the keys: glass keys carry their own light, so the
+    /// spill over them is kept soft, or it would cover the lit keys.
+    pub fn keys_tint(&self) -> f32 { if self.glass { self.on_keys * 0.3 } else { self.on_keys } }
+}
 
 /// Over the keys the light's colour is blended in rather than added (white keys can't get
 /// brighter): as a premultiplied colour (0..1) and its opacity, for `c` from `Glow::strip`.

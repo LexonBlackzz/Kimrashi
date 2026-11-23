@@ -347,11 +347,12 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                     lo, hi, piano.then_some(&columns), None, &active, &colors);
             }
             if let Some(gl) = &glow_look {
-                if gl.glass {
-                    for v in &mut frame[note_h as usize * width as usize * 4..] { *v = (*v as f32 * crate::glow::GLASS) as u8; }
-                }
                 glow.update(now_us, &active, &colors, gl);
-                if !glow.is_dark() { add_glow(&mut frame, width, note_h, &glow.strip(&columns, width as usize, gl), gl.reach * note_h as f32, gl.on_keys); }
+                if gl.glass {
+                    let kb = egui::Rect::from_min_max(egui::pos2(0.0, note_h as f32), egui::pos2(width as f32, height as f32));
+                    crate::pfa::fill(&mut frame, width, &crate::ui::glass_quads(kb, lo, hi, piano.then_some(&columns), &glow, gl.intensity));
+                }
+                if !glow.is_dark() { add_glow(&mut frame, width, note_h, &glow.strip(&columns, width as usize, gl), gl.reach * note_h as f32, gl.keys_tint()); }
             }
         }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };

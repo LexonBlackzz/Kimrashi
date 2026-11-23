@@ -320,7 +320,7 @@ impl AppState {
                                     .on_hover_text("How far the light spills sideways");
                                 ui.end_row();
                                 ui.label("  Glass keys");
-                                ui.checkbox(&mut c.glow_glass, "On").on_hover_text("Darken the keyboard like smoked glass, so the light stands out");
+                                ui.checkbox(&mut c.glow_glass, "On").on_hover_text("Frosted keys, dark at rest, lit from inside in their notes' colours");
                                 ui.end_row();
                                 ui.label("  On keys");
                                 ui.add(egui::Slider::new(&mut c.glow_on_keys, 0.0..=1.0).fixed_decimals(2))
@@ -1007,11 +1007,10 @@ pub(crate) fn draw_piano_roll(
     let along_bottom = side.is_none() && !in_parallax && !in_matrix && !persp.is_on();
     match glow_look.filter(|_| along_bottom && song.is_some()) {
         Some(look) => {
-            if look.glass {
-                let keep = (crate::glow::GLASS * 255.0) as u8;
-                painter.rect_filled(keyboard_rect, CornerRadius::ZERO, Color32::from_black_alpha(255 - keep));
-            }
             glow.update(now_us, &active_keys, &active_colors, &look);
+            if look.glass {
+                paint_quads(&painter, &glass_quads(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), glow, look.intensity));
+            }
             if !glow.is_dark() { paint_glow(&painter, glow, &columns, note_area, keyboard_rect, &look); }
         }
         None => *glow = Default::default(),
@@ -1170,7 +1169,7 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
     for (i, &c) in strip.iter().enumerate() {
         if c.iter().all(|&v| v < 1.0 / 255.0) { continue; }
         let (x0, x1) = (notes.left() + i as f32 * w, notes.left() + (i + 1) as f32 * w);
-        let (tint, alpha) = crate::glow::on_keys(c, look.on_keys);
+        let (tint, alpha) = crate::glow::on_keys(c, look.keys_tint());
         let over = Color32::from_rgba_premultiplied((tint[0] * 255.0) as u8, (tint[1] * 255.0) as u8, (tint[2] * 255.0) as u8, (alpha * 255.0) as u8);
         band(x0, x1, line, keys.bottom(), over, over);
         for s in [0.0f32, 0.35, 1.0, 2.0, 3.5, 5.0].windows(2) {
@@ -1180,6 +1179,46 @@ fn paint_glow(painter: &egui::Painter, glow: &crate::glow::Glow, columns: &[(f32
         }
     }
     painter.add(egui::Shape::mesh(mesh));
+}
+
+/// A glass key's colours: its body from top to bottom, and (black keys) its rim.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GlassKey { pub top: crate::pfa::Rgb, pub bottom: crate::pfa::Rgb, pub rim: crate::pfa::Rgb }
+
+/// Frosted keys lit from inside by `level` (0..1) of the light `col` (0..1 per channel): white keys
+/// dark at rest, lit saturated at the bottom and pale toward the top; black keys black, glowing at
+/// the rim and dimly inside.
+pub(crate) fn glass_colors(black: bool, level: f32, col: [f32; 3]) -> GlassKey {
+    let l = level.clamp(0.0, 1.0);
+    let mix = |a: [f32; 3], b: [f32; 3]| -> crate::pfa::Rgb { std::array::from_fn(|i| ((a[i] + (b[i] - a[i]) * l) * 255.0).round() as u8) };
+    let toward_white = |t: f32| col.map(|c| c + (1.0 - c) * t);
+    if black {
+        GlassKey { top: mix([0.04; 3], col.map(|c| c * 0.3)), bottom: mix([0.035; 3], col.map(|c| c * 0.25)), rim: mix([0.2; 3], toward_white(0.3)) }
+    } else {
+        GlassKey { top: mix([0.16, 0.16, 0.18], toward_white(0.6)), bottom: mix([0.11, 0.11, 0.13], col), rim: [8, 8, 10] }
+    }
+}
+
+/// The glass keyboard (see `glass_colors`) in `rect`, lit by `glow` (levels relative to `intensity`),
+/// as quads for the live mesh and for export.
+pub(crate) fn glass_quads(rect: Rect, lo: u8, hi: u8, columns: Option<&[(f32, f32); 128]>, glow: &crate::glow::Glow,
+    intensity: f32) -> Vec<crate::pfa::Quad>
+{
+    let quad = |r: Rect, top: crate::pfa::Rgb, bottom: crate::pfa::Rgb| crate::pfa::Quad {
+        p: [[r.left(), r.top()], [r.right(), r.top()], [r.right(), r.bottom()], [r.left(), r.bottom()]], c: [top, top, bottom, bottom] };
+    let mut q = vec![quad(rect, [8, 8, 10], [8, 8, 10])];
+    for (p, r) in keyboard_rects(rect, lo, hi, columns, None) {
+        let (level, col) = glow.key(p);
+        let black = is_black_key(p);
+        let k = glass_colors(black, level / intensity.max(1e-3), col);
+        if black {
+            q.push(quad(r, k.rim, k.rim));
+            q.push(quad(Rect::from_min_max(Pos2::new(r.left() + 1.5, r.top()), Pos2::new(r.right() - 1.5, r.bottom() - 1.5)), k.top, k.bottom));
+        } else {
+            q.push(quad(Rect::from_min_max(Pos2::new(r.left() + 1.0, r.top()), Pos2::new(r.right() - 1.0, r.bottom() - 1.0)), k.top, k.bottom));
+        }
+    }
+    q
 }
 
 /// A sounding key's colour for the PFA keyboard: its note's, or the default highlight.
@@ -1465,6 +1504,24 @@ pub(crate) fn format_timestamp(us: u64) -> String {
 mod tests {
     use super::*;
     use crate::settings::KeyboardSide;
+
+    #[test]
+    fn glass_keys_light_from_inside_with_a_pale_top() {
+        let red = [1.0, 0.0, 0.0];
+        let dark = |c: crate::pfa::Rgb| c.iter().all(|&v| v < 60);
+        let w = glass_colors(false, 0.0, red);
+        assert!(dark(w.top) && dark(w.bottom), "unlit white keys are dark frosted panels: {w:?}");
+        let lit = glass_colors(false, 1.0, red);
+        assert!(lit.bottom[0] > 200 && lit.bottom[1] < 90, "saturated at the bottom: {lit:?}");
+        let min = |c: crate::pfa::Rgb| *c.iter().min().unwrap() as i32;
+        assert!(lit.top[0] > 200 && min(lit.top) > min(lit.bottom) + 60, "pale toward the top: {lit:?}");
+        let half = glass_colors(false, 0.5, red);
+        assert!(half.bottom[0] > w.bottom[0] && half.bottom[0] < lit.bottom[0], "the level fades it: {half:?}");
+        let b = glass_colors(true, 0.0, red);
+        assert!(b.bottom.iter().all(|&v| v < 20) && b.rim.iter().all(|&v| v < 70), "black keys are black: {b:?}");
+        let bl = glass_colors(true, 1.0, red);
+        assert!(bl.rim[0] > 180 && bl.bottom[0] < bl.rim[0], "a lit black key glows at its rim: {bl:?}");
+    }
 
     #[test]
     fn sideways_keyboard_is_the_bottom_keyboard_rotated() {
