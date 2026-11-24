@@ -408,9 +408,9 @@ impl Parallel {
             let (a, b) = (old[s] as usize, self.part_of[s] as usize);
             if a != b {
                 let from = &parts[a].skipper;
-                let moved = (from.last_on_us[s], from.sounding[s], from.hold_until[s], from.demand[s]);
+                let moved = (from.keys[s], from.demand[s]);
                 let to = &mut parts[b].skipper;
-                (to.last_on_us[s], to.sounding[s], to.hold_until[s], to.demand[s]) = moved;
+                (to.keys[s], to.demand[s]) = moved;
             }
         }
         let offs: Vec<_> = parts
@@ -642,9 +642,7 @@ impl Engine {
             let mut parts: Vec<_> = par.parts.iter().map(|p| p.lock().unwrap()).collect();
             for s in 0..SLOTS {
                 let w = &mut parts[par.part_of[s] as usize].skipper;
-                w.last_on_us[s] = self.skipper.last_on_us[s];
-                w.sounding[s] = self.skipper.sounding[s];
-                w.hold_until[s] = self.skipper.hold_until[s];
+                w.keys[s] = self.skipper.keys[s];
             }
             let old = std::mem::replace(&mut self.cur.due, RadixHeap::new());
             for (k, d) in old.buckets.into_iter().flatten() {
@@ -671,9 +669,7 @@ impl Engine {
         let mut parts: Vec<_> = par.parts.iter().map(|p| p.lock().unwrap()).collect();
         for s in 0..SLOTS {
             let w = &parts[par.part_of[s] as usize].skipper;
-            self.skipper.last_on_us[s] = w.last_on_us[s];
-            self.skipper.sounding[s] = w.sounding[s];
-            self.skipper.hold_until[s] = w.hold_until[s];
+            self.skipper.keys[s] = w.keys[s];
         }
         for part in &mut parts {
             self.skipper.skipped += std::mem::take(&mut part.skipper.skipped);

@@ -657,12 +657,8 @@ impl Default for Costs {
 struct Skipper {
     /// Minimum time between note-ons on one channel+key; 0 = send everything.
     interval_us: u64,
-    /// Time of the last sent note-on per slot (u64::MAX = none yet).
-    last_on_us: Box<[u64; SLOTS]>,
-    /// Sent note-ons per slot not yet turned off.
-    sounding: Box<[u32; SLOTS]>,
-    /// Per slot: tick the sounding note must last until to cover merged notes (0 = none).
-    hold_until: Box<[u32; SLOTS]>,
+    /// Per slot, together so that a note touches one cache line.
+    keys: Box<[KeyState; SLOTS]>,
     /// Note-ons per slot since the last `regulate`, sent or not.
     demand: Box<[u32; SLOTS]>,
     /// Note-ons per second per slot, smoothed: up at once, down slowly.
@@ -680,6 +676,21 @@ struct Skipper {
     skipped: u32,
 }
 
+/// A slot's state in the `Skipper`.
+#[derive(Clone, Copy)]
+struct KeyState {
+    /// Time of the last sent note-on (u64::MAX = none yet).
+    last_on_us: u64,
+    /// Sent note-ons not yet turned off.
+    sounding: u32,
+    /// Tick the sounding note must last until to cover merged notes (0 = none).
+    hold_until: u32,
+}
+
+impl KeyState {
+    const NEW: Self = Self { last_on_us: u64::MAX, sounding: 0, hold_until: 0 };
+}
+
 impl Skipper {
     const NEVER: u32 = u32::MAX;
     /// How much of the thread's time to plan on using; the rest absorbs jitter.
@@ -691,9 +702,7 @@ impl Skipper {
         Self {
             enabled,
             interval_us: 0,
-            last_on_us: Box::new([u64::MAX; SLOTS]),
-            sounding: Box::new([0; SLOTS]),
-            hold_until: Box::new([0; SLOTS]),
+            keys: Box::new([KeyState::NEW; SLOTS]),
             demand: Box::new([0; SLOTS]),
             rate: Box::new([0.0; SLOTS]),
             limit_nps,
@@ -714,12 +723,12 @@ impl Skipper {
     #[inline]
     fn note_on(&mut self, slot: usize, time_us: u64, end: Option<u32>, dur_us: u64) -> bool {
         self.demand[slot] += 1;
-        let last = self.last_on_us[slot];
-        let too_soon = last != u64::MAX && time_us.saturating_sub(last) < self.interval_us;
+        let k = &mut self.keys[slot];
+        let too_soon = k.last_on_us != u64::MAX && time_us.saturating_sub(k.last_on_us) < self.interval_us;
         if too_soon {
-            if self.sounding[slot] > 0 {
+            if k.sounding > 0 {
                 let end = end.unwrap_or(Self::NEVER);
-                self.hold_until[slot] = self.hold_until[slot].max(end);
+                k.hold_until = k.hold_until.max(end);
                 self.skipped += 1;
                 return false;
             }
@@ -728,25 +737,26 @@ impl Skipper {
                 return false;
             }
         }
-        self.last_on_us[slot] = time_us;
-        self.sounding[slot] += 1;
+        k.last_on_us = time_us;
+        k.sounding += 1;
         true
     }
 
     /// A sent note's note-off is due at `tick`.
     #[inline]
     fn note_off(&mut self, slot: usize, tick: u32) -> OffAction {
-        let hold = self.hold_until[slot];
-        if self.sounding[slot] == 1 && hold > tick {
-            self.hold_until[slot] = 0;
+        let k = &mut self.keys[slot];
+        let hold = k.hold_until;
+        if k.sounding == 1 && hold > tick {
+            k.hold_until = 0;
             if hold == Self::NEVER {
                 return OffAction::Hold;
             }
             return OffAction::Postpone(hold);
         }
-        self.sounding[slot] = self.sounding[slot].saturating_sub(1);
-        if self.sounding[slot] == 0 {
-            self.hold_until[slot] = 0;
+        k.sounding = k.sounding.saturating_sub(1);
+        if k.sounding == 0 {
+            k.hold_until = 0;
         }
         OffAction::Send
     }
@@ -808,8 +818,8 @@ impl Skipper {
         self.gain = gain;
         for &msg in chase {
             let slot = Self::slot(msg as u8, (msg >> 8) as u8);
-            self.sounding[slot] += 1;
-            self.last_on_us[slot] = time_us;
+            self.keys[slot].sounding += 1;
+            self.keys[slot].last_on_us = time_us;
         }
     }
 }
@@ -935,28 +945,37 @@ impl Engine {
             let r = &mut cur.readers[i as usize];
             // A track standing for identical ones counts them; they are not played again.
             let copies = song.midi.track_copies[i as usize];
-            // The last form is given the end tick of a sent note that has one, and its channel
-            // and key, to queue its note-off.
+            // The last form of `note!` is given the end tick of a sent note that has one, and
+            // its channel and key, to queue its note-off; it says whether the note was sent and
+            // leaves the counting to `count!`, which a bulk run calls once (within a run notes
+            // only add to the counters, so the totals and the peak come out the same).
+            macro_rules! count {
+                ($decoded:expr, $sent:expr) => {{
+                    let (decoded, sent): (u64, u32) = ($decoded, $sent);
+                    self.notes_played += copies * decoded;
+                    self.repeats_skipped += (copies - 1) * decoded;
+                    self.decoded += decoded;
+                    self.notes_this_second += copies * decoded;
+                    self.sent += sent as u64;
+                    self.polyphony += sent;
+                    self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
+                }};
+            }
             macro_rules! note {
-                ($ch:expr, $key:expr, $vel:expr, $dur:expr) => {
-                    note!($ch, $key, $vel, $dur, |e, ch, key| cur.due.push(e, Due::Off((ch, key))))
-                };
+                ($ch:expr, $key:expr, $vel:expr, $dur:expr) => {{
+                    let sent = note!($ch, $key, $vel, $dur, |e, ch, key| cur.due.push(e, Due::Off((ch, key))));
+                    count!(1, sent as u32);
+                }};
                 ($ch:expr, $key:expr, $vel:expr, $dur:expr, |$e:ident, $c:ident, $k:ident| $off:expr) => {{
                     let (ch, key, vel, dur): (u8, u8, u8, Option<u32>) = ($ch, $key, $vel, $dur);
-                    self.notes_played += copies;
-                    self.repeats_skipped += copies - 1;
-                    self.decoded += 1;
-                    self.notes_this_second += copies;
                     let end = dur.map(|d| tick + d);
                     let dur_us = match dur {
                         Some(d) if skipper.interval_us > 0 => (d as f32 * us_per_tick) as u64,
                         _ => 0,
                     };
                     // A skipped note leaves nothing behind: no note-off, no polyphony.
-                    if skipper.note_on(Skipper::slot(ch, key), target_us, end, dur_us) {
-                        self.sent += 1;
-                        self.polyphony += 1;
-                        self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
+                    let sent = skipper.note_on(Skipper::slot(ch, key), target_us, end, dur_us);
+                    if sent {
                         if let Some($e) = end {
                             // A zero-length note's off lands on this tick: it's taken on
                             // the next call, after this note-on, as in the file.
@@ -965,6 +984,7 @@ impl Engine {
                         }
                         batch.push(pack_short(0x90 | ch, key, vel));
                     }
+                    sent
                 }};
             }
             let mut keys = [0u8; 16];
@@ -974,12 +994,13 @@ impl Engine {
                         note!(ch, key, vel, dur);
                         while let Some((ch, vel, dur, n)) = r.same_tick_run(data, &mut keys) {
                             let mut run = OffRun { ch, n: 0, keys: [0; 16] };
-                            let mut end = 0;
+                            let (mut end, mut sent) = (0, 0);
                             for &key in &keys[..n] {
-                                note!(ch, key, vel, dur, |e, _c, k| {
+                                sent += note!(ch, key, vel, dur, |e, _c, k| {
                                     (run.keys[run.n as usize], run.n, end) = (k, run.n + 1, e);
-                                });
+                                }) as u32;
                             }
+                            count!(n as u64, sent);
                             #[cfg(test)]
                             let one_each = NO_RUN_GROUPS.with(|g| g.get());
                             #[cfg(not(test))]
@@ -1138,6 +1159,22 @@ struct Feedback {
     timed: std::sync::atomic::AtomicBool,
     /// Messages decoded and not yet taken by the sender.
     queued: std::sync::atomic::AtomicU64,
+    /// The decoder thread, parked while `queued` is over `MAX_QUEUED_MSGS`, and woken by
+    /// the sender as it takes slices (`take`).
+    decoder: std::sync::OnceLock<thread::Thread>,
+    parked: AtomicBool,
+}
+
+impl Feedback {
+    /// The sender took a slice of `msgs` messages.
+    fn take(&self, msgs: usize) {
+        self.queued.fetch_sub(msgs as u64, Ordering::SeqCst);
+        if self.parked.load(Ordering::SeqCst) {
+            if let Some(t) = self.decoder.get() {
+                t.unpark();
+            }
+        }
+    }
 }
 
 /// Decoded song time is kept this far ahead of the clock (wall µs): enough that a slice
@@ -1375,6 +1412,7 @@ impl Decoder {
     }
 
     fn run(mut self) {
+        let _ = self.feedback.decoder.set(thread::current());
         let tempo = self.song.tempo.clone();
         loop {
             if self.commands().is_err() {
@@ -1405,7 +1443,13 @@ impl Decoder {
             let (_, now_us, speed) = self.clock.snapshot();
             let ahead = (self.feedback.ahead_us.load(Ordering::Relaxed) as f64 * speed) as u64;
             if self.feedback.queued.load(Ordering::Relaxed) > MAX_QUEUED_MSGS {
-                thread::sleep(Duration::from_micros(50));
+                // Woken as soon as the sender takes a slice (a sleep here lasts far longer
+                // than it asks on Windows, and the sender runs dry meanwhile).
+                self.feedback.parked.store(true, Ordering::SeqCst);
+                if self.feedback.queued.load(Ordering::SeqCst) > MAX_QUEUED_MSGS {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                self.feedback.parked.store(false, Ordering::SeqCst);
                 continue;
             }
             if first_us > now_us.saturating_add(ahead) {
@@ -1640,6 +1684,8 @@ impl Player {
             ahead_us: std::sync::atomic::AtomicU64::new(AHEAD_US),
             timed: Default::default(),
             queued: Default::default(),
+            decoder: Default::default(),
+            parked: Default::default(),
         });
         let mut timed_on = false;
         let eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(self.synth_limit, self.skipping));
@@ -1779,7 +1825,7 @@ impl Player {
                     time_us: abs_time_us,
                 });
                 while let Ok(old) = slices.try_recv() {
-                    feedback.queued.fetch_sub(old.msgs.len() as u64, Ordering::Relaxed);
+                    feedback.take(old.msgs.len());
                     let _ = spare.try_send(old);
                 }
                 waiting = None;
@@ -1823,7 +1869,7 @@ impl Player {
                     }
                     match slices.recv_timeout(Duration::from_micros(500)) {
                         Ok(slice) => {
-                            feedback.queued.fetch_sub(slice.msgs.len() as u64, Ordering::Relaxed);
+                            feedback.take(slice.msgs.len());
                             slice
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
@@ -2349,7 +2395,7 @@ mod tests {
         assert_eq!(s.note_off(slot, 10), OffAction::Postpone(40));
         // ...then sent at 40: exactly one off per sent on, nothing stuck.
         assert_eq!(s.note_off(slot, 40), OffAction::Send);
-        assert_eq!(s.sounding[slot], 0);
+        assert_eq!(s.keys[slot].sounding, 0);
 
         // Silent key, struck too soon: short blips are skipped, long notes still play.
         assert!(!s.note_on(slot, 950, Some(50), 100));
