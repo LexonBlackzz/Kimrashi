@@ -321,6 +321,24 @@ enum Due {
     /// This track has records at the tick.
     Track(u32),
     Off(PendingOff),
+    /// The note-offs of a bulk run's sent notes, in order (an index into `Cursor::runs`).
+    Run(u32),
+}
+
+/// Notes read in one bulk run (`TrackReader::same_tick_run`) share their channel and end
+/// tick, so the note-offs of those sent take one queue entry instead of one each. It stands
+/// where theirs would have, so they come out in the same order.
+#[derive(Clone, Copy)]
+struct OffRun {
+    ch: u8,
+    n: u8,
+    keys: [u8; 16],
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: give every note-off its own queue entry, as before runs shared one.
+    static NO_RUN_GROUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Playback position: a reader per track plus everything still due. Tracks and
@@ -329,6 +347,9 @@ enum Due {
 pub(crate) struct Cursor {
     readers: Vec<TrackReader>,
     due: RadixHeap<Due>,
+    /// What `Due::Run`s stand for, and the free places in it.
+    runs: Vec<OffRun>,
+    free_runs: Vec<u32>,
 }
 
 /// A SysEx message to send. In a batch of messages it stands as `sysex_marker(index)`,
@@ -530,6 +551,8 @@ impl Cursor {
             cursor: Cursor {
                 readers: Vec::with_capacity(midi.tracks.len()),
                 due: RadixHeap::new(),
+                runs: Vec::new(),
+                free_runs: Vec::new(),
             },
             chase: Vec::new(),
             started: resume.map_or(0, |r| r.started),
@@ -875,21 +898,30 @@ impl Engine {
             return;
         }
         cur.due.take_min(&mut self.due_buf);
+        macro_rules! off {
+            ($ch:expr, $key:expr) => {{
+                let (ch, key): (u8, u8) = ($ch, $key);
+                match skipper.note_off(Skipper::slot(ch, key), tick) {
+                    OffAction::Send => {
+                        self.polyphony = self.polyphony.saturating_sub(1);
+                        batch.push(pack_short(0x80 | ch, key, 0));
+                    }
+                    OffAction::Postpone(t2) => cur.due.push(t2, Due::Off((ch, key))),
+                    OffAction::Hold => {}
+                }
+            }};
+        }
         for &due in &self.due_buf {
-            let (ch, key) = match due {
-                Due::Off(off) => off,
-                Due::Track(i) => {
-                    self.track_buf.push(i);
-                    continue;
+            match due {
+                Due::Off((ch, key)) => off!(ch, key),
+                Due::Track(i) => self.track_buf.push(i),
+                Due::Run(r) => {
+                    let run = cur.runs[r as usize];
+                    cur.free_runs.push(r);
+                    for &key in &run.keys[..run.n as usize] {
+                        off!(run.ch, key);
+                    }
                 }
-            };
-            match skipper.note_off(Skipper::slot(ch, key), tick) {
-                OffAction::Send => {
-                    self.polyphony = self.polyphony.saturating_sub(1);
-                    batch.push(pack_short(0x80 | ch, key, 0));
-                }
-                OffAction::Postpone(t2) => cur.due.push(t2, Due::Off((ch, key))),
-                OffAction::Hold => {}
             }
         }
         self.due_buf.clear();
@@ -903,8 +935,13 @@ impl Engine {
             let r = &mut cur.readers[i as usize];
             // A track standing for identical ones counts them; they are not played again.
             let copies = song.midi.track_copies[i as usize];
+            // The last form is given the end tick of a sent note that has one, and its channel
+            // and key, to queue its note-off.
             macro_rules! note {
-                ($ch:expr, $key:expr, $vel:expr, $dur:expr) => {{
+                ($ch:expr, $key:expr, $vel:expr, $dur:expr) => {
+                    note!($ch, $key, $vel, $dur, |e, ch, key| cur.due.push(e, Due::Off((ch, key))))
+                };
+                ($ch:expr, $key:expr, $vel:expr, $dur:expr, |$e:ident, $c:ident, $k:ident| $off:expr) => {{
                     let (ch, key, vel, dur): (u8, u8, u8, Option<u32>) = ($ch, $key, $vel, $dur);
                     self.notes_played += copies;
                     self.repeats_skipped += copies - 1;
@@ -920,10 +957,11 @@ impl Engine {
                         self.sent += 1;
                         self.polyphony += 1;
                         self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
-                        if let Some(e) = end {
+                        if let Some($e) = end {
                             // A zero-length note's off lands on this tick: it's taken on
                             // the next call, after this note-on, as in the file.
-                            cur.due.push(e, Due::Off((ch, key)));
+                            let ($c, $k) = (ch, key);
+                            $off;
                         }
                         batch.push(pack_short(0x90 | ch, key, vel));
                     }
@@ -935,8 +973,33 @@ impl Engine {
                     Record::Note { ch, key, vel, dur } => {
                         note!(ch, key, vel, dur);
                         while let Some((ch, vel, dur, n)) = r.same_tick_run(data, &mut keys) {
+                            let mut run = OffRun { ch, n: 0, keys: [0; 16] };
+                            let mut end = 0;
                             for &key in &keys[..n] {
-                                note!(ch, key, vel, dur);
+                                note!(ch, key, vel, dur, |e, _c, k| {
+                                    (run.keys[run.n as usize], run.n, end) = (k, run.n + 1, e);
+                                });
+                            }
+                            #[cfg(test)]
+                            let one_each = NO_RUN_GROUPS.with(|g| g.get());
+                            #[cfg(not(test))]
+                            let one_each = false;
+                            if run.n == 1 || one_each {
+                                for &key in &run.keys[..run.n as usize] {
+                                    cur.due.push(end, Due::Off((ch, key)));
+                                }
+                            } else if run.n > 1 {
+                                let i = match cur.free_runs.pop() {
+                                    Some(i) => {
+                                        cur.runs[i as usize] = run;
+                                        i
+                                    }
+                                    None => {
+                                        cur.runs.push(run);
+                                        cur.runs.len() as u32 - 1
+                                    }
+                                };
+                                cur.due.push(end, Due::Run(i));
                             }
                         }
                     }
@@ -960,7 +1023,8 @@ impl Engine {
 ///
 /// Returns (notes decoded, notes counting repeated tracks, a hash of every message) so a
 /// change to the engine can be checked to leave its output as it was. `ENGINE_INTERVAL_US`
-/// runs it with note skipping at that interval, `ENGINE_HASH` computes the hash (it costs time).
+/// runs it with note skipping at that interval, `ENGINE_HASH` computes the hash (it costs time),
+/// and `ENGINE_EXACT` keeps the serial engine's note-offs in their own order in it.
 pub fn bench_engine(song: &SongData) -> (u64, u64, u64, f64) {
     let secs = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
     let from = secs("ENGINE_FROM_S").map_or(0, |s| song.tempo.time_to_tick((s * 1e6) as u64));
@@ -1010,7 +1074,7 @@ pub fn bench_engine(song: &SongData) -> (u64, u64, u64, f64) {
             batch.clear();
             // Time follows the tick (1 tick = 1 ms) so a skip interval means something.
             eng.process_tick(song, tick, tick as u64 * 1000, 1000.0, &mut batch);
-            if hash {
+            if hash && std::env::var_os("ENGINE_EXACT").is_none() {
                 batch[..eng.off_count].sort_unstable_by_key(|&m| Skipper::slot(m as u8, (m >> 8) as u8));
             }
             feed(&batch);
@@ -2100,6 +2164,8 @@ mod tests {
             }
         };
         let from_us = std::env::var("FROM_S").ok().and_then(|s| s.parse::<f64>().ok()).map_or(0, |s| (s * 1e6) as u64);
+        // `NO_RUN_GROUPS` queues every note-off on its own (as before bulk runs shared entries).
+        NO_RUN_GROUPS.with(|g| g.set(std::env::var_os("NO_RUN_GROUPS").is_some()));
         if std::env::var_os("ENGINE_ONLY").is_some() {
             let (decoded, _, hash, secs) = bench_engine(&song);
             return println!("engine alone: {decoded} notes in {secs:.2} s: {:.1} M notes/s, hash {hash:016x}", decoded as f64 / secs / 1e6);
@@ -2475,6 +2541,78 @@ mod tests {
         let song = SongData::load(&path, 127, &Default::default()).unwrap();
         let _ = std::fs::remove_file(&path);
         song
+    }
+
+    /// Note-offs of a bulk run share one queue entry; the messages, in order, are those of
+    /// one entry per note, with notes skipped, merged into sounding ones and postponed.
+    #[test]
+    fn run_note_offs_share_a_queue_entry_and_play_as_before() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut file = b"MThd".to_vec();
+        file.extend_from_slice(&[0, 0, 0, 6, 0, 1, 0, 3, 0, 96]);
+        for _ in 0..3 {
+            let mut events: Vec<(u32, Vec<u8>)> = vec![];
+            let mut tick = 0u32;
+            for _ in 0..300 {
+                tick += 1 + rnd(3) as u32;
+                let (ch, vel, len) = (rnd(2) as u8, 1 + rnd(127) as u8, [1, 2, 3, 7, 30][rnd(5) as usize]);
+                let lo = rnd(40) as u8;
+                for k in 0..rnd(40) as u8 {
+                    // Now and then a note of its own velocity or length breaks the run.
+                    let (vel, len) = if rnd(15) == 0 { (1 + rnd(127) as u8, rnd(9) as u32) } else { (vel, len) };
+                    events.push((tick, vec![0x90 | ch, 30 + lo + k, vel]));
+                    events.push((tick + len, vec![0x80 | ch, 30 + lo + k, 0]));
+                }
+            }
+            events.sort_by_key(|e| e.0);
+            let (mut trk, mut last) = (vec![], 0);
+            for (t, data) in &events {
+                let mut delta = vec![((t - last) & 0x7F) as u8];
+                let mut d = (t - last) >> 7;
+                while d > 0 {
+                    delta.push((d & 0x7F) as u8 | 0x80);
+                    d >>= 7;
+                }
+                trk.extend(delta.iter().rev());
+                trk.extend_from_slice(data);
+                last = *t;
+            }
+            file.extend_from_slice(b"MTrk");
+            file.extend_from_slice(&(trk.len() as u32).to_be_bytes());
+            file.extend_from_slice(&trk);
+        }
+        let path = std::env::temp_dir().join(format!("kimrashi_runs_{}.mid", std::process::id()));
+        std::fs::write(&path, file).unwrap();
+        let song = SongData::load(&path, 127, &Default::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let play = |group: bool, interval: u64| {
+            NO_RUN_GROUPS.with(|g| g.set(!group));
+            let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
+            eng.skipper.interval_us = interval;
+            let (mut msgs, mut most) = (vec![], 0);
+            while let Some(tick) = eng.cur.next_tick() {
+                eng.process_tick(&song, tick, tick as u64 * 100, 100.0, &mut msgs);
+                most = most.max(eng.cur.due.buckets.iter().map(|b| b.len()).sum::<usize>());
+            }
+            NO_RUN_GROUPS.with(|g| g.set(false));
+            assert_eq!(eng.polyphony, 0);
+            (msgs, eng.skipper.skipped, most)
+        };
+        for interval in [0, 250, 800] {
+            let (one, skipped, most_one) = play(false, interval);
+            let (grouped, skipped_grouped, most_grouped) = play(true, interval);
+            assert!(one == grouped, "messages differ at interval {interval}");
+            assert_eq!(skipped, skipped_grouped);
+            assert!(interval == 0 || skipped > 0);
+            assert!(most_grouped * if interval == 0 { 3 } else { 1 } < most_one * 2, "queue {most_grouped} vs {most_one} entries at interval {interval}");
+        }
     }
 
     /// What the engine sends for the whole song, 100 us a tick, with a skip interval; the

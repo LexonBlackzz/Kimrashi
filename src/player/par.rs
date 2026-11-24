@@ -651,9 +651,17 @@ impl Engine {
                 match d {
                     Due::Track(i) => par.chunks[par.chunk_of(i as usize)].lock().unwrap().heap.push(k, i),
                     Due::Off((ch, key)) => parts[par.part_of[Skipper::slot(ch, key)] as usize].heap.push(k, (ch, key)),
+                    Due::Run(r) => {
+                        let run = self.cur.runs[r as usize];
+                        for &key in &run.keys[..run.n as usize] {
+                            parts[par.part_of[Skipper::slot(run.ch, key)] as usize].heap.push(k, (run.ch, key));
+                        }
+                    }
                 }
             }
         }
+        self.cur.runs.clear();
+        self.cur.free_runs.clear();
         self.par = Some(par);
     }
 
