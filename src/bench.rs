@@ -67,7 +67,7 @@ pub fn run_from_args() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--engine") {
         // The playback engine alone (no synth, no clock) over a whole file.
-        let song = SongData::load(&args[i + 1], 127, &crate::parser::Progress::default()).expect("load");
+        let song = std::sync::Arc::new(SongData::load(&args[i + 1], 127, &crate::parser::Progress::default()).expect("load"));
         let m = &song.midi;
         let refs: usize = m.tracks.iter().map(|t| t.len()).sum();
         println!("packed: {} tracks, {} chunk refs, {} distinct chunks, {} MB stored of {} MB before dedup",

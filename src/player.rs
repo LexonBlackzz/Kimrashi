@@ -16,6 +16,7 @@ use crate::parser::{Record, TrackReader};
 use crate::song::SongData;
 
 mod par;
+mod pipe;
 
 pub enum PlayerCommand {
     Play(Arc<SongData>),
@@ -303,6 +304,13 @@ impl<T: Copy> RadixHeap<T> {
         }
         let b = (1..33).find(|&b| !self.buckets[b].is_empty())?;
         self.buckets[b].iter().map(|&(k, _)| k).min()
+    }
+
+    /// Push `items`, all at `key`, in order.
+    fn extend_from(&mut self, key: u32, items: impl Iterator<Item = T>) {
+        for item in items {
+            self.push(key, item);
+        }
     }
 
     /// Move the items with the smallest key into `out` (call `min_key` first).
@@ -862,6 +870,8 @@ struct Engine {
     /// Notes' slots split over threads (see `par`); while set, note-offs and the skipper's
     /// per-slot state live there instead of in `cur.due` and `skipper`.
     par: Option<par::Parallel>,
+    /// The tracks' reader thread, while it reads them (see `pipe`); `cur.readers` is empty then.
+    pipe: Option<pipe::Pipe>,
     /// Note-offs at the start of the last `process_tick`'s messages (they go first).
     off_count: usize,
 }
@@ -870,6 +880,7 @@ impl Engine {
     fn new(cur: Cursor, skipper: Skipper) -> Self {
         Self {
             par: None,
+            pipe: None,
             off_count: 0,
             cur,
             skipper,
@@ -937,98 +948,135 @@ impl Engine {
         self.due_buf.clear();
         self.off_count = batch.len() - first;
 
+        // A track standing for identical ones counts them; they are not played again.
+        let mut copies = 1;
+        // The last form of `note!` is given the end tick of a sent note that has one, and
+        // its channel and key, to queue its note-off; it says whether the note was sent and
+        // leaves the counting to `count!`, which a bulk run calls once (within a run notes
+        // only add to the counters, so the totals and the peak come out the same).
+        macro_rules! count {
+            ($decoded:expr, $sent:expr) => {{
+                let (decoded, sent): (u64, u32) = ($decoded, $sent);
+                self.notes_played += copies * decoded;
+                self.repeats_skipped += (copies - 1) * decoded;
+                self.decoded += decoded;
+                self.notes_this_second += copies * decoded;
+                self.sent += sent as u64;
+                self.polyphony += sent;
+                self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
+            }};
+        }
+        macro_rules! note {
+            ($ch:expr, $key:expr, $vel:expr, $dur:expr) => {{
+                let sent = note!($ch, $key, $vel, $dur, |e, ch, key| cur.due.push(e, Due::Off((ch, key))));
+                count!(1, sent as u32);
+            }};
+            ($ch:expr, $key:expr, $vel:expr, $dur:expr, |$e:ident, $c:ident, $k:ident| $off:expr) => {{
+                let (ch, key, vel, dur): (u8, u8, u8, Option<u32>) = ($ch, $key, $vel, $dur);
+                let end = dur.map(|d| tick + d);
+                let dur_us = match dur {
+                    Some(d) if skipper.interval_us > 0 => (d as f32 * us_per_tick) as u64,
+                    _ => 0,
+                };
+                // A skipped note leaves nothing behind: no note-off, no polyphony.
+                let sent = skipper.note_on(Skipper::slot(ch, key), target_us, end, dur_us);
+                if sent {
+                    if let Some($e) = end {
+                        // A zero-length note's off lands on this tick: it's taken on
+                        // the next call, after this note-on, as in the file.
+                        let ($c, $k) = (ch, key);
+                        $off;
+                    }
+                    batch.push(pack_short(0x90 | ch, key, vel));
+                }
+                sent
+            }};
+        }
+        // The plain notes of a bulk read, right after a note.
+        macro_rules! run {
+            ($ch:expr, $vel:expr, $dur:expr, $keys:expr) => {{
+                let (ch, vel, dur, keys): (u8, u8, Option<u32>, &[u8]) = ($ch, $vel, $dur, $keys);
+                let mut run = OffRun { ch, n: 0, keys: [0; 16] };
+                let (mut end, mut sent) = (0, 0);
+                for &key in keys {
+                    sent += note!(ch, key, vel, dur, |e, _c, k| {
+                        (run.keys[run.n as usize], run.n, end) = (k, run.n + 1, e);
+                    }) as u32;
+                }
+                count!(keys.len() as u64, sent);
+                #[cfg(test)]
+                let one_each = NO_RUN_GROUPS.with(|g| g.get());
+                #[cfg(not(test))]
+                let one_each = false;
+                if run.n == 1 || one_each {
+                    for &key in &run.keys[..run.n as usize] {
+                        cur.due.push(end, Due::Off((ch, key)));
+                    }
+                } else if run.n > 1 {
+                    let i = match cur.free_runs.pop() {
+                        Some(i) => {
+                            cur.runs[i as usize] = run;
+                            i
+                        }
+                        None => {
+                            cur.runs.push(run);
+                            cur.runs.len() as u32 - 1
+                        }
+                    };
+                    cur.due.push(end, Due::Run(i));
+                }
+            }};
+        }
+        macro_rules! sysex {
+            ($status:expr, $at:expr, $len:expr) => {{
+                batch.push(sysex_marker(self.sysex.len()));
+                self.sysex.push(SysexRef { status: $status, at: $at, len: $len });
+            }};
+        }
+
+        if let Some(p) = &mut self.pipe {
+            // The reader's records for this tick, as it read them (see `pipe`); then its
+            // next tick takes their place in the queue.
+            if !self.track_buf.is_empty() {
+                self.track_buf.clear();
+                debug_assert_eq!(p.peek_tick(), Some(tick));
+                p.at += 1;
+                while let Some(&rec) = p.block.get(p.at) {
+                    match rec {
+                        pipe::Rec::Tick(_) => break,
+                        pipe::Rec::Track(i) => copies = song.midi.track_copies[i as usize],
+                        pipe::Rec::Note { ch, key, vel, dur } => note!(ch, key, vel, dur),
+                        pipe::Rec::Run { ch, vel, n, dur, keys } => run!(ch, vel, dur, &keys[..n as usize]),
+                        pipe::Rec::Other { status, d1, d2 } => batch.push(pack_short(status, d1, d2)),
+                        pipe::Rec::Sysex { status, at, len } => sysex!(status, at, len),
+                    }
+                    p.at += 1;
+                }
+                if let Some(t) = p.peek_tick() {
+                    cur.due.push(t, Due::Track(pipe::READER));
+                }
+            }
+            return;
+        }
+
         // Same order as the file within a tick (matters for e.g. a program change in
         // one track and a note in another on the same channel and tick).
         self.track_buf.sort_unstable();
+        let mut keys = [0u8; 16];
         for &i in &self.track_buf {
             let data = song.midi.track(i as usize);
             let r = &mut cur.readers[i as usize];
-            // A track standing for identical ones counts them; they are not played again.
-            let copies = song.midi.track_copies[i as usize];
-            // The last form of `note!` is given the end tick of a sent note that has one, and
-            // its channel and key, to queue its note-off; it says whether the note was sent and
-            // leaves the counting to `count!`, which a bulk run calls once (within a run notes
-            // only add to the counters, so the totals and the peak come out the same).
-            macro_rules! count {
-                ($decoded:expr, $sent:expr) => {{
-                    let (decoded, sent): (u64, u32) = ($decoded, $sent);
-                    self.notes_played += copies * decoded;
-                    self.repeats_skipped += (copies - 1) * decoded;
-                    self.decoded += decoded;
-                    self.notes_this_second += copies * decoded;
-                    self.sent += sent as u64;
-                    self.polyphony += sent;
-                    self.peak_polyphony = self.peak_polyphony.max(self.polyphony);
-                }};
-            }
-            macro_rules! note {
-                ($ch:expr, $key:expr, $vel:expr, $dur:expr) => {{
-                    let sent = note!($ch, $key, $vel, $dur, |e, ch, key| cur.due.push(e, Due::Off((ch, key))));
-                    count!(1, sent as u32);
-                }};
-                ($ch:expr, $key:expr, $vel:expr, $dur:expr, |$e:ident, $c:ident, $k:ident| $off:expr) => {{
-                    let (ch, key, vel, dur): (u8, u8, u8, Option<u32>) = ($ch, $key, $vel, $dur);
-                    let end = dur.map(|d| tick + d);
-                    let dur_us = match dur {
-                        Some(d) if skipper.interval_us > 0 => (d as f32 * us_per_tick) as u64,
-                        _ => 0,
-                    };
-                    // A skipped note leaves nothing behind: no note-off, no polyphony.
-                    let sent = skipper.note_on(Skipper::slot(ch, key), target_us, end, dur_us);
-                    if sent {
-                        if let Some($e) = end {
-                            // A zero-length note's off lands on this tick: it's taken on
-                            // the next call, after this note-on, as in the file.
-                            let ($c, $k) = (ch, key);
-                            $off;
-                        }
-                        batch.push(pack_short(0x90 | ch, key, vel));
-                    }
-                    sent
-                }};
-            }
-            let mut keys = [0u8; 16];
+            copies = song.midi.track_copies[i as usize];
             while let Some(rec) = r.next_at(data, tick) {
                 match rec {
                     Record::Note { ch, key, vel, dur } => {
                         note!(ch, key, vel, dur);
                         while let Some((ch, vel, dur, n)) = r.same_tick_run(data, &mut keys) {
-                            let mut run = OffRun { ch, n: 0, keys: [0; 16] };
-                            let (mut end, mut sent) = (0, 0);
-                            for &key in &keys[..n] {
-                                sent += note!(ch, key, vel, dur, |e, _c, k| {
-                                    (run.keys[run.n as usize], run.n, end) = (k, run.n + 1, e);
-                                }) as u32;
-                            }
-                            count!(n as u64, sent);
-                            #[cfg(test)]
-                            let one_each = NO_RUN_GROUPS.with(|g| g.get());
-                            #[cfg(not(test))]
-                            let one_each = false;
-                            if run.n == 1 || one_each {
-                                for &key in &run.keys[..run.n as usize] {
-                                    cur.due.push(end, Due::Off((ch, key)));
-                                }
-                            } else if run.n > 1 {
-                                let i = match cur.free_runs.pop() {
-                                    Some(i) => {
-                                        cur.runs[i as usize] = run;
-                                        i
-                                    }
-                                    None => {
-                                        cur.runs.push(run);
-                                        cur.runs.len() as u32 - 1
-                                    }
-                                };
-                                cur.due.push(end, Due::Run(i));
-                            }
+                            run!(ch, vel, dur, &keys[..n]);
                         }
                     }
                     Record::Other { status, d1, d2 } => batch.push(pack_short(status, d1, d2)),
-                    Record::Sysex { status, at, len } => {
-                        batch.push(sysex_marker(self.sysex.len()));
-                        self.sysex.push(SysexRef { status, at, len });
-                    }
+                    Record::Sysex { status, at, len } => sysex!(status, at, len),
                 }
             }
             if let Some(t) = r.peek_tick(data) {
@@ -1036,6 +1084,53 @@ impl Engine {
             }
         }
         self.track_buf.clear();
+    }
+
+    /// Read the tracks on a thread of their own from now on (see `pipe`).
+    fn enter_pipe(&mut self, song: Arc<SongData>) {
+        if self.pipe.is_some() || self.par.is_some() {
+            return;
+        }
+        // Tracks to the reader, note-offs stay: taken out in order, so the note-offs of a
+        // tick keep theirs.
+        let (mut tracks, mut offs, mut buf) = (RadixHeap::new(), RadixHeap::new(), Vec::new());
+        while let Some(t) = self.cur.due.min_key() {
+            self.cur.due.take_min(&mut buf);
+            for d in buf.drain(..) {
+                match d {
+                    Due::Track(i) => tracks.push(t, i),
+                    d => offs.push(t, d),
+                }
+            }
+        }
+        let mut p = pipe::Pipe::new(song, std::mem::take(&mut self.cur.readers), tracks);
+        // The reader's next tick stands in the queue for the tracks' (as the serial engine has
+        // them there, so the queue never moves past the tick being played).
+        if let Some(t) = p.peek_tick() {
+            offs.push(t, Due::Track(pipe::READER));
+        }
+        self.cur.due = offs;
+        self.pipe = Some(p);
+    }
+
+    /// Read the tracks here again. The reader is ahead, so they are positioned anew at the
+    /// tick it stands at in the queue (as a seek would: records before it are consumed).
+    fn leave_pipe(&mut self, song: &SongData) {
+        let Some(mut p) = self.pipe.take() else { return };
+        let at = p.peek_tick().unwrap_or(u32::MAX);
+        drop(p);
+        let (mut due, mut buf) = (RadixHeap::new(), Vec::new());
+        while let Some(t) = self.cur.due.min_key() {
+            self.cur.due.take_min(&mut buf);
+            due.extend_from(t, buf.drain(..).filter(|&d| d != Due::Track(pipe::READER)));
+        }
+        self.cur.readers = Cursor::seek(song, at).cursor.readers;
+        for (i, r) in self.cur.readers.iter().enumerate() {
+            if let Some(t) = r.peek_tick(song.midi.track(i)) {
+                due.push(t, Due::Track(i as u32));
+            }
+        }
+        self.cur.due = due;
     }
 }
 
@@ -1046,7 +1141,7 @@ impl Engine {
 /// change to the engine can be checked to leave its output as it was. `ENGINE_INTERVAL_US`
 /// runs it with note skipping at that interval, `ENGINE_HASH` computes the hash (it costs time),
 /// and `ENGINE_EXACT` keeps the serial engine's note-offs in their own order in it.
-pub fn bench_engine(song: &SongData) -> (u64, u64, u64, f64) {
+pub fn bench_engine(song: &Arc<SongData>) -> (u64, u64, u64, f64) {
     let secs = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
     let from = secs("ENGINE_FROM_S").map_or(0, |s| song.tempo.time_to_tick((s * 1e6) as u64));
     let mut eng = Engine::new(Cursor::seek(song, from).cursor, Skipper::new(0, true));
@@ -1091,6 +1186,10 @@ pub fn bench_engine(song: &SongData) -> (u64, u64, u64, f64) {
             feed(&batch);
         }
     } else {
+        // `ENGINE_PIPE` reads the tracks on a thread of their own (see `pipe`).
+        if std::env::var_os("ENGINE_PIPE").is_some() {
+            eng.enter_pipe(song.clone());
+        }
         while let Some(tick) = eng.next_tick().filter(|&t| t < stop) {
             batch.clear();
             // Time follows the tick (1 tick = 1 ms) so a skip interval means something.
@@ -1211,11 +1310,10 @@ struct Decoder {
     seg_idx: usize,
     /// The end of the song was reported (until the next seek).
     ended: bool,
-    /// Threads the engine may use when decoding falls behind the clock (0 = never), when to
-    /// use them, and what a note cost the serial engine before it last went parallel.
+    /// Threads the engine may use when decoding falls behind the clock (0 = never), and when
+    /// to use them.
     threads: usize,
     mode: ModeSwitch,
-    serial_ns: f32,
     ends: Vec<(u32, u32)>,
     /// What the synth really charges per message (ns), learned from how late it renders:
     /// a synth can take events in a few ns each and still need microseconds to sound them.
@@ -1237,12 +1335,21 @@ fn engine_threads() -> usize {
     if cores >= 6 { (cores / 2).clamp(2, 8) } else { 0 }
 }
 
-/// Slices in a row the decoder is behind the clock before the engine goes parallel.
+/// Slices in a row the decoder is behind the clock before the engine goes parallel (once
+/// it has measured what serial gets through, behind the clock for a whole `MEASURE_LOAD`).
 const GO_PARALLEL_AFTER: u32 = 16;
-/// While parallel, the load is measured over this long; the engine goes back to serial when
-/// the serial engine would have been busy less than `GO_SERIAL_LOAD` of it.
+/// The engine's speed is measured over this long, in either mode. While parallel, it goes
+/// back to serial when the serial engine would have been busy less than `GO_SERIAL_LOAD`.
 const MEASURE_LOAD: Duration = Duration::from_millis(250);
 const GO_SERIAL_LOAD: f64 = 0.5;
+/// Parallel found slower than serial (behind the clock all along, it decoded less than the
+/// serial engine would have): it isn't tried again for this long, twice as long each time
+/// up to `HOLD_OFF_MOST`, until the next seek.
+const HOLD_OFF_FIRST: Duration = Duration::from_secs(1);
+const HOLD_OFF_MOST: Duration = Duration::from_secs(8);
+/// Measuring periods in a row parallel, at most: then serial again for a while, which
+/// measures its speed anew (the song may have changed since).
+const PROBE_SERIAL_AFTER: u32 = 16;
 
 /// When the engine goes parallel and back. Parallel only pays while one thread can't keep
 /// up: its threads wake for every slice, which costs far more than a sparse slice's notes,
@@ -1250,35 +1357,63 @@ const GO_SERIAL_LOAD: f64 = 0.5;
 struct ModeSwitch {
     /// Slices in a row behind the clock.
     behind: u32,
-    /// Since when the load is measured, and the notes decoded by then.
+    /// Since when the load is measured, the notes decoded by then, and whether every slice
+    /// since was behind the clock.
     since: Instant,
     decoded: u64,
+    all_behind: bool,
+    /// No going parallel before this; the next hold-off.
+    hold_until: Instant,
+    hold: Duration,
+    /// Measuring periods since going parallel.
+    windows: u32,
+    /// What a note cost serially (wall ns), from the last period behind the clock all along.
+    serial_ns: Option<f64>,
 }
 
 impl ModeSwitch {
     fn new(now: Instant) -> Self {
-        Self { behind: 0, since: now, decoded: 0 }
+        Self { behind: 0, since: now, decoded: 0, all_behind: true, hold_until: now, hold: HOLD_OFF_FIRST, windows: 0, serial_ns: None }
     }
 
     /// Before a slice: whether to go parallel (`Some(true)`) or serial (`Some(false)`), given
-    /// the mode, whether the slice is behind the clock, the notes decoded ever, and what a
-    /// note costs the serial engine (ns).
-    fn step(&mut self, parallel: bool, behind: bool, decoded: u64, serial_ns: f32, now: Instant) -> Option<bool> {
+    /// the mode, whether the slice is behind the clock and the notes decoded ever.
+    fn step(&mut self, parallel: bool, behind: bool, decoded: u64, now: Instant) -> Option<bool> {
+        self.all_behind &= behind;
+        let wall = now.saturating_duration_since(self.since);
+        let measured = wall >= MEASURE_LOAD;
+        let notes = decoded - self.decoded;
+        if measured {
+            (self.since, self.decoded) = (now, decoded);
+        }
         if !parallel {
             self.behind = if behind { self.behind + 1 } else { 0 };
-            if self.behind < GO_PARALLEL_AFTER {
+            if measured {
+                // Behind all along, the engine was busy all along: its speed.
+                self.serial_ns = (self.all_behind && notes > 0).then(|| wall.as_nanos() as f64 / notes as f64);
+                self.all_behind = true;
+            }
+            if self.behind < GO_PARALLEL_AFTER || now < self.hold_until || self.serial_ns.is_none() {
                 return None;
             }
-            (self.behind, self.since, self.decoded) = (0, now, decoded);
+            (self.behind, self.since, self.decoded, self.all_behind, self.windows) = (0, now, decoded, true, 0);
             return Some(true);
         }
-        let wall = now.saturating_duration_since(self.since);
-        if wall < MEASURE_LOAD {
+        if !measured {
             return None;
         }
-        let load = (decoded - self.decoded) as f64 * serial_ns as f64 / wall.as_nanos() as f64;
-        (self.since, self.decoded) = (now, decoded);
-        (load < GO_SERIAL_LOAD).then_some(false)
+        let load = notes as f64 * self.serial_ns.unwrap_or(0.0) / wall.as_nanos() as f64;
+        let slower = self.all_behind && load < 1.0;
+        (self.all_behind, self.windows) = (true, self.windows + 1);
+        if slower {
+            self.hold_until = now + self.hold;
+            self.hold = (self.hold * 2).min(HOLD_OFF_MOST);
+        }
+        let serial = slower || load < GO_SERIAL_LOAD || self.windows >= PROBE_SERIAL_AFTER;
+        if serial {
+            self.serial_ns = None; // measured anew before going parallel again
+        }
+        serial.then_some(false)
     }
 }
 
@@ -1301,7 +1436,7 @@ impl Decoder {
         let (cmd_tx, cmds) = crossbeam_channel::unbounded();
         let (out, slices) = crossbeam_channel::bounded(SLICES_IN_FLIGHT);
         let (spare_tx, spare) = crossbeam_channel::bounded(SLICES_IN_FLIGHT * 2);
-        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), mode: ModeSwitch::new(Instant::now()), serial_ns: Costs::default().engine_ns, ends: Vec::new(), render_ns: 0.0, render_calm: 0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
+        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), mode: ModeSwitch::new(Instant::now()), ends: Vec::new(), render_ns: 0.0, render_calm: 0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
         thread::Builder::new().name("player-decode".into()).spawn(move || d.run()).expect("spawn decoder");
         (cmd_tx, slices, spare_tx)
     }
@@ -1312,6 +1447,7 @@ impl Decoder {
             ToDecoder::Seek { epoch, cursor, chase, started, time_us } => {
                 self.epoch = epoch;
                 self.eng.par = None; // its tracks and slots are the old position's
+                self.eng.pipe = None;
                 self.mode = ModeSwitch::new(Instant::now());
                 self.eng.cur = cursor;
                 self.eng.notes_played = started;
@@ -1319,6 +1455,9 @@ impl Decoder {
                 self.eng.peak_polyphony = self.eng.peak_polyphony.max(self.eng.polyphony);
                 self.eng.notes_this_second = 0;
                 self.eng.skipper.reset(&chase, time_us);
+                if self.threads > 0 {
+                    self.eng.enter_pipe(self.song.clone());
+                }
                 self.ended = false;
                 true
             }
@@ -1413,6 +1552,10 @@ impl Decoder {
 
     fn run(mut self) {
         let _ = self.feedback.decoder.set(thread::current());
+        // With a thread to spare, the tracks are read on it (see `pipe`).
+        if self.threads > 0 {
+            self.eng.enter_pipe(self.song.clone());
+        }
         let tempo = self.song.tempo.clone();
         loop {
             if self.commands().is_err() {
@@ -1461,12 +1604,15 @@ impl Decoder {
             // to one once that would do.
             if self.threads > 0 {
                 let parallel = self.eng.par.is_some();
-                match self.mode.step(parallel, first_us <= now_us, self.eng.decoded, self.serial_ns, Instant::now()) {
+                match self.mode.step(parallel, first_us <= now_us, self.eng.decoded, Instant::now()) {
                     Some(true) => {
-                        self.serial_ns = self.costs.engine_ns;
+                        self.eng.leave_pipe(&self.song);
                         self.eng.enter_parallel(self.threads);
                     }
-                    Some(false) => self.eng.leave_parallel(),
+                    Some(false) => {
+                        self.eng.leave_parallel();
+                        self.eng.enter_pipe(self.song.clone());
+                    }
                     None => {}
                 }
             }
@@ -2043,40 +2189,73 @@ impl Player {
 mod tests {
     use super::*;
 
+    /// Steps the switch every 500 µs, `per_slice` notes a slice, behind the clock or not,
+    /// until it says something or `limit_us` passes; how long that took.
+    fn mode_until(m: &mut ModeSwitch, parallel: bool, behind: bool, per_slice: u64, clock: &mut (u64, u64), limit_us: u64) -> Option<(bool, u64)> {
+        let t0 = mode_epoch();
+        let start = clock.0;
+        while clock.0 - start < limit_us {
+            (clock.0, clock.1) = (clock.0 + 500, clock.1 + per_slice);
+            if let Some(go) = m.step(parallel, behind, clock.1, t0 + Duration::from_micros(clock.0)) {
+                return Some((go, clock.0 - start));
+            }
+        }
+        None
+    }
+
+    fn mode_epoch() -> Instant {
+        static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *T0.get_or_init(Instant::now)
+    }
+
     #[test]
     fn the_engine_goes_parallel_only_while_serial_cannot_keep_up() {
-        let t0 = Instant::now();
-        let at = |us: u64| t0 + Duration::from_micros(us);
-        let mut m = ModeSwitch::new(t0);
-        // Behind for a while, but not long enough.
-        for i in 0..GO_PARALLEL_AFTER - 1 {
-            assert_eq!(m.step(false, true, 0, 10.0, at(i as u64)), None);
+        let window = MEASURE_LOAD.as_micros() as u64;
+        let mut clock = (0, 0);
+        let mut m = ModeSwitch::new(mode_epoch());
+        // On time: never.
+        assert_eq!(mode_until(&mut m, false, false, 50_000, &mut clock, 2_000_000), None);
+        // Behind, now and then on time again: not while no whole period was behind.
+        for _ in 0..8 {
+            assert_eq!(mode_until(&mut m, false, true, 50_000, &mut clock, window / 2), None);
+            assert_eq!(mode_until(&mut m, false, false, 50_000, &mut clock, 500), None);
         }
-        assert_eq!(m.step(false, false, 0, 10.0, at(100)), None, "on time again: start over");
-        for i in 0..GO_PARALLEL_AFTER - 1 {
-            assert_eq!(m.step(false, true, 0, 10.0, at(200 + i as u64)), None);
-        }
-        assert_eq!(m.step(false, true, 0, 10.0, at(300)), Some(true));
+        // Behind for good: parallel once a whole period behind has measured serial's speed.
+        let (go, took) = mode_until(&mut m, false, true, 50_000, &mut clock, 2_000_000).unwrap();
+        assert!(go && took <= window * 2 + 500, "parallel after {took} µs");
 
-        // Dense: 80M notes/s at 10 ns each is more than one serial thread.
-        let mut decoded = 0;
-        let mut us = 300;
-        for _ in 0..2_000 {
-            (us, decoded) = (us + 500, decoded + 40_000);
-            assert_eq!(m.step(true, false, decoded, 10.0, at(us)), None);
-        }
+        // Dense: 80M notes/s at 10 ns each (as serial measured) is more than one thread does
+        // in that time, so it stays parallel, though it keeps up.
+        assert_eq!(mode_until(&mut m, true, false, 40_000, &mut clock, 1_000_000), None);
         // Slices keep coming every 500 µs, but with 2M notes/s the serial engine would be
         // 2% busy: back to serial within the measuring period, though it never waits long.
-        let start = us;
-        let left = loop {
-            (us, decoded) = (us + 500, decoded + 1_000);
-            if let Some(go) = m.step(true, false, decoded, 10.0, at(us)) {
-                break (go, us - start);
-            }
-            assert!(us - start < 1_000_000, "still parallel after a second of light load");
-        };
-        assert!(!left.0);
-        assert!(left.1 <= MEASURE_LOAD.as_micros() as u64 * 2 + 500, "took {} µs", left.1);
+        let (go, took) = mode_until(&mut m, true, false, 1_000, &mut clock, 1_000_000).expect("still parallel after a second of light load");
+        assert!(!go && took <= window * 2 + 500, "took {took} µs");
+    }
+
+    #[test]
+    fn the_engine_leaves_a_parallel_mode_slower_than_serial_and_waits_before_trying_again() {
+        let window = MEASURE_LOAD.as_micros() as u64;
+        let mut clock = (0, 0);
+        let mut m = ModeSwitch::new(mode_epoch());
+        // Serial does 100M notes/s (50k a slice), behind the clock all along.
+        assert_eq!(mode_until(&mut m, false, true, 50_000, &mut clock, 2_000_000).map(|x| x.0), Some(true));
+        // Faster (150M notes/s): parallel until it is time to measure serial again.
+        let (go, took) = mode_until(&mut m, true, true, 75_000, &mut clock, 10_000_000).unwrap();
+        let probe = window * PROBE_SERIAL_AFTER as u64;
+        assert!(!go && took >= probe && took <= probe + 20_000, "measured serial again after {took} µs");
+        // No hold-off after that: parallel again once serial is measured.
+        assert_eq!(mode_until(&mut m, false, true, 50_000, &mut clock, window * 2 + 500).map(|x| x.0), Some(true));
+        for hold in [HOLD_OFF_FIRST, HOLD_OFF_FIRST * 2] {
+            let hold = hold.as_micros() as u64;
+            // Behind all along, yet through 30M notes/s: back to serial soon.
+            let (go, took) = mode_until(&mut m, true, true, 15_000, &mut clock, 1_000_000).expect("still parallel after a second of it being slower");
+            assert!(!go && took <= window * 2 + 500);
+            // Behind again, but parallel was just found slower: not before the hold-off,
+            // which doubles each time.
+            assert_eq!(mode_until(&mut m, false, true, 50_000, &mut clock, hold - 1_000), None);
+            assert_eq!(mode_until(&mut m, false, true, 50_000, &mut clock, window + 1_000).map(|x| x.0), Some(true));
+        }
     }
 
     #[test]
@@ -2589,10 +2768,8 @@ mod tests {
         song
     }
 
-    /// Note-offs of a bulk run share one queue entry; the messages, in order, are those of
-    /// one entry per note, with notes skipped, merged into sounding ones and postponed.
-    #[test]
-    fn run_note_offs_share_a_queue_entry_and_play_as_before() {
+    /// Three tracks of same-tick runs (bulk reads), now and then broken by a note of its own.
+    fn runs_song() -> Arc<SongData> {
         let mut x = 0x2545_F491_4F6C_DD1Du64;
         let mut rnd = move |n: u64| {
             x ^= x << 13;
@@ -2637,7 +2814,14 @@ mod tests {
         std::fs::write(&path, file).unwrap();
         let song = SongData::load(&path, 127, &Default::default()).unwrap();
         let _ = std::fs::remove_file(&path);
+        song
+    }
 
+    /// Note-offs of a bulk run share one queue entry; the messages, in order, are those of
+    /// one entry per note, with notes skipped, merged into sounding ones and postponed.
+    #[test]
+    fn run_note_offs_share_a_queue_entry_and_play_as_before() {
+        let song = runs_song();
         let play = |group: bool, interval: u64| {
             NO_RUN_GROUPS.with(|g| g.set(!group));
             let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
@@ -2658,6 +2842,51 @@ mod tests {
             assert_eq!(skipped, skipped_grouped);
             assert!(interval == 0 || skipped > 0);
             assert!(most_grouped * if interval == 0 { 3 } else { 1 } < most_one * 2, "queue {most_grouped} vs {most_one} entries at interval {interval}");
+        }
+    }
+
+    #[test]
+    fn the_engine_reading_on_a_thread_of_its_own_sends_exactly_the_same() {
+        let (random, _) = load_random_song("pipe");
+        for (name, song) in [("runs", runs_song()), ("random", random)] {
+            for interval in [0, 250, 800] {
+                // Piped from the start, and also leaving the reader and taking it back every
+                // `toggle` ticks (0 = never).
+                let play = |piped: bool, toggle: u32| {
+                    let mut eng = Engine::new(Cursor::seek(&song, 0).cursor, Skipper::new(0, true));
+                    eng.skipper.interval_us = interval;
+                    if piped {
+                        eng.enter_pipe(song.clone());
+                    }
+                    let (mut msgs, mut sysex) = (vec![], vec![]);
+                    let (mut per, mut n) = (vec![], 0);
+                    while let Some(tick) = eng.next_tick() {
+                        n += 1;
+                        if piped && toggle > 0 && n % toggle == 0 {
+                            if eng.pipe.is_some() {
+                                eng.leave_pipe(&song);
+                            } else {
+                                eng.enter_pipe(song.clone());
+                            }
+                        }
+                        let n0 = msgs.len();
+                        eng.process_tick(&song, tick, tick as u64 * 100, 100.0, &mut msgs);
+                        per.push((tick, msgs[n0..].iter().map(|m| format!("{m:06x}")).collect::<Vec<_>>()));
+                        sysex.extend(eng.sysex.drain(..).map(|x| (x.status, x.at, x.len)));
+                    }
+                    (msgs, sysex, eng.skipper.skipped, eng.notes_played, eng.peak_polyphony, eng.polyphony, per)
+                };
+                let want = play(false, 0);
+                assert!(want.0.len() > 1000, "{name}");
+                for toggle in [0, 37] {
+                    let got = play(true, toggle);
+                    // The first tick that differs, to see what went wrong.
+                    if let Some(i) = want.6.iter().zip(&got.6).position(|(a, b)| a != b) {
+                        panic!("{name}, interval {interval}, toggle {toggle}: {:?} played as {:?}", want.6[i], got.6[i]);
+                    }
+                    assert!(want == got, "{name}, interval {interval}, toggle {toggle}");
+                }
+            }
         }
     }
 
