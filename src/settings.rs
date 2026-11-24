@@ -40,6 +40,21 @@ pub enum KeyboardSide {
     Right,
 }
 
+/// One-click looks for the Effects tab (and `--effects`). Off only switches the effects off,
+/// keeping their sliders; the others set every effect setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EffectsPreset { Off, Subtle, Sapphire, Neon, Party }
+
+impl EffectsPreset {
+    pub const ALL: [Self; 5] = [Self::Off, Self::Subtle, Self::Sapphire, Self::Neon, Self::Party];
+
+    pub fn name(self) -> &'static str {
+        match self { Self::Off => "Off", Self::Subtle => "Subtle", Self::Sapphire => "Sapphire", Self::Neon => "Neon", Self::Party => "Party" }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> { Self::ALL.into_iter().find(|p| p.name().eq_ignore_ascii_case(s)) }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -196,6 +211,32 @@ impl Settings {
             bar_color: self.glow_bar_single.then(|| self.glow_bar_color.map(|c| c as f32 / 255.0)) })
     }
 
+    pub fn apply_effects(&mut self, preset: EffectsPreset) {
+        use EffectsPreset::*;
+        if preset == Off {
+            (self.glow, self.glow_bar, self.confetti) = (false, false, false);
+            return;
+        }
+        // (intensity, decay, spread, reach, on keys, glass, tail)
+        let (intensity, decay, spread, reach, on_keys, glass, tail) = match preset {
+            Subtle => (0.8, 0.3, 1.5, 0.05, 0.5, false, 0.3),
+            Neon => (2.0, 0.15, 1.0, 0.06, 1.0, true, 0.4),
+            _ => (1.5, 0.35, 1.5, 0.1, 0.8, true, 0.6),
+        };
+        (self.glow, self.glow_intensity, self.glow_decay, self.glow_spread, self.glow_reach, self.glow_on_keys, self.glow_glass, self.glow_tail) =
+            (true, intensity, decay, spread, reach, on_keys, glass, tail);
+        self.glow_bar = preset != Subtle;
+        (self.glow_bar_height, self.glow_bar_speed, self.glow_bar_rest, self.glow_bar_single) =
+            if preset == Neon { (0.06, 0.5, 0.8, false) } else { (0.08, 0.1, 0.4, false) };
+        self.confetti = preset == Party;
+        (self.confetti_amount, self.confetti_size, self.confetti_gravity, self.confetti_life, self.confetti_rainbow) = (10, 0.015, 1.5, 1.5, true);
+    }
+
+    /// The preset the effect settings match, if any.
+    pub fn effects_preset(&self) -> Option<EffectsPreset> {
+        EffectsPreset::ALL.into_iter().find(|&p| { let mut s = self.clone(); s.apply_effects(p); s == *self })
+    }
+
     /// Confetti's look, when it is on.
     pub fn confetti_look(&self) -> Option<crate::confetti::ConfettiLook> {
         self.confetti.then_some(crate::confetti::ConfettiLook { amount: self.confetti_amount, size: self.confetti_size,
@@ -242,6 +283,25 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effects_presets_set_the_look_and_are_recognised() {
+        let mut s = Settings::default();
+        assert_eq!(s.effects_preset(), Some(EffectsPreset::Off), "defaults: everything off");
+        s.apply_effects(EffectsPreset::Sapphire);
+        assert!(s.glow && s.glow_glass && s.glow_bar && !s.confetti && s.glow_tail > 0.4);
+        assert_eq!(s.effects_preset(), Some(EffectsPreset::Sapphire));
+        s.apply_effects(EffectsPreset::Party);
+        assert!(s.glow && s.confetti && s.confetti_rainbow);
+        s.glow_tail += 0.05;
+        assert_eq!(s.effects_preset(), None, "tweaked: no preset");
+        let tail = s.glow_tail;
+        s.apply_effects(EffectsPreset::Off);
+        assert!(!s.glow && !s.glow_bar && !s.confetti && s.glow_tail == tail, "Off keeps the sliders");
+        assert_eq!(s.effects_preset(), Some(EffectsPreset::Off));
+        for p in EffectsPreset::ALL { assert_eq!(EffectsPreset::parse(p.name()), Some(p)); }
+        assert_eq!(EffectsPreset::parse("NEON"), Some(EffectsPreset::Neon));
+    }
 
     #[test]
     fn round_trip_and_fallbacks() {

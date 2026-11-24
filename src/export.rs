@@ -406,6 +406,10 @@ pub fn run_from_args() -> bool {
     if let Some(v) = value("--keyboard-side") {
         look.keyboard_side = match v.as_str() { "left" => KeyboardSide::Left, "right" => KeyboardSide::Right, _ => panic!("keyboard side: left or right") };
     }
+    // A preset first, so the flags after it can adjust it.
+    if let Some(v) = value("--effects") {
+        look.apply_effects(crate::settings::EffectsPreset::parse(v).expect("--effects: off, subtle, sapphire, neon or party"));
+    }
     if args.iter().any(|a| a == "--glow") { look.glow = true; }
     if let Some(v) = value("--glow-intensity") { look.glow_intensity = v.parse::<f32>().expect("bad --glow-intensity").clamp(0.0, 3.0); }
     if let Some(v) = value("--glow-decay") { look.glow_decay = v.parse::<f32>().expect("bad --glow-decay").clamp(0.05, 2.0); }

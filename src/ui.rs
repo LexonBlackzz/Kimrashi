@@ -317,12 +317,20 @@ impl AppState {
                             ui.end_row();
                         }
                     }
-                    if show(Effects, "Effects key glow light bloom intensity decay spread tail reach glass keys rainbow bar confetti particles") {
+                    if show(Effects, "Effects presets subtle sapphire neon party key glow light bloom intensity decay spread tail reach glass keys rainbow bar confetti particles") {
                         if c.view != crate::settings::ViewMode::Vertical {
                             ui.label("Effects");
                             ui.label("Effects show in the Vertical view.");
                             ui.end_row();
                         } else {
+                            ui.label("Presets");
+                            ui.horizontal(|ui| {
+                                let current = c.effects_preset();
+                                for p in crate::settings::EffectsPreset::ALL {
+                                    if ui.selectable_label(current == Some(p), p.name()).clicked() { c.apply_effects(p); }
+                                }
+                            }).response.on_hover_text("One-click looks; adjust the sliders from there (Off keeps them)");
+                            ui.end_row();
                             ui.label("Key glow");
                             ui.checkbox(&mut c.glow, "On").on_hover_text("Hit keys light up and spill light over the keys and up into the notes");
                             ui.end_row();
