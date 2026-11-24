@@ -317,7 +317,7 @@ impl AppState {
                             ui.end_row();
                         }
                     }
-                    if show(Effects, "Effects key glow light bloom intensity decay spread tail reach glass keys rainbow bar") {
+                    if show(Effects, "Effects key glow light bloom intensity decay spread tail reach glass keys rainbow bar confetti particles") {
                         if c.view != crate::settings::ViewMode::Vertical {
                             ui.label("Effects");
                             ui.label("Effects show in the Vertical view.");
@@ -376,6 +376,33 @@ impl AppState {
                                     ui.checkbox(&mut c.glow_bar_single, "One colour").on_hover_text("One colour instead of the moving rainbow");
                                     if c.glow_bar_single { ui.color_edit_button_srgb(&mut c.glow_bar_color); }
                                 });
+                                ui.end_row();
+                            }
+                            ui.label("Confetti");
+                            ui.checkbox(&mut c.confetti, "On").on_hover_text("Keys throw paper confetti up into the notes as their notes start");
+                            ui.end_row();
+                            if c.confetti {
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    ui.label("Amount");
+                                    ui.add(egui::Slider::new(&mut c.confetti_amount, 1..=40)).on_hover_text("Pieces per note start");
+                                    ui.label("Size");
+                                    ui.add(egui::Slider::new(&mut c.confetti_size, 0.005..=0.05).fixed_decimals(3))
+                                        .on_hover_text("A piece's length, as a fraction of the note area's height");
+                                });
+                                ui.end_row();
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    ui.label("Gravity");
+                                    ui.add(egui::Slider::new(&mut c.confetti_gravity, 0.0..=5.0).fixed_decimals(2))
+                                        .on_hover_text("How hard pieces are pulled back down (0: they float)");
+                                    ui.label("Life");
+                                    ui.add(egui::Slider::new(&mut c.confetti_life, 0.2..=5.0).fixed_decimals(1).suffix(" s"))
+                                        .on_hover_text("How long a piece lasts before it shrinks away");
+                                });
+                                ui.end_row();
+                                ui.label("");
+                                ui.checkbox(&mut c.confetti_rainbow, "Rainbow colours").on_hover_text("Random bright colours instead of the note's");
                                 ui.end_row();
                             }
                         }
@@ -841,6 +868,7 @@ pub(crate) fn draw_piano_roll(
     parallax: &mut crate::parallax::Parallax,
     matrix: &mut crate::matrix::Matrix,
     (glow, glow_look): (&mut crate::glow::Glow, Option<crate::glow::GlowLook>),
+    (confetti, confetti_look): (&mut crate::confetti::Confetti, Option<crate::confetti::ConfettiLook>),
     instances: &mut Arc<gpu::InstanceRing>,
     times: &mut FrameTimes,
 ) {
@@ -1051,6 +1079,14 @@ pub(crate) fn draw_piano_roll(
             if look.bar_height > 0.0 { paint_bar(&painter, glow, &columns, note_area, keyboard_rect, &look, now_us); }
         }
         None => *glow = Default::default(),
+    }
+    match confetti_look.filter(|_| along_bottom && song.is_some()) {
+        Some(look) => {
+            confetti.update(now_us, &active_keys, &active_colors, &columns, &look);
+            let quads = confetti.quads(note_area.left(), note_area.width(), note_area.bottom(), note_area.height(), &look);
+            paint_quads(&painter.with_clip_rect(note_area.union(keyboard_rect)), &quads);
+        }
+        None => *confetti = Default::default(),
     }
 
     let detailed_stats = stats_mode == StatsMode::Detailed;

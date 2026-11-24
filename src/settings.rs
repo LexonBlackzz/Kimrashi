@@ -73,6 +73,13 @@ pub struct Settings {
     pub glow_bar_color: [u8; 3],
     /// Sapphire-style tail on the glow (see `GlowLook::tail`).
     pub glow_tail: f32,
+    /// Confetti from keys as their notes start (Vertical view, see `crate::confetti`).
+    pub confetti: bool,
+    pub confetti_amount: u32,
+    pub confetti_size: f32,
+    pub confetti_gravity: f32,
+    pub confetti_life: f32,
+    pub confetti_rainbow: bool,
     pub note_speed: f32,
     pub notes_rise: bool,
     pub piano_layout: bool,
@@ -137,6 +144,12 @@ impl Default for Settings {
             glow_bar_single: false,
             glow_bar_color: [80, 200, 255],
             glow_tail: 0.5,
+            confetti: false,
+            confetti_amount: 6,
+            confetti_size: 0.015,
+            confetti_gravity: 1.5,
+            confetti_life: 1.5,
+            confetti_rainbow: false,
             note_speed: 5.0,
             notes_rise: false,
             piano_layout: false,
@@ -174,7 +187,6 @@ fn dir() -> Option<std::path::PathBuf> {
 }
 
 impl Settings {
-    /// The note shader's `flat_mode`: 0 shaded, 1 flat, 2 Piano From Above.
     /// The key glow's look, when it or the rainbow bar (which runs on the same key light) is on.
     pub fn glow_look(&self) -> Option<crate::glow::GlowLook> {
         (self.glow || self.glow_bar).then_some(crate::glow::GlowLook { glow: self.glow, intensity: self.glow_intensity, decay: self.glow_decay,
@@ -184,6 +196,13 @@ impl Settings {
             bar_color: self.glow_bar_single.then(|| self.glow_bar_color.map(|c| c as f32 / 255.0)) })
     }
 
+    /// Confetti's look, when it is on.
+    pub fn confetti_look(&self) -> Option<crate::confetti::ConfettiLook> {
+        self.confetti.then_some(crate::confetti::ConfettiLook { amount: self.confetti_amount, size: self.confetti_size,
+            gravity: self.confetti_gravity, life: self.confetti_life, rainbow: self.confetti_rainbow })
+    }
+
+    /// The note shader's `flat_mode`: 0 shaded, 1 flat, 2 Piano From Above.
     pub fn note_mode(&self) -> u32 { if self.pfa_style { 2 } else { self.flat_notes as u32 } }
 
     pub fn load() -> Self {

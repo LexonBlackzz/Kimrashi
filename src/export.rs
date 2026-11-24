@@ -263,6 +263,7 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
     let mut layers = crate::parallax::Parallax::default();
     let mut cells = crate::matrix::Matrix::new();
     let (mut glow, glow_look) = (crate::glow::Glow::default(), look.glow_look());
+    let (mut confetti, confetti_look) = (crate::confetti::Confetti::default(), look.confetti_look());
     let mut visible = VisibleNotes::default();
     visible.set_collapse(look.collapse_overlaps);
     visible.set_max_instances(look.max_instances);
@@ -375,6 +376,10 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
                     }
                 }
             }
+            if let Some(cl) = &confetti_look {
+                confetti.update(now_us, &active, &colors, &columns, cl);
+                crate::pfa::fill(&mut frame, width, &confetti.quads(0.0, width as f32, note_h as f32, note_h as f32, cl));
+            }
         }
         let report = Report { frame: f + 1, total, speed: (f + 1) as f64 / cfg.fps as f64 / start.elapsed().as_secs_f64(), rgba: &frame };
         if !on_frame(&report) { result = Err("cancelled".into()); break; }
@@ -410,6 +415,12 @@ pub fn run_from_args() -> bool {
     if args.iter().any(|a| a == "--glow-bar") { look.glow_bar = true; }
     if let Some(v) = value("--glow-bar-height") { look.glow_bar_height = v.parse::<f32>().expect("bad --glow-bar-height").clamp(0.02, 0.5); }
     if let Some(v) = value("--glow-bar-speed") { look.glow_bar_speed = v.parse::<f32>().expect("bad --glow-bar-speed").clamp(-1.0, 1.0); }
+    if args.iter().any(|a| a == "--confetti") { look.confetti = true; }
+    if args.iter().any(|a| a == "--confetti-rainbow") { look.confetti = true; look.confetti_rainbow = true; }
+    if let Some(v) = value("--confetti-amount") { look.confetti_amount = v.parse::<u32>().expect("bad --confetti-amount").clamp(1, 40); }
+    if let Some(v) = value("--confetti-size") { look.confetti_size = v.parse::<f32>().expect("bad --confetti-size").clamp(0.005, 0.05); }
+    if let Some(v) = value("--confetti-gravity") { look.confetti_gravity = v.parse::<f32>().expect("bad --confetti-gravity").clamp(0.0, 5.0); }
+    if let Some(v) = value("--confetti-life") { look.confetti_life = v.parse::<f32>().expect("bad --confetti-life").clamp(0.2, 5.0); }
     if let Some(v) = value("--glow-tail") { look.glow_tail = v.parse::<f32>().expect("bad --glow-tail").clamp(0.0, 0.9); }
     if let Some(v) = value("--glow-bar-brightness") { look.glow_bar_rest = v.parse::<f32>().expect("bad --glow-bar-brightness").clamp(0.0, 1.0); }
     if let Some(v) = value("--glow-bar-color") {
@@ -563,6 +574,16 @@ mod tests {
         let spread = |c: [u8; 3]| *c.iter().max().unwrap() as i32 - *c.iter().min().unwrap() as i32;
         assert!(spread(pixel(&bar, 2, 82)) > 40, "the bar shows with the glow off: {:?}", pixel(&bar, 2, 82));
         assert_eq!(pixel(&bar, 144, 86), pixel(&plain, 144, 86), "and the keys take no glow: {:?}", pixel(&bar, 144, 86));
+    }
+    #[test]
+    fn confetti_bursts_from_the_struck_key() {
+        let look = |confetti| crate::settings::Settings { confetti, confetti_size: 0.1, confetti_amount: 12, ..Default::default() };
+        let Some(plain) = first_frame("kimrashi-confetti-off", look(false), 1.0) else { return };
+        let Some(burst) = first_frame("kimrashi-confetti-on", look(true), 1.0) else { return };
+        // Key 100 sits near x 144; the pieces start at the keyboard line (row ~80).
+        let changed = |x0: u32, x1: u32| (x0..x1).flat_map(|x| (70..82).map(move |y| (x, y))).filter(|&(x, y)| pixel(&burst, x, y) != pixel(&plain, x, y)).count();
+        assert!(changed(130, 158) > 10, "pieces at the struck key: {}", changed(130, 158));
+        assert_eq!(changed(0, 60), 0, "none far from it");
     }
     #[test]
     fn matrix_export_lights_the_sounding_cell() {
