@@ -1314,6 +1314,8 @@ struct Decoder {
     /// to use them.
     threads: usize,
     mode: ModeSwitch,
+    /// The tracks are read on a thread of their own (see `pipe`) while serial.
+    reader: bool,
     ends: Vec<(u32, u32)>,
     /// What the synth really charges per message (ns), learned from how late it renders:
     /// a synth can take events in a few ns each and still need microseconds to sound them.
@@ -1333,6 +1335,16 @@ fn engine_threads() -> usize {
     }
     let cores = thread::available_parallelism().map_or(1, |n| n.get());
     if cores >= 6 { (cores / 2).clamp(2, 8) } else { 0 }
+}
+
+/// Whether the engine reads the tracks on a thread of its own: it takes one core, which
+/// a machine of 4 can spare. `KIM_ENGINE_READER` overrides (0 = never, 1 = always).
+fn engine_reader() -> bool {
+    match std::env::var("KIM_ENGINE_READER").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => thread::available_parallelism().map_or(1, |n| n.get()) >= 4,
+    }
 }
 
 /// Slices in a row the decoder is behind the clock before the engine goes parallel (once
@@ -1436,7 +1448,7 @@ impl Decoder {
         let (cmd_tx, cmds) = crossbeam_channel::unbounded();
         let (out, slices) = crossbeam_channel::bounded(SLICES_IN_FLIGHT);
         let (spare_tx, spare) = crossbeam_channel::bounded(SLICES_IN_FLIGHT * 2);
-        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), mode: ModeSwitch::new(Instant::now()), ends: Vec::new(), render_ns: 0.0, render_calm: 0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
+        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), reader: engine_reader(), mode: ModeSwitch::new(Instant::now()), ends: Vec::new(), render_ns: 0.0, render_calm: 0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
         thread::Builder::new().name("player-decode".into()).spawn(move || d.run()).expect("spawn decoder");
         (cmd_tx, slices, spare_tx)
     }
@@ -1455,7 +1467,7 @@ impl Decoder {
                 self.eng.peak_polyphony = self.eng.peak_polyphony.max(self.eng.polyphony);
                 self.eng.notes_this_second = 0;
                 self.eng.skipper.reset(&chase, time_us);
-                if self.threads > 0 {
+                if self.reader {
                     self.eng.enter_pipe(self.song.clone());
                 }
                 self.ended = false;
@@ -1553,7 +1565,7 @@ impl Decoder {
     fn run(mut self) {
         let _ = self.feedback.decoder.set(thread::current());
         // With a thread to spare, the tracks are read on it (see `pipe`).
-        if self.threads > 0 {
+        if self.reader {
             self.eng.enter_pipe(self.song.clone());
         }
         let tempo = self.song.tempo.clone();
@@ -1611,7 +1623,9 @@ impl Decoder {
                     }
                     Some(false) => {
                         self.eng.leave_parallel();
-                        self.eng.enter_pipe(self.song.clone());
+                        if self.reader {
+                            self.eng.enter_pipe(self.song.clone());
+                        }
                     }
                     None => {}
                 }
