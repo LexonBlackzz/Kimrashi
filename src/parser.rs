@@ -270,29 +270,41 @@ impl TrackReader {
         Some(self.body(t.store, v, p))
     }
 
-    /// Right after a note record: the 16 records that follow it, if they are all plain notes
-    /// at the same tick (two bytes each: no delay, velocity or duration of their own).
-    /// Consumes them, puts their keys in `keys`, and returns their channel, velocity and
-    /// duration. Otherwise None, and nothing is consumed. Dense black MIDI is mostly this.
+    /// Right after a note record: the records that follow it while they are plain notes at
+    /// the same tick (two bytes each: no delay, velocity or duration of their own), up to 16
+    /// and within the chunk. Consumes them, puts their keys in `keys`, and returns their
+    /// channel, velocity, duration and how many there are. None if there is none, and then
+    /// nothing is consumed. Dense black MIDI is mostly this.
     #[inline]
-    pub fn same_tick_run(&mut self, t: Track, keys: &mut [u8; 16]) -> Option<(u8, u8, Option<u32>)> {
-        if self.running & 0xF0 != 0x90 || self.pos + 32 > self.end {
+    pub fn same_tick_run(&mut self, t: Track, keys: &mut [u8; 16]) -> Option<(u8, u8, Option<u32>, usize)> {
+        if self.running & 0xF0 != 0x90 {
             return None;
         }
-        let b = &t.store[self.pos..self.pos + 32];
-        // Even bytes (delta and flags) all zero, odd bytes (keys) without the high bit.
-        let mut bad = 0u64;
-        for w in b.chunks_exact(8) {
-            bad |= u64::from_le_bytes(w.try_into().unwrap()) & 0x80FF_80FF_80FF_80FF;
-        }
-        if bad != 0 {
+        let b = &t.store[self.pos..self.end];
+        // A plain record: its first byte (delta and flags) zero, its second (key) without the
+        // high bit.
+        let n = if b.len() >= 32 {
+            // Eight bytes at a time: the first bad bit is in the first record that isn't plain.
+            let mut n = 16;
+            for (i, w) in b[..32].chunks_exact(8).enumerate() {
+                let bad = u64::from_le_bytes(w.try_into().unwrap()) & 0x80FF_80FF_80FF_80FF;
+                if bad != 0 {
+                    n = i * 4 + (bad.trailing_zeros() / 16) as usize;
+                    break;
+                }
+            }
+            n
+        } else {
+            b.chunks_exact(2).take_while(|r| r[0] == 0 && r[1] < 0x80).count()
+        };
+        if n == 0 {
             return None;
         }
-        for (i, k) in keys.iter_mut().enumerate() {
+        for (i, k) in keys[..n].iter_mut().enumerate() {
             *k = b[2 * i + 1];
         }
-        self.pos += 32;
-        Some((self.running & 0x0F, self.vel, self.dur.checked_sub(1)))
+        self.pos += 2 * n;
+        Some((self.running & 0x0F, self.vel, self.dur.checked_sub(1), n))
     }
 
     /// Decode the next record and its absolute tick.

@@ -977,7 +977,7 @@ fn decode_parts(song: &SongData, readers: &mut [TrackReader], now_us: u64, reach
             if dur.is_some_and(|d| tick + d < now_tick) {
                 // The plain notes right behind it share its tick and length (most of a dense
                 // black MIDI), so they are finished too: skip them together.
-                if r.same_tick_run(data, &mut run).is_some() { acc.scanned += 16; }
+                if let Some((.., n)) = r.same_tick_run(data, &mut run) { acc.scanned += n; }
                 continue;
             }
             keep(acc, tick, ch, key, dur);

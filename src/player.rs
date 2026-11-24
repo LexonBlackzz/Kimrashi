@@ -508,8 +508,8 @@ impl Cursor {
                                 let end = dur.map(|d| t + d);
                                 if end.map_or(true, |e| e > tick) {
                                     active.push((ch, key, vel, end));
-                                } else if r.same_tick_run(data, &mut run).is_some() {
-                                    started += 16; // the plain notes behind it share its tick and length
+                                } else if let Some((.., n)) = r.same_tick_run(data, &mut run) {
+                                    started += n as u64; // the plain notes behind it share its tick and length
                                 }
                             } else if let Record::Sysex { status, at, len } = rec {
                                 seq += 1;
@@ -934,8 +934,8 @@ impl Engine {
                 match rec {
                     Record::Note { ch, key, vel, dur } => {
                         note!(ch, key, vel, dur);
-                        while let Some((ch, vel, dur)) = r.same_tick_run(data, &mut keys) {
-                            for &key in &keys {
+                        while let Some((ch, vel, dur, n)) = r.same_tick_run(data, &mut keys) {
+                            for &key in &keys[..n] {
                                 note!(ch, key, vel, dur);
                             }
                         }
@@ -2101,8 +2101,8 @@ mod tests {
         };
         let from_us = std::env::var("FROM_S").ok().and_then(|s| s.parse::<f64>().ok()).map_or(0, |s| (s * 1e6) as u64);
         if std::env::var_os("ENGINE_ONLY").is_some() {
-            let (decoded, _, _, secs) = bench_engine(&song);
-            return println!("engine alone: {decoded} notes in {secs:.2} s: {:.1} M notes/s", decoded as f64 / secs / 1e6);
+            let (decoded, _, hash, secs) = bench_engine(&song);
+            return println!("engine alone: {decoded} notes in {secs:.2} s: {:.1} M notes/s, hash {hash:016x}", decoded as f64 / secs / 1e6);
         }
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (tel_tx, tel_rx) = latest();
@@ -2536,7 +2536,7 @@ mod tests {
     }
 
     /// Many notes at one tick with the same velocity and length (the plain two-byte records
-    /// `same_tick_run` takes 16 at a time), broken up now and then by other notes and controllers.
+    /// `same_tick_run` takes up to 16 at a time), broken up now and then by other notes and controllers.
     #[test]
     fn bulk_reads_of_plain_notes_match_one_by_one() {
         use crate::parser::{MidiFile, Plain, Progress};
@@ -2586,17 +2586,21 @@ mod tests {
         while let Some(x) = r.next(t) {
             one.push(x);
         }
-        let (mut bulk, mut runs, mut r, mut keys) = (vec![], 0, TrackReader::default(), [0u8; 16]);
+        let (mut bulk, mut runs, mut short, mut r, mut keys) = (vec![], 0, 0, TrackReader::default(), [0u8; 16]);
         while let Some((tick, rec)) = r.next(t) {
             bulk.push((tick, rec));
             if matches!(rec, Record::Note { .. }) {
-                while let Some((ch, vel, dur)) = r.same_tick_run(t, &mut keys) {
-                    runs += 1;
-                    bulk.extend(keys.iter().map(|&key| (tick, Record::Note { ch, key, vel, dur })));
+                while let Some((ch, vel, dur, n)) = r.same_tick_run(t, &mut keys) {
+                    assert!((1..=16).contains(&n));
+                    (runs, short) = (runs + 1, short + (n < 16) as u32);
+                    bulk.extend(keys[..n].iter().map(|&key| (tick, Record::Note { ch, key, vel, dur })));
                 }
             }
         }
         assert!(runs > 100, "only {runs} bulk reads");
+        // The plain notes before a change of velocity or length, or a chunk's end, come in
+        // runs shorter than 16.
+        assert!(short > 100, "only {short} short runs");
         assert!(one == bulk, "the records differ");
     }
 

@@ -141,8 +141,8 @@ fn scan_track(song: &SongData, track: usize, step: u32, count: usize) -> (Vec<Tr
             started += 1;
             if dur.map_or(true, |d| d > step) {
                 long.push(LongNote { tick, ch, key, vel, dur });
-            } else if r.same_tick_run(data, &mut run).is_some() {
-                started += 16; // plain notes behind a short one share its tick and length
+            } else if let Some((.., n)) = r.same_tick_run(data, &mut run) {
+                started += n as u32; // plain notes behind a short one share its tick and length
             }
         }
         readers.push(r);

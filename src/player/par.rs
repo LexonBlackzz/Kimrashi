@@ -480,12 +480,12 @@ impl Chunk {
                         Record::Note { ch, key, vel, dur } => {
                             let mut n = 1;
                             note!(ch, key, vel, dur);
-                            while let Some((ch, vel, dur)) = r.same_tick_run(data, &mut keys) {
-                                for &key in &keys {
+                            while let Some((ch, vel, dur, run)) = r.same_tick_run(data, &mut keys) {
+                                for &key in &keys[..run] {
                                     seq += 1;
                                     note!(ch, key, vel, dur);
                                 }
-                                n += 16;
+                                n += run as u64;
                             }
                             self.decoded += n;
                             self.played += n * copies;
