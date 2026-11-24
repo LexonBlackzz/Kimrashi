@@ -175,9 +175,9 @@ fn dir() -> Option<std::path::PathBuf> {
 
 impl Settings {
     /// The note shader's `flat_mode`: 0 shaded, 1 flat, 2 Piano From Above.
-    /// The key glow's look, when it is on.
+    /// The key glow's look, when it or the rainbow bar (which runs on the same key light) is on.
     pub fn glow_look(&self) -> Option<crate::glow::GlowLook> {
-        self.glow.then_some(crate::glow::GlowLook { intensity: self.glow_intensity, decay: self.glow_decay,
+        (self.glow || self.glow_bar).then_some(crate::glow::GlowLook { glow: self.glow, intensity: self.glow_intensity, decay: self.glow_decay,
             spread: self.glow_spread, reach: self.glow_reach, on_keys: self.glow_on_keys, glass: self.glow_glass,
             bar_height: if self.glow_bar { self.glow_bar_height } else { 0.0 }, bar_speed: self.glow_bar_speed,
             tail: self.glow_tail, bar_rest: self.glow_bar_rest,

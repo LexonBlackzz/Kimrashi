@@ -1893,6 +1893,7 @@ struct AppState {
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
     Display,
+    Effects,
     Audio,
     Loading,
     Performance,

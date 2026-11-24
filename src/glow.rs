@@ -6,6 +6,8 @@ use egui::Color32;
 /// The adjustable look (see `Settings::glow_*`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlowLook {
+    /// The key glow itself (halo, light on the keys, glass keys); off leaves only the rainbow bar.
+    pub glow: bool,
     /// Light of a sounding key (1 = a full-strength key before tone mapping).
     pub intensity: f32,
     /// Seconds for released light to fall to 1/e.
@@ -193,7 +195,7 @@ pub fn on_keys(c: [f32; 3], strength: f32) -> ([f32; 3], f32) {
 mod tests {
     use super::*;
 
-    const LOOK: GlowLook = GlowLook { intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25, on_keys: 0.8, glass: false, bar_height: 0.1, bar_speed: 0.2, tail: 0.0, bar_rest: 0.35, bar_color: None };
+    const LOOK: GlowLook = GlowLook { glow: true, intensity: 1.0, decay: 0.3, spread: 2.0, reach: 0.25, on_keys: 0.8, glass: false, bar_height: 0.1, bar_speed: 0.2, tail: 0.0, bar_rest: 0.35, bar_color: None };
 
     fn one_key(p: usize) -> [bool; 128] { let mut a = [false; 128]; a[p] = true; a }
 

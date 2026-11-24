@@ -351,11 +351,11 @@ pub fn run(cfg: &Settings, mut on_frame: impl FnMut(&Report) -> bool) -> Result<
             }
             if let Some(gl) = &glow_look {
                 glow.update(now_us, &active, &colors, gl);
-                if gl.glass {
+                if gl.glow && gl.glass {
                     let kb = egui::Rect::from_min_max(egui::pos2(0.0, note_h as f32), egui::pos2(width as f32, height as f32));
                     crate::pfa::fill(&mut frame, width, &crate::ui::glass_quads(kb, lo, hi, piano.then_some(&columns), &glow, gl.intensity));
                 }
-                if !glow.is_dark() {
+                if gl.glow && !glow.is_dark() {
                     let w = width as usize;
                     let (halo, core, wide) = (glow.strip(&columns, w, gl), glow.core(&columns, w, gl), glow.wide(&columns, w, gl));
                     add_glow(&mut frame, width, note_h, (&halo, &core, &wide), gl.reach * note_h as f32, gl.keys_tint(), gl.tail);
@@ -554,6 +554,15 @@ mod tests {
         assert_eq!(pixel(&bar, 2, 89), pixel(&plain, 2, 89), "only the top");
         assert!(pixel(&bar, 2, 78)[0] > pixel(&plain, 2, 78)[0] + 10, "the bar glows up into the notes: {:?}", pixel(&bar, 2, 78));
         assert!(pixel(&bar, 2, 10)[0] <= pixel(&plain, 2, 10)[0] + 5, "only a faint tail far up: {:?}", pixel(&bar, 2, 10));
+    }
+    #[test]
+    fn the_rainbow_bar_needs_no_key_glow() {
+        let look = |glow_bar| crate::settings::Settings { glow: false, glow_bar, glow_bar_height: 0.5, ..Default::default() };
+        let Some(plain) = first_frame("kimrashi-bar-alone-off", look(false), 1.0) else { return };
+        let Some(bar) = first_frame("kimrashi-bar-alone", look(true), 1.0) else { return };
+        let spread = |c: [u8; 3]| *c.iter().max().unwrap() as i32 - *c.iter().min().unwrap() as i32;
+        assert!(spread(pixel(&bar, 2, 82)) > 40, "the bar shows with the glow off: {:?}", pixel(&bar, 2, 82));
+        assert_eq!(pixel(&bar, 144, 86), pixel(&plain, 144, 86), "and the keys take no glow: {:?}", pixel(&bar, 144, 86));
     }
     #[test]
     fn matrix_export_lights_the_sounding_cell() {

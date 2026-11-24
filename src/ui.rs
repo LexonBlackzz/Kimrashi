@@ -243,6 +243,7 @@ impl AppState {
                     ui.horizontal(|ui| {
                         for (tab, name) in [
                             (SettingsTab::Display, "Display"),
+                            (SettingsTab::Effects, "Effects"),
                             (SettingsTab::Audio, "Audio"),
                             (SettingsTab::Loading, "Loading"),
                             (SettingsTab::Performance, "Performance"),
@@ -303,62 +304,6 @@ impl AppState {
                             }
                             ui.end_row();
                         }
-                        if c.view == ViewMode::Vertical {
-                            ui.label("Key glow");
-                            ui.checkbox(&mut c.glow, "On").on_hover_text("Hit keys light up and spill light over the keys and up into the notes");
-                            ui.end_row();
-                            if c.glow {
-                                ui.label("  Intensity");
-                                ui.add(egui::Slider::new(&mut c.glow_intensity, 0.0..=3.0).fixed_decimals(2));
-                                ui.end_row();
-                                ui.label("  Decay");
-                                ui.add(egui::Slider::new(&mut c.glow_decay, 0.05..=2.0).fixed_decimals(2).suffix(" s"))
-                                    .on_hover_text("How fast the light fades after a key is released");
-                                ui.end_row();
-                                ui.label("  Spread");
-                                ui.add(egui::Slider::new(&mut c.glow_spread, 0.5..=8.0).fixed_decimals(1).suffix(" keys"))
-                                    .on_hover_text("How far the light spills sideways");
-                                ui.end_row();
-                                ui.label("  Glass keys");
-                                ui.checkbox(&mut c.glow_glass, "On").on_hover_text("Frosted keys, dark at rest, lit from inside in their notes' colours");
-                                ui.end_row();
-                                ui.label("  On keys");
-                                ui.add(egui::Slider::new(&mut c.glow_on_keys, 0.0..=1.0).fixed_decimals(2))
-                                    .on_hover_text("How strongly the light colours the keys themselves");
-                                ui.end_row();
-                                ui.label("  Tail");
-                                ui.add(egui::Slider::new(&mut c.glow_tail, 0.0..=0.9).fixed_decimals(2))
-                                    .on_hover_text("Sapphire-style: wider, fainter glows stacked around the light (0: one soft glow)");
-                                ui.end_row();
-                                ui.label("  Reach");
-                                ui.add(egui::Slider::new(&mut c.glow_reach, 0.02..=1.0).fixed_decimals(2))
-                                    .on_hover_text("How far up the light rises, as a fraction of the note area");
-                                ui.end_row();
-                                ui.label("  Rainbow bar");
-                                ui.checkbox(&mut c.glow_bar, "On").on_hover_text("A moving rainbow along the top of the keys that flares where keys are hit");
-                                ui.end_row();
-                                if c.glow_bar {
-                                    ui.label("    Height");
-                                    ui.add(egui::Slider::new(&mut c.glow_bar_height, 0.02..=0.5).fixed_decimals(2))
-                                        .on_hover_text("As a fraction of the keys' height");
-                                    ui.end_row();
-                                    ui.label("    Speed");
-                                    ui.add(egui::Slider::new(&mut c.glow_bar_speed, -1.0..=1.0).fixed_decimals(2).suffix(" turns/s"))
-                                        .on_hover_text("How fast the rainbow moves (negative: the other way; 0: still)");
-                                    ui.end_row();
-                                    ui.label("    Brightness");
-                                    ui.add(egui::Slider::new(&mut c.glow_bar_rest, 0.0..=1.0).fixed_decimals(2))
-                                        .on_hover_text("How bright the bar is at rest; hits flare it toward white");
-                                    ui.end_row();
-                                    ui.label("    One colour");
-                                    ui.horizontal(|ui| {
-                                        ui.checkbox(&mut c.glow_bar_single, "");
-                                        if c.glow_bar_single { ui.color_edit_button_srgb(&mut c.glow_bar_color); }
-                                    }).response.on_hover_text("One colour instead of the moving rainbow");
-                                    ui.end_row();
-                                }
-                            }
-                        }
                         if c.view == ViewMode::Matrix {
                             ui.label("Fade");
                             ui.add(egui::Slider::new(&mut c.matrix_fade, 0.0..=2.0).fixed_decimals(2).suffix(" s"))
@@ -371,6 +316,70 @@ impl AppState {
                                 .on_hover_text("How wide the far (top) edge is, as a fraction of the keyboard's width");
                             ui.end_row();
                         }
+                    }
+                    if show(Effects, "Effects key glow light bloom intensity decay spread tail reach glass keys rainbow bar") {
+                        if c.view != crate::settings::ViewMode::Vertical {
+                            ui.label("Effects");
+                            ui.label("Effects show in the Vertical view.");
+                            ui.end_row();
+                        } else {
+                            ui.label("Key glow");
+                            ui.checkbox(&mut c.glow, "On").on_hover_text("Hit keys light up and spill light over the keys and up into the notes");
+                            ui.end_row();
+                            if c.glow {
+                                ui.label("  Light");
+                                ui.horizontal(|ui| {
+                                    { ui.label("Intensity"); ui.add(egui::Slider::new(&mut c.glow_intensity, 0.0..=3.0).fixed_decimals(2)) };
+                                    { ui.label("Decay"); ui.add(egui::Slider::new(&mut c.glow_decay, 0.05..=2.0).fixed_decimals(2).suffix(" s")) }
+                                        .on_hover_text("How fast the light fades after a key is released");
+                                });
+                                ui.end_row();
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    { ui.label("Spread"); ui.add(egui::Slider::new(&mut c.glow_spread, 0.5..=8.0).fixed_decimals(1).suffix(" keys")) }
+                                        .on_hover_text("How far the light spills sideways");
+                                    { ui.label("Tail"); ui.add(egui::Slider::new(&mut c.glow_tail, 0.0..=0.9).fixed_decimals(2)) }
+                                        .on_hover_text("Sapphire-style: wider, fainter glows stacked around the light (0: one soft glow)");
+                                });
+                                ui.end_row();
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    ui.label("Reach");
+                                    ui.add(egui::Slider::new(&mut c.glow_reach, 0.02..=1.0).fixed_decimals(2))
+                                        .on_hover_text("How far up the light rises, as a fraction of the note area");
+                                });
+                                ui.end_row();
+                                ui.label("  Keys");
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut c.glow_glass, "Glass keys").on_hover_text("Frosted keys, dark at rest, lit from inside in their notes' colours");
+                                    { ui.label("On keys"); ui.add(egui::Slider::new(&mut c.glow_on_keys, 0.0..=1.0).fixed_decimals(2)) }
+                                        .on_hover_text("How strongly the light colours the keys themselves");
+                                });
+                                ui.end_row();
+                            }
+                            ui.label("Rainbow bar");
+                            ui.checkbox(&mut c.glow_bar, "On").on_hover_text("A moving rainbow along the top of the keys that flares where keys are hit");
+                            ui.end_row();
+                            if c.glow_bar {
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    { ui.label("Height"); ui.add(egui::Slider::new(&mut c.glow_bar_height, 0.02..=0.5).fixed_decimals(2)) }
+                                        .on_hover_text("As a fraction of the keys' height");
+                                    { ui.label("Speed"); ui.add(egui::Slider::new(&mut c.glow_bar_speed, -1.0..=1.0).fixed_decimals(2).suffix(" turns/s")) }
+                                        .on_hover_text("How fast the rainbow moves (negative: the other way; 0: still)");
+                                });
+                                ui.end_row();
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    { ui.label("Brightness"); ui.add(egui::Slider::new(&mut c.glow_bar_rest, 0.0..=1.0).fixed_decimals(2)) }
+                                        .on_hover_text("How bright the bar is at rest; hits flare it toward white");
+                                    ui.checkbox(&mut c.glow_bar_single, "One colour").on_hover_text("One colour instead of the moving rainbow");
+                                    if c.glow_bar_single { ui.color_edit_button_srgb(&mut c.glow_bar_color); }
+                                });
+                                ui.end_row();
+                            }
+                        }
+                        shown += 1;
                     }
                     if c.view == crate::settings::ViewMode::Vertical && show(Display, "Notes fall rise direction") {
                         ui.label("Notes");
@@ -1035,10 +1044,10 @@ pub(crate) fn draw_piano_roll(
     match glow_look.filter(|_| along_bottom && song.is_some()) {
         Some(look) => {
             glow.update(now_us, &active_keys, &active_colors, &look);
-            if look.glass {
+            if look.glow && look.glass {
                 paint_quads(&painter, &glass_quads(keyboard_rect, pitch_min, pitch_max, piano_layout.then_some(&columns), glow, look.intensity));
             }
-            if !glow.is_dark() { paint_glow(&painter, glow, &columns, note_area, keyboard_rect, &look); }
+            if look.glow && !glow.is_dark() { paint_glow(&painter, glow, &columns, note_area, keyboard_rect, &look); }
             if look.bar_height > 0.0 { paint_bar(&painter, glow, &columns, note_area, keyboard_rect, &look, now_us); }
         }
         None => *glow = Default::default(),
