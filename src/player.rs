@@ -1110,11 +1110,11 @@ struct Decoder {
     seg_idx: usize,
     /// The end of the song was reported (until the next seek).
     ended: bool,
-    /// Threads the engine may use when decoding falls behind the clock (0 = never), and how
-    /// many slices in a row it has been behind, or has had to wait for the clock.
+    /// Threads the engine may use when decoding falls behind the clock (0 = never), when to
+    /// use them, and what a note cost the serial engine before it last went parallel.
     threads: usize,
-    behind: u32,
-    waited: u32,
+    mode: ModeSwitch,
+    serial_ns: f32,
     ends: Vec<(u32, u32)>,
     /// What the synth really charges per message (ns), learned from how late it renders:
     /// a synth can take events in a few ns each and still need microseconds to sound them.
@@ -1136,10 +1136,50 @@ fn engine_threads() -> usize {
     if cores >= 6 { (cores / 2).clamp(2, 8) } else { 0 }
 }
 
-/// Slices in a row the decoder is behind the clock before the engine goes parallel, and
-/// loops in a row it has to wait for the clock before it goes back.
+/// Slices in a row the decoder is behind the clock before the engine goes parallel.
 const GO_PARALLEL_AFTER: u32 = 16;
-const GO_SERIAL_AFTER: u32 = 400;
+/// While parallel, the load is measured over this long; the engine goes back to serial when
+/// the serial engine would have been busy less than `GO_SERIAL_LOAD` of it.
+const MEASURE_LOAD: Duration = Duration::from_millis(250);
+const GO_SERIAL_LOAD: f64 = 0.5;
+
+/// When the engine goes parallel and back. Parallel only pays while one thread can't keep
+/// up: its threads wake for every slice, which costs far more than a sparse slice's notes,
+/// and the skipper reads that cost as the engine's price per note.
+struct ModeSwitch {
+    /// Slices in a row behind the clock.
+    behind: u32,
+    /// Since when the load is measured, and the notes decoded by then.
+    since: Instant,
+    decoded: u64,
+}
+
+impl ModeSwitch {
+    fn new(now: Instant) -> Self {
+        Self { behind: 0, since: now, decoded: 0 }
+    }
+
+    /// Before a slice: whether to go parallel (`Some(true)`) or serial (`Some(false)`), given
+    /// the mode, whether the slice is behind the clock, the notes decoded ever, and what a
+    /// note costs the serial engine (ns).
+    fn step(&mut self, parallel: bool, behind: bool, decoded: u64, serial_ns: f32, now: Instant) -> Option<bool> {
+        if !parallel {
+            self.behind = if behind { self.behind + 1 } else { 0 };
+            if self.behind < GO_PARALLEL_AFTER {
+                return None;
+            }
+            (self.behind, self.since, self.decoded) = (0, now, decoded);
+            return Some(true);
+        }
+        let wall = now.saturating_duration_since(self.since);
+        if wall < MEASURE_LOAD {
+            return None;
+        }
+        let load = (decoded - self.decoded) as f64 * serial_ns as f64 / wall.as_nanos() as f64;
+        (self.since, self.decoded) = (now, decoded);
+        (load < GO_SERIAL_LOAD).then_some(false)
+    }
+}
 
 /// How `Decoder::deliver` went.
 enum Delivery {
@@ -1160,7 +1200,7 @@ impl Decoder {
         let (cmd_tx, cmds) = crossbeam_channel::unbounded();
         let (out, slices) = crossbeam_channel::bounded(SLICES_IN_FLIGHT);
         let (spare_tx, spare) = crossbeam_channel::bounded(SLICES_IN_FLIGHT * 2);
-        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), behind: 0, waited: 0, ends: Vec::new(), render_ns: 0.0, render_calm: 0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
+        let d = Decoder { song, eng, cmds, out, spare, clock, feedback, epoch: 0, costs: Costs::default(), seg_idx: 0, ended: false, threads: engine_threads(), mode: ModeSwitch::new(Instant::now()), serial_ns: Costs::default().engine_ns, ends: Vec::new(), render_ns: 0.0, render_calm: 0, synth_seq: 0, learn_render: std::env::var("KIM_SYNTH_FEEDBACK").map_or(true, |v| v != "0") };
         thread::Builder::new().name("player-decode".into()).spawn(move || d.run()).expect("spawn decoder");
         (cmd_tx, slices, spare_tx)
     }
@@ -1171,7 +1211,7 @@ impl Decoder {
             ToDecoder::Seek { epoch, cursor, chase, started, time_us } => {
                 self.epoch = epoch;
                 self.eng.par = None; // its tracks and slots are the old position's
-                self.behind = 0;
+                self.mode = ModeSwitch::new(Instant::now());
                 self.eng.cur = cursor;
                 self.eng.notes_played = started;
                 self.eng.polyphony = chase.len() as u32;
@@ -1305,20 +1345,22 @@ impl Decoder {
                 continue;
             }
             if first_us > now_us.saturating_add(ahead) {
-                self.behind = 0;
-                self.waited += 1;
-                if self.waited >= GO_SERIAL_AFTER && self.eng.par.is_some() {
-                    self.eng.leave_parallel();
-                }
                 let wait = ((first_us - now_us - ahead) as f64 / speed) as u64;
                 thread::sleep(Duration::from_micros(wait.clamp(200, 2_000)));
                 continue;
             }
-            // Behind the clock: the engine alone is not keeping up, so give it threads.
-            self.waited = 0;
-            self.behind = if first_us <= now_us { self.behind + 1 } else { 0 };
-            if self.behind >= GO_PARALLEL_AFTER && self.threads > 0 && self.eng.par.is_none() {
-                self.eng.enter_parallel(self.threads);
+            // Behind the clock: the engine alone is not keeping up, so give it threads; back
+            // to one once that would do.
+            if self.threads > 0 {
+                let parallel = self.eng.par.is_some();
+                match self.mode.step(parallel, first_us <= now_us, self.eng.decoded, self.serial_ns, Instant::now()) {
+                    Some(true) => {
+                        self.serial_ns = self.costs.engine_ns;
+                        self.eng.enter_parallel(self.threads);
+                    }
+                    Some(false) => self.eng.leave_parallel(),
+                    None => {}
+                }
             }
 
             let start = Instant::now();
@@ -1892,6 +1934,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_engine_goes_parallel_only_while_serial_cannot_keep_up() {
+        let t0 = Instant::now();
+        let at = |us: u64| t0 + Duration::from_micros(us);
+        let mut m = ModeSwitch::new(t0);
+        // Behind for a while, but not long enough.
+        for i in 0..GO_PARALLEL_AFTER - 1 {
+            assert_eq!(m.step(false, true, 0, 10.0, at(i as u64)), None);
+        }
+        assert_eq!(m.step(false, false, 0, 10.0, at(100)), None, "on time again: start over");
+        for i in 0..GO_PARALLEL_AFTER - 1 {
+            assert_eq!(m.step(false, true, 0, 10.0, at(200 + i as u64)), None);
+        }
+        assert_eq!(m.step(false, true, 0, 10.0, at(300)), Some(true));
+
+        // Dense: 80M notes/s at 10 ns each is more than one serial thread.
+        let mut decoded = 0;
+        let mut us = 300;
+        for _ in 0..2_000 {
+            (us, decoded) = (us + 500, decoded + 40_000);
+            assert_eq!(m.step(true, false, decoded, 10.0, at(us)), None);
+        }
+        // Slices keep coming every 500 µs, but with 2M notes/s the serial engine would be
+        // 2% busy: back to serial within the measuring period, though it never waits long.
+        let start = us;
+        let left = loop {
+            (us, decoded) = (us + 500, decoded + 1_000);
+            if let Some(go) = m.step(true, false, decoded, 10.0, at(us)) {
+                break (go, us - start);
+            }
+            assert!(us - start < 1_000_000, "still parallel after a second of light load");
+        };
+        assert!(!left.0);
+        assert!(left.1 <= MEASURE_LOAD.as_micros() as u64 * 2 + 500, "took {} µs", left.1);
+    }
+
+    #[test]
     fn seek_chases_sounding_notes() {
         // Bass note held 0..384 on ch 1; C4 on ch 0 every quarter (96 ticks), 96 long.
         let mut trk = vec![0x00, 0x91, 48, 80];
@@ -2010,10 +2088,22 @@ mod tests {
     #[ignore]
     fn player_loop_throughput() {
         use crate::clock::PlaybackClock;
-        let path = std::env::temp_dir().join(format!("kimrashi_loop_{}.mid", std::process::id()));
-        std::fs::write(&path, crate::benchmark::midi_file(16, 2_000_000)).unwrap();
-        let song = SongData::load(&path, 127, &Default::default()).unwrap();
-        let _ = std::fs::remove_file(&path);
+        // `SONG=<file>` plays that instead of generated notes, from `FROM_S` seconds.
+        let song = match std::env::var("SONG") {
+            Ok(file) => SongData::load(&file, 127, &Default::default()).unwrap(),
+            Err(_) => {
+                let path = std::env::temp_dir().join(format!("kimrashi_loop_{}.mid", std::process::id()));
+                std::fs::write(&path, crate::benchmark::midi_file(16, 2_000_000)).unwrap();
+                let song = SongData::load(&path, 127, &Default::default()).unwrap();
+                let _ = std::fs::remove_file(&path);
+                song
+            }
+        };
+        let from_us = std::env::var("FROM_S").ok().and_then(|s| s.parse::<f64>().ok()).map_or(0, |s| (s * 1e6) as u64);
+        if std::env::var_os("ENGINE_ONLY").is_some() {
+            let (decoded, _, _, secs) = bench_engine(&song);
+            return println!("engine alone: {decoded} notes in {secs:.2} s: {:.1} M notes/s", decoded as f64 / secs / 1e6);
+        }
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (tel_tx, tel_rx) = latest();
         let stop = Arc::new(AtomicBool::new(false));
@@ -2022,23 +2112,33 @@ mod tests {
         Player::new(None, OutputChoice::Kdmapi, cmd_rx, tel_tx, stop.clone(), clock);
         let total = song.midi.note_count;
         crate::output::SIM_SYNTH_NS.store(std::env::var("SYNTH_NS").ok().and_then(|s| s.parse().ok()).unwrap_or(0), Ordering::Relaxed);
-        cmd_tx.send(PlayerCommand::SetSkipping(false)).unwrap();
+        cmd_tx.send(PlayerCommand::SetSkipping(std::env::var_os("SKIP").is_some())).unwrap();
         cmd_tx.send(PlayerCommand::Play(song)).unwrap();
+        cmd_tx.send(PlayerCommand::Seek(from_us)).unwrap();
         // Unpaced (a huge speed): the song plays as fast as the player can get through it.
+        // Counted from the first report after the seek, for at most `SECS` seconds.
+        let limit = Duration::from_secs_f64(std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60.0));
         let start = Instant::now();
-        let (mut played, mut worst_lag) = (0, 0);
-        while start.elapsed() < Duration::from_secs(60) {
+        let (mut first, mut played, mut worst_lag, mut busy, mut msgs, mut reports) = (None, 0, 0, 0.0, 0.0, 0);
+        while start.elapsed() < limit {
             if let Ok(t) = tel_rx.recv_timeout(Duration::from_millis(100)) {
+                if t.playback_time_us < from_us {
+                    continue;
+                }
+                first.get_or_insert((Instant::now(), t.notes_played));
                 played = t.notes_played;
                 worst_lag = worst_lag.max(t.lag_us);
+                (busy, msgs, reports) = (busy + t.stats.sched_busy, msgs + t.stats.msgs_per_sec as f64, reports + 1);
                 if !t.is_playing && played > 0 {
                     break;
                 }
             }
         }
-        let secs = start.elapsed().as_secs_f64();
+        let (t0, played0) = first.unwrap();
+        let secs = t0.elapsed().as_secs_f64();
         stop.store(true, Ordering::SeqCst);
-        println!("{played} of {total} notes in {secs:.2} s: {:.1} M notes/s, worst lag {worst_lag} us", played as f64 / secs / 1e6);
+        println!("{} of {total} notes in {secs:.2} s: {:.1} M notes/s, worst lag {worst_lag} us, decoder busy {:.0}%, {:.1} M msg/s sent",
+            played - played0, (played - played0) as f64 / secs / 1e6, busy / reports.max(1) as f32 * 1e2, msgs / reports.max(1) as f64 / 1e6);
     }
 
     #[test]
